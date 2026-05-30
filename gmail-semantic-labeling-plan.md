@@ -14,6 +14,8 @@ Examples:
 - Personal
 - Newsletters
 
+Messages that don't clearly belong to any category remain unlabeled. Unlabeled messages are the priority tier: they surface in the inbox for direct attention. The system's job is to file away the noise so important emails are what remain.
+
 The system should learn from existing labeled messages and from future manual corrections.
 
 ---
@@ -29,9 +31,9 @@ Gmail API
   v
 Classifier Service (Python)
   |
-  +--> Embedding Model
+  +--> Embedding Model (local, sentence-transformers)
   |
-  +--> Similarity Index (FAISS)
+  +--> Similarity Index (brute-force cosine similarity)
   |
   +--> Local Cache (SQLite)
   |
@@ -51,11 +53,44 @@ The local cache is disposable and can be rebuilt at any time.
 3. For each message:
    - Extract sender
    - Extract subject
-   - Extract relevant body text
+   - Extract relevant body text (see Preprocessing below)
 4. Compute embeddings.
-5. Build a nearest-neighbor index (FAISS).
+5. Build the similarity index.
 
 The labeled historical messages become the training set.
+
+A label should have at least 5-10 examples before the system attempts auto-classification for that category. Below that threshold, classification for that label is disabled.
+
+---
+
+## Email Preprocessing
+
+Raw email bodies require cleaning before embedding:
+
+1. Strip HTML (extract text content only).
+2. Remove quoted replies (lines starting with `>`).
+3. Remove forwarded message headers.
+4. Trim signatures (detect `-- ` separator or common patterns).
+5. Remove legal disclaimers and boilerplate footers.
+6. Truncate to the first ~512 tokens (embedding model input limit).
+
+The goal is to embed the meaningful content of the message, not the noise.
+
+---
+
+## Embedding Model
+
+Use a local sentence-transformers model such as `all-MiniLM-L6-v2`:
+
+- Free, no API dependency
+- Fast inference (~5ms per message on CPU)
+- ~80MB model size
+- 384-dimensional embeddings
+- Good quality for short text similarity
+
+No external API calls needed for embeddings. The model runs inside the container.
+
+If quality is insufficient, upgrade to a larger local model (e.g., `all-mpnet-base-v2`) or switch to an API-based model later.
 
 ---
 
@@ -63,23 +98,27 @@ The labeled historical messages become the training set.
 
 ### Input Features
 
-For each message:
+For each message, construct a text representation from:
 
 - Sender address
 - Sender name
 - Subject
 - Mailing-list headers (if present)
-- First portion of the body
+- First portion of the cleaned body
 
-### Embedding-Based Classification
+### Similarity-Based Classification
 
 For a new message:
 
 1. Compute its embedding.
-2. Find the nearest labeled messages.
+2. Compute cosine similarity against all stored labeled embeddings.
 3. Weight votes by similarity.
-4. Assign the most likely label.
+4. Identify the most likely label.
 5. Compute a confidence score.
+
+At MVP scale (a few thousand training examples), brute-force cosine similarity over all embeddings is fast enough with NumPy. No approximate nearest-neighbor index is needed.
+
+If the training set grows to tens of thousands of examples, add FAISS for faster lookup.
 
 Example:
 
@@ -93,14 +132,14 @@ Nearest examples:
 
 ---
 
-## Confidence Levels
+## Confidence Levels and the Unlabeled Tier
+
+Unlabeled messages are intentionally unlabeled. They represent the emails the user wants to see first. A false positive (wrong label hides an important email) is much worse than a false negative (a newsletter stays in the inbox). Thresholds should be aggressive.
 
 ### High Confidence
 
-Example:
-
 ```text
-Confidence >= 90%
+Confidence >= 95%
 ```
 
 Action:
@@ -109,53 +148,40 @@ Action:
 
 ### Medium Confidence
 
-Example:
-
 ```text
-70% <= Confidence < 90%
+80% <= Confidence < 95%
 ```
 
 Action:
 
 - Apply predicted label.
-- Add auxiliary label such as:
-  - AI-Predicted
-  - NeedsReview
+- Add auxiliary label: `AI-Predicted`
 
 ### Low Confidence
 
-Example:
-
 ```text
-Confidence < 70%
+Confidence < 80%
 ```
 
 Action:
 
-- Leave unclassified.
-- Wait for manual classification.
+- Leave unlabeled.
+- The message stays visible in the inbox.
 
-Thresholds can be tuned later.
+Thresholds can be tuned based on observed false-positive rates.
 
 ---
 
-## Learning from Corrections
+## Learning from Label State
 
-The system should treat manual label changes as training feedback.
+Gmail is the source of truth. The current label state of any message IS the ground truth.
 
-Example:
+- A label present on a message = that message is a training example for that category.
+- A label removed from a message = that message is no longer a training example for that category.
+- A label changed from one category to another = the message moves between training sets.
+- A message with no category labels = not a training example (and intentionally unlabeled).
 
-```text
-Predicted:
-  Technology
-
-User changes to:
-  Optimization
-```
-
-This is interpreted as a correction.
-
-The corrected message becomes part of the Optimization training set.
+It does not matter whether the user or the system originally applied the label. The current state is what counts. No provenance tracking is needed.
 
 ---
 
@@ -168,7 +194,6 @@ Benefits:
 - Detect new messages.
 - Detect label additions.
 - Detect label removals.
-- Detect manual corrections.
 
 Workflow:
 
@@ -184,23 +209,23 @@ Mailbox Changes
 
 Store the latest processed history ID.
 
-This is the only truly important piece of persistent state.
+### History ID Staleness
+
+If the stored history ID is too old (Gmail returns 404), fall back to a partial re-sync: scan messages from the last 30 days, reconcile label state, and resume from the new history ID. A full rebuild is only needed if the local cache is entirely lost.
 
 ---
 
 ## Polling Strategy
 
-Simple version:
-
 Every 5 minutes:
 
 1. Query Gmail History API.
 2. Retrieve changes since the previous history ID.
-3. Process new messages.
-4. Process label changes.
+3. Process new messages (classify if unlabeled).
+4. Process label changes (update training set).
 5. Update local cache.
 
-This remains polling, but it is efficient because only mailbox changes are retrieved.
+This is efficient because only mailbox deltas are retrieved.
 
 ---
 
@@ -227,66 +252,64 @@ Not required for the first version.
 
 ---
 
-## Deployment Options
+## OAuth2 Setup
 
-### Recommended First Version
+Gmail API uses OAuth2. For a headless container, the setup is:
 
-Containerized Python service.
+1. Create a Google Cloud project with Gmail API enabled.
+2. Configure an OAuth consent screen (internal or external with test users).
+3. Create OAuth2 client credentials (desktop application type).
+4. Run a one-time interactive authorization flow to obtain a refresh token.
+5. Store the refresh token in a mounted secret/volume accessible to the container.
+
+At runtime, the service uses the refresh token to obtain short-lived access tokens automatically. The refresh token is the only credential that needs to persist outside the container.
+
+---
+
+## Rate Limits
+
+Gmail API has quotas (250 quota units/second per user for most operations).
+
+During initial training (fetching historical messages):
+
+- Use `messages.list` with `labelIds` filter to find relevant messages.
+- Batch `messages.get` requests (up to 100 per batch).
+- Implement exponential backoff on 429 responses.
+- Pace requests to stay within quota.
+
+During normal polling, quota usage is minimal (a few API calls per cycle).
+
+---
+
+## Deployment
+
+### Recommended: Docker Container
 
 ```text
 Docker
   |
   v
-Python
+Python + sentence-transformers
   |
   v
 Gmail API
 ```
+
+Run anywhere Docker runs: a home server, a $5 VPS, a NAS, or a spare machine. The service uses minimal resources (polling every 5 minutes, embedding computation only for new messages).
 
 Advantages:
 
 - Easy deployment
 - Easy upgrades
 - Reproducible environment
+- No cloud vendor lock-in
 
-### AWS Options
+### Scaling Up (if needed later)
 
-#### EC2
+- ECS Fargate: no VM management, automatic restart
+- AWS Lambda: pay-per-use, but less convenient for the persistent polling model
 
-Pros:
-
-- Familiar
-- Flexible
-
-Cons:
-
-- VM maintenance
-- OS updates
-
-#### ECS Fargate
-
-Recommended cloud deployment.
-
-Pros:
-
-- No VM management
-- Runs containers directly
-- Automatic restart
-- Easy upgrades
-
-#### AWS Lambda
-
-Possible later.
-
-Pros:
-
-- Very low operational burden
-- Pay-per-use
-
-Cons:
-
-- Less convenient for experimentation
-- Additional AWS concepts
+These are not needed for a personal email classifier.
 
 ---
 
@@ -302,33 +325,27 @@ Store:
 - Timestamp
 - Last processed history ID
 
-### FAISS
+### Purpose
 
-Store:
+- Fast classification (avoid re-fetching and re-embedding known messages)
+- Fast startup (load embeddings from disk rather than recomputing)
 
-- Embedding index for nearest-neighbor search
-
-Purpose:
-
-- Fast classification
-- Fast startup
-
-The cache is not authoritative.
+The cache is not authoritative. Gmail is.
 
 ---
 
 ## Recovery Philosophy
 
-No backups should be required.
+No backups are required.
 
 If local state is lost:
 
 1. Read labeled messages from Gmail.
 2. Recompute embeddings.
-3. Rebuild FAISS.
+3. Rebuild similarity index.
 4. Continue processing.
 
-Because Gmail is the source of truth, the system remains recoverable.
+Because Gmail is the source of truth, the system is always recoverable.
 
 ---
 
@@ -342,9 +359,15 @@ Only incremental updates.
 
 ### Service Restart
 
-Load SQLite and FAISS.
+Load SQLite cache.
 
 Continue from latest history ID.
+
+### History ID Expired
+
+Partial re-sync from last 30 days.
+
+Resume normal polling.
 
 ### Catastrophic Cache Loss
 
@@ -354,7 +377,7 @@ Perform full rebuild from Gmail.
 
 Recompute all embeddings.
 
-Rebuild FAISS.
+Rebuild similarity index.
 
 This is expected to be rare.
 
@@ -365,19 +388,22 @@ This is expected to be rare.
 Technology Stack:
 
 - Python
-- Gmail API
-- Gmail History API
+- sentence-transformers (all-MiniLM-L6-v2)
+- Gmail API + History API
 - SQLite
-- FAISS
+- NumPy (cosine similarity)
 - Docker
 
 Workflow:
 
-1. Fetch historical labeled messages.
-2. Build embedding index.
-3. Poll History API every 5 minutes.
-4. Classify new messages.
-5. Apply Gmail labels.
-6. Learn from manual corrections.
+1. One-time OAuth2 setup to obtain refresh token.
+2. Fetch historical labeled messages (with rate limit handling).
+3. Preprocess and embed messages.
+4. Build similarity index in memory.
+5. Poll History API every 5 minutes.
+6. Classify new unlabeled messages (high threshold to avoid false positives).
+7. Apply Gmail labels for high-confidence predictions.
+8. Update training set when label state changes.
+9. Leave uncertain messages unlabeled (they surface in the inbox).
 
-This provides semantic email filing with minimal operational complexity and a recoverable, nearly stateless architecture.
+This provides semantic email filing with minimal operational complexity, a recoverable nearly-stateless architecture, and a strong bias toward precision over recall.
