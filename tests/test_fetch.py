@@ -93,3 +93,27 @@ def test_fetch_multiple_labels(tmp_path):
 
     assert len(store.load_by_label("Tech")) == 1
     assert len(store.load_by_label("Travel")) == 1
+
+
+def test_fetch_removes_messages_no_longer_in_label(tmp_path):
+    """If a message was unlabeled or moved to another label, remove it."""
+    service = MagicMock()
+    # Gmail now only has m2 and m3 under this label (m1 was removed)
+    service.users().messages().list.return_value.execute.return_value = {
+        "messages": [{"id": "m2"}, {"id": "m3"}],
+    }
+    # No new messages to fetch (m2 and m3 already stored)
+    client = GmailClient(service)
+    store = MessageStore(str(tmp_path / "test.db"))
+
+    # Pre-store m1, m2, m3 all under "Tech"
+    from gmail_classifier.models import Message
+    store.save_message(Message(id="m1", subject="First", from_address="a@x.com", labels=["Tech"]))
+    store.save_message(Message(id="m2", subject="Second", from_address="a@x.com", labels=["Tech"]))
+    store.save_message(Message(id="m3", subject="Third", from_address="a@x.com", labels=["Tech"]))
+
+    fetch_messages_for_label(client, store, label_id="Label_1", label_name="Tech")
+
+    messages = store.load_by_label("Tech")
+    assert len(messages) == 2
+    assert {m.id for m in messages} == {"m2", "m3"}

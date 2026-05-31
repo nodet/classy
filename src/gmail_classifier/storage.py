@@ -57,6 +57,24 @@ class MessageStore:
         )
         return cursor.fetchone() is not None
 
+    def get_ids_by_label(self, label: str) -> set:
+        """Get all message IDs stored under a given label."""
+        cursor = self._conn.execute(
+            "SELECT id FROM messages WHERE labels LIKE ?",
+            (f'%"{label}"%',),
+        )
+        return {row[0] for row in cursor.fetchall()}
+
+    def delete_messages(self, message_ids: List[str]):
+        """Delete messages by ID."""
+        if not message_ids:
+            return
+        self._conn.executemany(
+            "DELETE FROM messages WHERE id = ?",
+            [(mid,) for mid in message_ids],
+        )
+        self._conn.commit()
+
     def close(self):
         self._conn.close()
 

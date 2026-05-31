@@ -78,3 +78,28 @@ def test_storage_persists_to_disk(tmp_path):
     store2.close()
     assert len(messages) == 1
     assert messages[0].id == "m1"
+
+
+def test_get_ids_by_label(store):
+    store.save_message(_make_message(id="m1", labels=["Tech"]))
+    store.save_message(_make_message(id="m2", labels=["Travel"]))
+    store.save_message(_make_message(id="m3", labels=["Tech"]))
+    assert store.get_ids_by_label("Tech") == {"m1", "m3"}
+    assert store.get_ids_by_label("Travel") == {"m2"}
+    assert store.get_ids_by_label("News") == set()
+
+
+def test_delete_messages(store):
+    store.save_message(_make_message(id="m1", labels=["Tech"]))
+    store.save_message(_make_message(id="m2", labels=["Tech"]))
+    store.save_message(_make_message(id="m3", labels=["Travel"]))
+    store.delete_messages(["m1", "m3"])
+    messages = store.load_all()
+    assert len(messages) == 1
+    assert messages[0].id == "m2"
+
+
+def test_delete_messages_empty_list(store):
+    store.save_message(_make_message(id="m1", labels=["Tech"]))
+    store.delete_messages([])
+    assert len(store.load_all()) == 1
