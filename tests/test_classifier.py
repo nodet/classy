@@ -4,10 +4,12 @@ import pytest
 from gmail_classifier.classifier import (
     Action,
     aggregate_scores,
+    classify,
     compute_confidence,
     cosine_similarity,
     decide_action,
     find_neighbors,
+    MIN_EXAMPLES_PER_LABEL,
 )
 
 
@@ -125,3 +127,54 @@ def test_decision_medium_confidence_labels_with_marker():
 def test_decision_low_confidence_no_label():
     action = decide_action(0.70)
     assert action == Action.NO_LABEL
+
+
+def test_label_with_few_examples_excluded():
+    # "Tech" has 20 examples, "Rare" has 3 (below MIN_EXAMPLES_PER_LABEL)
+    # Query is closest to "Rare" vectors but Rare should be excluded
+    dim = 10
+    rng = np.random.default_rng(42)
+
+    # Create "Tech" cluster near [1,0,0,...] and "Rare" cluster near [0,1,0,...]
+    tech_vecs = rng.normal(0, 0.1, (20, dim))
+    tech_vecs[:, 0] += 1.0
+    tech_vecs = tech_vecs / np.linalg.norm(tech_vecs, axis=1, keepdims=True)
+
+    rare_vecs = rng.normal(0, 0.1, (3, dim))
+    rare_vecs[:, 1] += 1.0
+    rare_vecs = rare_vecs / np.linalg.norm(rare_vecs, axis=1, keepdims=True)
+
+    training = np.vstack([tech_vecs, rare_vecs])
+    labels = ["Tech"] * 20 + ["Rare"] * 3
+
+    # Query is very close to "Rare" cluster
+    query = np.zeros(dim)
+    query[1] = 1.0
+
+    result = classify(query, training, labels, k=5)
+    # "Rare" should be excluded due to min examples threshold
+    assert result.label != "Rare"
+
+
+def test_label_at_threshold_included():
+    dim = 10
+    rng = np.random.default_rng(42)
+
+    # "NewLabel" has exactly MIN_EXAMPLES_PER_LABEL examples
+    new_vecs = rng.normal(0, 0.1, (MIN_EXAMPLES_PER_LABEL, dim))
+    new_vecs[:, 0] += 1.0
+    new_vecs = new_vecs / np.linalg.norm(new_vecs, axis=1, keepdims=True)
+
+    other_vecs = rng.normal(0, 0.1, (20, dim))
+    other_vecs[:, 1] += 1.0
+    other_vecs = other_vecs / np.linalg.norm(other_vecs, axis=1, keepdims=True)
+
+    training = np.vstack([new_vecs, other_vecs])
+    labels = ["NewLabel"] * MIN_EXAMPLES_PER_LABEL + ["Other"] * 20
+
+    # Query is close to "NewLabel" cluster
+    query = np.zeros(dim)
+    query[0] = 1.0
+
+    result = classify(query, training, labels, k=5)
+    assert result.label == "NewLabel"
