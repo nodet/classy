@@ -2,9 +2,11 @@ import numpy as np
 import pytest
 
 from gmail_classifier.classifier import (
+    Action,
     aggregate_scores,
     compute_confidence,
     cosine_similarity,
+    decide_action,
     find_neighbors,
 )
 
@@ -108,3 +110,18 @@ def test_confidence_three_labels():
     label, confidence = compute_confidence(scores)
     assert label == "Tech"
     assert confidence == pytest.approx(2.0 / 3.0)
+
+
+def test_decision_high_confidence_labels():
+    action = decide_action(0.96)
+    assert action == Action.LABEL
+
+
+def test_decision_medium_confidence_labels_with_marker():
+    action = decide_action(0.85)
+    assert action == Action.LABEL_WITH_REVIEW
+
+
+def test_decision_low_confidence_no_label():
+    action = decide_action(0.70)
+    assert action == Action.NO_LABEL

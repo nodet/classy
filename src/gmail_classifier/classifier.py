@@ -1,6 +1,17 @@
+from enum import Enum
 from typing import List, Tuple
 
 import numpy as np
+
+
+class Action(Enum):
+    LABEL = "label"
+    LABEL_WITH_REVIEW = "label_with_review"
+    NO_LABEL = "no_label"
+
+
+HIGH_CONFIDENCE_THRESHOLD = 0.95
+MEDIUM_CONFIDENCE_THRESHOLD = 0.80
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -61,3 +72,13 @@ def compute_confidence(scores: dict) -> Tuple[str, float]:
     winning_label = max(scores, key=scores.get)
     confidence = scores[winning_label] / total
     return (winning_label, confidence)
+
+
+def decide_action(confidence: float) -> Action:
+    """Decide what action to take based on confidence level."""
+    if confidence >= HIGH_CONFIDENCE_THRESHOLD:
+        return Action.LABEL
+    elif confidence >= MEDIUM_CONFIDENCE_THRESHOLD:
+        return Action.LABEL_WITH_REVIEW
+    else:
+        return Action.NO_LABEL
