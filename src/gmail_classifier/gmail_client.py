@@ -54,3 +54,16 @@ class GmailClient:
     def get_messages(self, message_ids: List[str]) -> List[dict]:
         """Get multiple messages by ID."""
         return [self.get_message(mid) for mid in message_ids]
+
+    def apply_label(self, message_id: str, label_id: str):
+        """Add a label to a message."""
+        self._service.users().messages().modify(
+            userId="me", id=message_id, body={"addLabelIds": [label_id]}
+        ).execute()
+
+    def get_message_labels(self, message_id: str) -> List[str]:
+        """Get the label IDs currently on a message (minimal fetch)."""
+        result = self._service.users().messages().get(
+            userId="me", id=message_id, format="minimal"
+        ).execute()
+        return result.get("labelIds", [])

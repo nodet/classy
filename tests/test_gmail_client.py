@@ -99,3 +99,24 @@ def test_batch_get_messages():
     assert len(results) == 5
     assert results[0]["id"] == "msg0"
     assert results[4]["id"] == "msg4"
+
+
+def test_apply_label():
+    service = MagicMock()
+    client = GmailClient(service)
+    client.apply_label("msg1", "Label_1")
+    service.users().messages().modify.assert_called_once_with(
+        userId="me", id="msg1", body={"addLabelIds": ["Label_1"]}
+    )
+    service.users().messages().modify.return_value.execute.assert_called_once()
+
+
+def test_get_message_labels():
+    service = MagicMock()
+    service.users().messages().get.return_value.execute.return_value = {
+        "id": "msg1",
+        "labelIds": ["INBOX", "UNREAD", "Label_1"],
+    }
+    client = GmailClient(service)
+    labels = client.get_message_labels("msg1")
+    assert labels == ["INBOX", "UNREAD", "Label_1"]
