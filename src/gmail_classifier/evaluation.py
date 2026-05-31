@@ -47,3 +47,33 @@ def compute_metrics_table(
         (t, precision_at_threshold(results, t), coverage_at_threshold(results, t))
         for t in thresholds
     ]
+
+
+def per_label_precision(
+    results: List[PredictionResult], threshold: float
+) -> dict:
+    """Compute precision per true label at a given confidence threshold.
+
+    Returns dict of {label: (precision, n_correct, n_total)} for each label
+    that has at least one prediction at or above the threshold.
+    """
+    from collections import defaultdict
+
+    # Group by true label: count how many were predicted (at threshold) and how many correctly
+    label_correct = defaultdict(int)
+    label_total = defaultdict(int)
+
+    for r in results:
+        if r.confidence >= threshold and r.predicted_label != "":
+            label_total[r.true_label] += 1
+            if r.predicted_label == r.true_label:
+                label_correct[r.true_label] += 1
+
+    return {
+        label: (
+            label_correct[label] / label_total[label],
+            label_correct[label],
+            label_total[label],
+        )
+        for label in label_total
+    }

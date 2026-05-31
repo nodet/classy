@@ -6,6 +6,7 @@ from gmail_classifier.evaluation import (
     precision_at_threshold,
     coverage_at_threshold,
     compute_metrics_table,
+    per_label_precision,
 )
 
 
@@ -96,3 +97,12 @@ def test_compute_metrics_table(sample_results):
     assert table[1][0] == 0.80
     assert table[1][1] == pytest.approx(5 / 7)
     assert table[1][2] == pytest.approx(7 / 10)
+
+
+def test_per_label_precision(sample_results):
+    """per_label_precision breaks down precision by true label."""
+    plp = per_label_precision(sample_results, 0.80)
+    # Label A: 3 correct (0.99, 0.97, 0.85), 1 wrong (0.93 predicted B) = 3/4
+    assert plp["A"] == pytest.approx((3 / 4, 3, 4))
+    # Label B: 2 correct (0.96, 0.88), 1 wrong (0.82 predicted A) = 2/3
+    assert plp["B"] == pytest.approx((2 / 3, 2, 3))

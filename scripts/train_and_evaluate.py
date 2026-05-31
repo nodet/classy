@@ -5,6 +5,7 @@ import sys
 from collections import Counter
 
 from gmail_classifier.evaluate import run_evaluation
+from gmail_classifier.evaluation import per_label_precision
 from gmail_classifier.storage import MessageStore
 
 
@@ -60,6 +61,14 @@ def main():
     if predicted:
         correct = sum(1 for r in predicted if r.predicted_label == r.true_label)
         print(f"Overall accuracy (all predictions): {correct}/{len(predicted)} = {correct/len(predicted):.1%}")
+
+    # Per-label precision at 0.80 threshold
+    print(f"\nPer-label precision (at >=0.80 confidence):")
+    print(f"  {'Label':30s} {'Precision':>10s} {'Correct':>8s} {'Total':>8s}")
+    print(f"  {'-'*60}")
+    plp = per_label_precision(results, 0.80)
+    for label, (prec, correct, total) in sorted(plp.items(), key=lambda x: x[1][0]):
+        print(f"  {label:30s} {prec:>10.1%} {correct:>8d} {total:>8d}")
 
     # Show some errors at the 0.80 threshold
     errors_80 = [
