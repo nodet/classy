@@ -253,9 +253,9 @@ Some labels are best handled by Gmail's built-in filters rather than content-bas
 - The classifier's rule is simple: "if a message already has a user label, skip it."
 - Filter-based labels still contribute to the training set (their content is embedded and used as neighbors), but the classifier never *predicts* into those labels for new messages — because messages destined for those labels arrive pre-labeled.
 
-**Auto-detection of non-content-learnable labels:**
+**Excluding filter-based labels from predictions:**
 
-During evaluation (leave-one-out cross-validation), per-label precision naturally reveals which labels are not content-learnable. Labels whose precision falls significantly below others (e.g., <95% when others are >99%) are candidates for filter-based handling rather than ML classification. The evaluation script reports per-label precision to surface this.
+Filter-based labels must be explicitly excluded from the classifier's predictions via configuration (e.g., `--exclude-labels XLC XLE XLCap`). Auto-detection via per-label precision is unreliable: a filter-based label with significantly more examples than its siblings will appear to have high precision (it wins by neighbor count, not content distinctiveness). The user knows which labels are filter-based and configures the exclusion list once.
 
 **Validation with push notifications:**
 
@@ -572,7 +572,7 @@ Before each run:
 
 #### Exclude non-content labels:
 
-Labels handled by Gmail filters (XLC, XLE, XLCap in current setup) should be excluded from predictions via `--exclude-labels`. These are detected by per-label precision in evaluation (<95% = likely not content-learnable).
+Labels handled by Gmail filters (XLC, XLE, XLCap in current setup) must be excluded from predictions via `--exclude-labels`. This is explicit configuration — the user knows which labels are filter-based.
 
 #### Guardrails:
 
