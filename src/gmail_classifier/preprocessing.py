@@ -89,3 +89,23 @@ def preprocess_email_body(html: str) -> str:
     text = trim_signature(text)
     text = truncate(text)
     return text
+
+
+def build_text_representation(
+    from_name: str,
+    from_address: str,
+    subject: str,
+    body: str,
+    list_id: str = "",
+) -> str:
+    """Build the text string that will be embedded for classification."""
+    if from_name:
+        sender = f"{from_name} <{from_address}>"
+    else:
+        sender = f"<{from_address}>"
+
+    parts = [sender, subject, body]
+    if list_id:
+        parts.append(f"[list: {list_id}]")
+
+    return " | ".join(parts)
