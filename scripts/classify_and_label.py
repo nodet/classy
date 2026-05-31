@@ -135,9 +135,10 @@ def _check_inbox(args, client, embedder, train_embeddings, train_labels,
     new_ids = [mid for mid in inbox_ids if mid not in skip_ids]
 
     if not new_ids:
-        print(f"{now()} No new messages.")
+        print(".", end="", flush=True)
         return
 
+    print()  # newline after any dots
     skip_store = MessageStore(args.skip_db)
 
     for mid in new_ids:
