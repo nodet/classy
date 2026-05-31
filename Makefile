@@ -1,4 +1,4 @@
-.PHONY: help setup test quick clean fetch-training fetch-inbox evaluate dry-run
+.PHONY: help setup test quick clean fetch-training fetch-inbox evaluate dry-run classify
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -23,6 +23,9 @@ evaluate: ## Run cross-validation evaluation on stored messages
 
 dry-run: ## Classify inbox messages without modifying Gmail
 	uv run python scripts/dry_run.py
+
+classify: ## Classify new inbox messages and apply labels
+	uv run python scripts/classify_and_label.py
 
 clean: ## Remove build artifacts and virtual environment
 	rm -rf .venv __pycache__ src/*.egg-info
