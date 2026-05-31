@@ -461,48 +461,21 @@ The primary risk is ML effectiveness, not infrastructure. Validate classificatio
 
 Goal: answer the question "does this actually work on my email?" before writing any service code.
 
-#### Step 1.1: Project Skeleton and Fake Dataset
+#### Step 1.1: Project Skeleton and Unit Tests [DONE]
 
-Set up the Python project with a synthetic dataset for fast unit tests.
+Set up the Python project with unit tests using synthetic data.
 
-**What to test with fake data:**
+**Implemented (39 tests, all passing):**
 
-- The preprocessing pipeline (HTML stripping, quote removal, signature trimming)
-- The embedding → KNN → confidence calculation pipeline
-- Edge cases: empty body, very short messages, messages with only a subject
-- Threshold logic (high/medium/low confidence → correct action)
+- Preprocessing pipeline: strip_html, remove_quoted_replies, remove_forwarded, trim_signature, truncate, preprocess_email_body
+- Text representation: build_text_representation (sender, subject, body, optional list-id)
+- Classifier: cosine_similarity, find_neighbors (KNN), aggregate_scores, compute_confidence, decide_action, classify
+- ClassificationResult dataclass, Action enum, MIN_EXAMPLES_PER_LABEL threshold
+- All tests use plain strings or synthetic NumPy vectors — no embedding model needed, suite runs in <200ms
 
-**What NOT to test with fake data:**
+**Not tested with fake data (by design):**
 
-- ML quality. Synthetic text embeds differently than real email. Don't tune thresholds or evaluate accuracy on fake data.
-
-**Fake dataset structure:**
-
-```
-tests/fixtures/
-  emails.json   # ~50 synthetic messages across labels
-```
-
-Each entry:
-
-```json
-{
-  "id": "fake-001",
-  "from_name": "Alice",
-  "from_address": "alice@example.com",
-  "subject": "Q3 OKR planning",
-  "body_html": "<p>Hi team, here are the OKRs...</p>",
-  "labels": ["Work"]
-}
-```
-
-Include intentionally ambiguous cases (messages that could belong to multiple labels) and messages that should remain unlabeled (personal, important).
-
-**Tech:**
-
-- pytest
-- A small embedding model or even mock embeddings (random vectors with controlled similarity) for pure-logic tests
-- Real model only for integration tests
+- ML quality. Synthetic text embeds differently than real email. Thresholds will be tuned on real data in Step 1.3.
 
 #### Step 1.2: OAuth2 Setup and Gmail Fetch
 
@@ -666,8 +639,10 @@ Only start this phase after Phase 2 has been running successfully for a few week
 ## Technology Stack
 
 - Python 3.11+
+- uv (package/project management)
 - sentence-transformers (all-MiniLM-L6-v2)
 - NumPy
+- BeautifulSoup4 (HTML parsing)
 - google-api-python-client + google-auth
 - SQLite (local cache)
 - pytest (testing)
@@ -675,29 +650,35 @@ Only start this phase after Phase 2 has been running successfully for a few week
 
 ---
 
-## Project Structure (proposed)
+## Project Structure
 
 ```
 gmail-classifier/
-  src/
-    preprocessing.py    # HTML strip, quote removal, signature trim
+  src/gmail_classifier/
+    __init__.py
+    preprocessing.py    # HTML strip, quote removal, signature trim, text repr
     embeddings.py       # sentence-transformers wrapper
-    classifier.py       # KNN logic, confidence calculation
+    classifier.py       # KNN logic, confidence calculation, decision
     gmail_client.py     # API wrapper: fetch, label, history
     storage.py          # SQLite read/write for messages + embeddings
-  scripts/
-    fetch_training_data.py
-    fetch_inbox.py
-    train_and_evaluate.py
-    classify_dry_run.py
-    classify_and_label.py
   tests/
+    __init__.py
     fixtures/emails.json
     test_preprocessing.py
+    test_text_representation.py
     test_classifier.py
-    test_confidence.py
   credentials/          # .gitignored
   data/                 # .gitignored
-  requirements.txt
+  pyproject.toml
+  Makefile
   .gitignore
+```
+
+## Development Setup
+
+```
+git clone <repo>
+make setup   # creates .venv, installs project + dev dependencies
+make test    # runs pytest
+make clean   # removes .venv and build artifacts
 ```
