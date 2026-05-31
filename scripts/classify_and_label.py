@@ -122,6 +122,7 @@ def main():
     review_count = 0
     already_labeled_count = 0
     low_confidence_count = 0
+    skip_store = MessageStore(args.skip_db)
 
     for mid in new_ids:
         # Fetch message
@@ -166,6 +167,12 @@ def main():
                 review_count += 1
         else:
             low_confidence_count += 1
+            # Add to skip pool so it's not re-processed next run
+            if not args.dry_run:
+                msg.labels = []
+                skip_store.save_message(msg)
+
+    skip_store.close()
 
     # Summary
     print(f"\n{'DRY RUN — ' if args.dry_run else ''}Summary:")
