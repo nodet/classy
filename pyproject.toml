@@ -13,6 +13,7 @@ dependencies = [
     "beautifulsoup4",
     "google-api-python-client",
     "google-auth-oauthlib",
+    "sentence-transformers",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: marks tests that load ML models (deselect with '-m \"not slow\"')"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
