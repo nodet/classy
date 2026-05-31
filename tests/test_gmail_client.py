@@ -61,3 +61,28 @@ def test_list_messages_by_label_empty():
     client = GmailClient(service)
     ids = client.list_message_ids(label_id="Label_1")
     assert ids == []
+
+
+def test_get_message():
+    service = MagicMock()
+    msg_resource = {
+        "id": "msg1",
+        "payload": {"headers": [{"name": "Subject", "value": "Hi"}]},
+    }
+    service.users().messages().get.return_value.execute.return_value = msg_resource
+    client = GmailClient(service)
+    result = client.get_message("msg1")
+    assert result == msg_resource
+
+
+def test_batch_get_messages():
+    service = MagicMock()
+    msg_resources = [
+        {"id": f"msg{i}", "payload": {"headers": []}} for i in range(5)
+    ]
+    service.users().messages().get.return_value.execute.side_effect = msg_resources
+    client = GmailClient(service)
+    results = client.get_messages(["msg0", "msg1", "msg2", "msg3", "msg4"])
+    assert len(results) == 5
+    assert results[0]["id"] == "msg0"
+    assert results[4]["id"] == "msg4"

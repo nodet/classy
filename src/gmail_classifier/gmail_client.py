@@ -32,3 +32,13 @@ class GmailClient:
             if not page_token:
                 break
         return ids
+
+    def get_message(self, message_id: str) -> dict:
+        """Get a single message by ID."""
+        return self._service.users().messages().get(
+            userId="me", id=message_id, format="full"
+        ).execute()
+
+    def get_messages(self, message_ids: List[str]) -> List[dict]:
+        """Get multiple messages by ID."""
+        return [self.get_message(mid) for mid in message_ids]
