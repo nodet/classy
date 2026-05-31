@@ -63,6 +63,19 @@ def test_list_messages_by_label_empty():
     assert ids == []
 
 
+def test_list_messages_with_max_results():
+    service = MagicMock()
+    # API returns 5 messages but we only want 3
+    service.users().messages().list.return_value.execute.return_value = {
+        "messages": [{"id": f"msg{i}"} for i in range(5)],
+        "nextPageToken": "more",
+    }
+    client = GmailClient(service)
+    ids = client.list_message_ids(label_id="Label_1", max_results=3)
+    assert len(ids) == 3
+    assert ids == ["msg0", "msg1", "msg2"]
+
+
 def test_get_message():
     service = MagicMock()
     msg_resource = {

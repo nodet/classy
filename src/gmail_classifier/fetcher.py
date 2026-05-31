@@ -8,9 +8,15 @@ def fetch_messages_for_label(
     store: MessageStore,
     label_id: str,
     label_name: str,
+    max_messages: int = 0,
 ):
-    """Fetch all messages for a label and store them, skipping already-stored ones."""
-    message_ids = client.list_message_ids(label_id)
+    """Fetch messages for a label and store them, skipping already-stored ones.
+
+    Args:
+        max_messages: Maximum number of messages to fetch (0 = no limit).
+                      Fetches most recent first.
+    """
+    message_ids = client.list_message_ids(label_id, max_results=max_messages)
 
     # Filter out already-stored messages
     new_ids = [mid for mid in message_ids if not store.has_message(mid)]

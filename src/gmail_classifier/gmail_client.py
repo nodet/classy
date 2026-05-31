@@ -17,17 +17,29 @@ class GmailClient:
             if l.get("type") == "user"
         ]
 
-    def list_message_ids(self, label_id: str) -> List[str]:
-        """List all message IDs with the given label. Handles pagination."""
+    def list_message_ids(self, label_id: str, max_results: int = 0) -> List[str]:
+        """List message IDs with the given label. Handles pagination.
+
+        Args:
+            label_id: Gmail label ID to filter by.
+            max_results: Maximum number of IDs to return (0 = no limit).
+                         Gmail returns most recent first.
+        """
         ids = []
         page_token = None
         while True:
             kwargs = {"userId": "me", "labelIds": [label_id]}
             if page_token:
                 kwargs["pageToken"] = page_token
+            if max_results:
+                # Request at most what we still need (Gmail caps at 500 per page)
+                kwargs["maxResults"] = min(max_results - len(ids), 500)
             response = self._service.users().messages().list(**kwargs).execute()
             messages = response.get("messages", [])
             ids.extend(m["id"] for m in messages)
+            if max_results and len(ids) >= max_results:
+                ids = ids[:max_results]
+                break
             page_token = response.get("nextPageToken")
             if not page_token:
                 break

@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--db", default="data/training.db", help="SQLite database path")
     parser.add_argument("--credentials", default="credentials", help="Credentials directory")
     parser.add_argument("--labels", nargs="*", help="Only fetch these label names (default: all user labels)")
+    parser.add_argument("--max-per-label", type=int, default=500, help="Max messages per label (default: 500, 0=all)")
     args = parser.parse_args()
 
     credentials_dir = Path(args.credentials)
@@ -47,8 +48,8 @@ def main():
     store = MessageStore(str(db_path))
 
     for label_id, label_name in labels_to_fetch:
-        print(f"  Fetching '{label_name}'...")
-        fetch_messages_for_label(client, store, label_id, label_name)
+        print(f"  Fetching '{label_name}' (max {args.max_per_label or 'all'})...")
+        fetch_messages_for_label(client, store, label_id, label_name, max_messages=args.max_per_label)
         count = len(store.load_by_label(label_name))
         print(f"    {count} messages stored")
 
