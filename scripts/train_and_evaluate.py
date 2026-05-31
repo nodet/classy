@@ -21,6 +21,10 @@ def main():
         "--k", type=int, default=5,
         help="Number of neighbors for KNN (default: 5)",
     )
+    parser.add_argument(
+        "--exclude-labels", nargs="*", default=[],
+        help="Labels to exclude from evaluation (e.g. --exclude-labels XLC XLE XLCap)",
+    )
     args = parser.parse_args()
 
     # Load messages
@@ -31,6 +35,13 @@ def main():
     if not messages:
         print("No messages found in the database.")
         sys.exit(1)
+
+    # Exclude labels if requested
+    if args.exclude_labels:
+        excluded = set(args.exclude_labels)
+        messages = [m for m in messages if m.labels and m.labels[0] not in excluded]
+        print(f"Excluded labels: {', '.join(sorted(excluded))}")
+        print()
 
     # Show dataset summary
     label_counts = Counter(m.labels[0] for m in messages if m.labels)
