@@ -38,3 +38,11 @@ def find_neighbors(
     top_indices = np.argsort(sims)[::-1][:actual_k]
 
     return [(float(sims[i]), labels[i]) for i in top_indices]
+
+
+def aggregate_scores(neighbors: List[Tuple[float, str]]) -> dict:
+    """Sum similarity scores per label from neighbor list."""
+    scores: dict = {}
+    for sim, label in neighbors:
+        scores[label] = scores.get(label, 0.0) + sim
+    return scores

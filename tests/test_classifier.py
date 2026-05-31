@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from gmail_classifier.classifier import cosine_similarity, find_neighbors
+from gmail_classifier.classifier import aggregate_scores, cosine_similarity, find_neighbors
 
 
 def test_cosine_similarity_identical_vectors():
@@ -61,3 +61,18 @@ def test_knn_returns_fewer_if_training_set_smaller_than_k():
 
     neighbors = find_neighbors(query, training, labels, k=5)
     assert len(neighbors) == 2
+
+
+def test_score_aggregation_single_label():
+    neighbors = [(0.9, "Tech"), (0.8, "Tech"), (0.7, "Tech"), (0.6, "Tech"), (0.5, "Tech")]
+    scores = aggregate_scores(neighbors)
+    assert scores == {"Tech": pytest.approx(3.5)}
+
+
+def test_score_aggregation_multiple_labels():
+    neighbors = [
+        (0.9, "Tech"), (0.8, "Tech"), (0.7, "Tech"),
+        (0.6, "Travel"), (0.5, "Travel"),
+    ]
+    scores = aggregate_scores(neighbors)
+    assert scores == {"Tech": pytest.approx(2.4), "Travel": pytest.approx(1.1)}
