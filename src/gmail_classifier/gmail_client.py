@@ -16,3 +16,19 @@ class GmailClient:
             for l in labels
             if l.get("type") == "user"
         ]
+
+    def list_message_ids(self, label_id: str) -> List[str]:
+        """List all message IDs with the given label. Handles pagination."""
+        ids = []
+        page_token = None
+        while True:
+            kwargs = {"userId": "me", "labelIds": [label_id]}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            response = self._service.users().messages().list(**kwargs).execute()
+            messages = response.get("messages", [])
+            ids.extend(m["id"] for m in messages)
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return ids
