@@ -1,4 +1,4 @@
-from gmail_classifier.gmail_parser import parse_sender
+from gmail_classifier.gmail_parser import extract_headers, parse_sender
 from gmail_classifier.models import Message
 
 
@@ -60,3 +60,33 @@ def test_parse_sender_empty():
     name, address = parse_sender("")
     assert name == ""
     assert address == ""
+
+
+def test_extract_headers_subject():
+    headers = [{"name": "Subject", "value": "Hello"}]
+    result = extract_headers(headers)
+    assert result["subject"] == "Hello"
+
+
+def test_extract_headers_from():
+    headers = [{"name": "From", "value": "Alice <alice@example.com>"}]
+    result = extract_headers(headers)
+    assert result["from"] == "Alice <alice@example.com>"
+
+
+def test_extract_headers_list_id():
+    headers = [{"name": "List-Id", "value": "<dev.lists.example.com>"}]
+    result = extract_headers(headers)
+    assert result["list_id"] == "dev.lists.example.com"
+
+
+def test_extract_headers_list_id_missing():
+    headers = [{"name": "Subject", "value": "Hi"}]
+    result = extract_headers(headers)
+    assert result["list_id"] == ""
+
+
+def test_extract_headers_case_insensitive():
+    headers = [{"name": "subject", "value": "Hello"}]
+    result = extract_headers(headers)
+    assert result["subject"] == "Hello"
