@@ -3,6 +3,7 @@ import pytest
 
 from gmail_classifier.classifier import (
     Action,
+    SKIP_LABEL,
     aggregate_scores,
     classify,
     compute_confidence,
@@ -244,3 +245,62 @@ def test_classify_empty_training_set():
     result = classify(query, training, labels, k=5)
     assert result.label == ""
     assert result.action == Action.NO_LABEL
+
+
+def test_classify_skip_wins():
+    """When __skip__ gets the highest aggregate score, result is NO_LABEL."""
+    dim = 10
+    rng = np.random.default_rng(42)
+
+    # Skip cluster near query
+    skip_vecs = rng.normal(0, 0.05, (10, dim))
+    skip_vecs[:, 0] += 1.0
+    skip_vecs = skip_vecs / np.linalg.norm(skip_vecs, axis=1, keepdims=True)
+
+    # Real label cluster far from query
+    real_vecs = rng.normal(0, 0.05, (10, dim))
+    real_vecs[:, 1] += 1.0
+    real_vecs = real_vecs / np.linalg.norm(real_vecs, axis=1, keepdims=True)
+
+    training = np.vstack([skip_vecs, real_vecs])
+    labels = [SKIP_LABEL] * 10 + ["Tech"] * 10
+
+    # Query close to skip cluster
+    query = np.zeros(dim)
+    query[0] = 1.0
+
+    result = classify(query, training, labels, k=5)
+    assert result.label == ""
+    assert result.action == Action.NO_LABEL
+
+
+def test_classify_skip_dilutes_confidence():
+    """When __skip__ is among neighbors but doesn't win, it dilutes confidence."""
+    dim = 10
+    rng = np.random.default_rng(77)
+
+    # Real label cluster
+    tech_vecs = rng.normal(0, 0.05, (10, dim))
+    tech_vecs[:, 0] += 1.0
+    tech_vecs[:, 2] += 0.3
+    tech_vecs = tech_vecs / np.linalg.norm(tech_vecs, axis=1, keepdims=True)
+
+    # Skip cluster nearby
+    skip_vecs = rng.normal(0, 0.05, (10, dim))
+    skip_vecs[:, 0] += 0.8
+    skip_vecs[:, 2] += 0.6
+    skip_vecs = skip_vecs / np.linalg.norm(skip_vecs, axis=1, keepdims=True)
+
+    training = np.vstack([tech_vecs, skip_vecs])
+    labels = ["Tech"] * 10 + [SKIP_LABEL] * 10
+
+    # Query between the two clusters
+    query = np.zeros(dim)
+    query[0] = 1.0
+    query[2] = 0.5
+    query = query / np.linalg.norm(query)
+
+    result = classify(query, training, labels, k=5)
+    # Tech might win but confidence should be reduced by skip presence
+    if result.label == "Tech":
+        assert result.confidence < 0.95

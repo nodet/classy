@@ -6,7 +6,9 @@ Shows what the classifier would do for each unlabeled inbox message.
 import argparse
 import sys
 
-from gmail_classifier.classifier import classify, Action
+import numpy as np
+
+from gmail_classifier.classifier import classify, Action, SKIP_LABEL
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
 from gmail_classifier.storage import MessageStore
@@ -33,6 +35,10 @@ def main():
         "--exclude-labels", nargs="*", default=[],
         help="Labels to exclude from predictions (e.g. --exclude-labels XLC XLE XLCap)",
     )
+    parser.add_argument(
+        "--skip-db", default="",
+        help="Path to inbox/skip message store (messages used as negative examples)",
+    )
     args = parser.parse_args()
 
     # Load training data
@@ -53,13 +59,29 @@ def main():
 
     print(f"  {len(train_messages)} training messages")
 
+    # Load skip (negative) examples if provided
+    skip_messages = []
+    skip_db = args.skip_db or args.inbox_db
+    if skip_db:
+        print(f"Loading skip examples from {skip_db}...")
+        skip_store = MessageStore(skip_db)
+        skip_messages = skip_store.load_all()
+        skip_store.close()
+        # Tag them with __skip__ label
+        for m in skip_messages:
+            m.labels = [SKIP_LABEL]
+        print(f"  {len(skip_messages)} skip examples")
+
+    # Combine training + skip for building index
+    all_train_messages = train_messages + skip_messages
+
     # Build training index
     print("Embedding training data...")
     embedder = Embedder()
-    train_embeddings, train_labels = build_training_data(train_messages, embedder=embedder)
+    train_embeddings, train_labels = build_training_data(all_train_messages, embedder=embedder)
     print(f"  {train_embeddings.shape[0]} embeddings, {train_embeddings.shape[1]} dimensions")
 
-    # Load inbox messages
+    # Load inbox messages (same DB as skip — we classify them to see what would happen)
     print("Loading inbox messages...")
     inbox_store = MessageStore(args.inbox_db)
     inbox_messages = inbox_store.load_all()
@@ -71,6 +93,13 @@ def main():
 
     print(f"  {len(inbox_messages)} inbox messages")
     print()
+
+    # Build index of inbox message IDs to their position in training set
+    # (skip messages are appended after train_messages)
+    n_train = len(train_messages)
+    inbox_id_to_train_idx = {}
+    for i, msg in enumerate(skip_messages):
+        inbox_id_to_train_idx[msg.id] = n_train + i
 
     # Classify each inbox message
     sure = []
@@ -87,7 +116,16 @@ def main():
             list_id=msg.list_id,
         )
         query_embedding = embedder.embed(text)
-        result = classify(query_embedding, train_embeddings, train_labels, k=args.k)
+
+        # Exclude this message from training set (LOO) if it's in skip examples
+        if msg.id in inbox_id_to_train_idx:
+            idx = inbox_id_to_train_idx[msg.id]
+            mask = np.ones(len(train_embeddings), dtype=bool)
+            mask[idx] = False
+            result = classify(query_embedding, train_embeddings[mask],
+                            [l for i, l in enumerate(train_labels) if mask[i]], k=args.k)
+        else:
+            result = classify(query_embedding, train_embeddings, train_labels, k=args.k)
 
         sender = msg.from_name or msg.from_address
         top_sim = result.neighbors[0][0] if result.neighbors else 0.0

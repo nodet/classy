@@ -22,6 +22,7 @@ class ClassificationResult:
 HIGH_CONFIDENCE_THRESHOLD = 0.95
 MEDIUM_CONFIDENCE_THRESHOLD = 0.80
 MIN_EXAMPLES_PER_LABEL = 5
+SKIP_LABEL = "__skip__"
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -126,6 +127,15 @@ def classify(
 
     scores = aggregate_scores(eligible_neighbors)
     label, confidence = compute_confidence(scores)
+
+    # If __skip__ wins or is the only real contender, don't label
+    if label == SKIP_LABEL:
+        return ClassificationResult(
+            label="", confidence=0.0, action=Action.NO_LABEL, neighbors=neighbors
+        )
+
+    # Confidence already includes __skip__ in the denominator,
+    # so its presence naturally dilutes confidence in the winning real label
     action = decide_action(confidence)
 
     return ClassificationResult(
