@@ -240,6 +240,35 @@ Thresholds can be tuned based on observed false-positive rates.
 
 ---
 
+## Coexistence with Gmail Filters
+
+Some labels are best handled by Gmail's built-in filters rather than content-based classification. For example, labels defined by recipient address (e.g., "move everything sent to alias+xyz@gmail.com to label XYZ") are not content-learnable — the same email content could arrive at different addresses and need different labels.
+
+**Policy:** Leave such Gmail filters active. The classifier only acts on messages that arrive with no user label. Since filters run server-side at delivery time, filter-labeled messages are already labeled before the classifier ever sees them.
+
+**Why this works:**
+
+- Gmail applies filters synchronously during message delivery.
+- By the time the classifier queries a message (whether via polling or push notification), filters have already run.
+- The classifier's rule is simple: "if a message already has a user label, skip it."
+- Filter-based labels still contribute to the training set (their content is embedded and used as neighbors), but the classifier never *predicts* into those labels for new messages — because messages destined for those labels arrive pre-labeled.
+
+**Auto-detection of non-content-learnable labels:**
+
+During evaluation (leave-one-out cross-validation), per-label precision naturally reveals which labels are not content-learnable. Labels whose precision falls significantly below others (e.g., <95% when others are >99%) are candidates for filter-based handling rather than ML classification. The evaluation script reports per-label precision to surface this.
+
+**Validation with push notifications:**
+
+When using the Gmail Watch API (push), there is a theoretical race condition: could a push notification arrive before the filter has applied its label? In practice, no — Gmail processes filters as part of message delivery, before updating the mailbox history that triggers the push. However, to be safe:
+
+1. When the classifier receives a push notification for a new message, it fetches the message's *current* label state from the API.
+2. If the message already carries any user-defined label, it is skipped (assumed handled by a filter or manually).
+3. Only truly unlabeled messages proceed to classification.
+
+This "check before classifying" step is both the correct behavior and a safety net against any edge-case timing issues.
+
+---
+
 ## Learning from Label State
 
 Gmail is the source of truth. The current label state of any message IS the ground truth.
