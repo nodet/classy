@@ -1,4 +1,5 @@
 from gmail_classifier.preprocessing import (
+    preprocess_email_body,
     remove_forwarded,
     remove_quoted_replies,
     strip_html,
@@ -99,3 +100,21 @@ def test_truncate_long_text():
 def test_truncate_short_text_unchanged():
     text = "Short email"
     assert truncate(text, max_words=400) == "Short email"
+
+
+def test_preprocess_combines_all_steps():
+    html = """<html><head><style>h1{color:red}</style></head><body>
+<p>Important update about the project.</p>
+<p>We need to discuss next steps.</p>
+<p>On Tue, Feb 1, 2025, Alice wrote:</p>
+<blockquote>> Old message content here</blockquote>
+<p>-- </p>
+<p>Bob Smith<br>VP Engineering</p>
+</body></html>"""
+    result = preprocess_email_body(html)
+    assert "Important update" in result
+    assert "discuss next steps" in result
+    assert "Old message" not in result
+    assert "Bob Smith" not in result
+    assert "<" not in result
+    assert "color:red" not in result

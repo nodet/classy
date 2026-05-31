@@ -79,3 +79,13 @@ def truncate(text: str, max_words: int = 400) -> str:
     if len(words) <= max_words:
         return text
     return " ".join(words[:max_words])
+
+
+def preprocess_email_body(html: str) -> str:
+    """Full preprocessing pipeline: HTML strip, quotes, forwards, signature, truncate."""
+    text = strip_html(html)
+    text = remove_forwarded(text)
+    text = remove_quoted_replies(text)
+    text = trim_signature(text)
+    text = truncate(text)
+    return text
