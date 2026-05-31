@@ -1,11 +1,11 @@
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
 
 class Embedder:
     """Wrapper around sentence-transformers for computing text embeddings."""
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        from sentence_transformers import SentenceTransformer
         self._model = SentenceTransformer(model_name)
 
     def embed(self, text: str) -> np.ndarray:
