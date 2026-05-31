@@ -28,12 +28,15 @@ def run_evaluation(
     if thresholds is None:
         thresholds = DEFAULT_THRESHOLDS
 
-    embeddings, labels = build_training_data(messages)
+    from gmail_classifier.embeddings import Embedder
+    embedder = Embedder()
+
+    embeddings, labels = build_training_data(messages, embedder=embedder)
 
     extra_embeddings = None
     extra_labels = None
     if skip_messages:
-        extra_embeddings, extra_labels = build_training_data(skip_messages)
+        extra_embeddings, extra_labels = build_training_data(skip_messages, embedder=embedder)
 
     results = leave_one_out(
         embeddings, labels, k=k,
