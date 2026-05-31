@@ -11,6 +11,8 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "beautifulsoup4",
+    "google-api-python-client",
+    "google-auth-oauthlib",
 ]
 
 [project.optional-dependencies]
