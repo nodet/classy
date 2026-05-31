@@ -24,9 +24,8 @@ def fetch_messages_for_label(
     if not new_ids:
         return
 
-    raw_messages = client.get_messages(new_ids)
-    for raw in raw_messages:
+    for mid in new_ids:
+        raw = client.get_message(mid)
         msg = parse_gmail_message(raw)
-        # Override labels with the user-friendly label name
         msg.labels = [label_name]
         store.save_message(msg)
