@@ -1,6 +1,11 @@
 import base64
 
-from gmail_classifier.gmail_parser import decode_body, extract_headers, parse_sender
+from gmail_classifier.gmail_parser import (
+    decode_body,
+    extract_headers,
+    parse_gmail_message,
+    parse_sender,
+)
 
 
 def _b64url(text: str) -> str:
@@ -150,3 +155,47 @@ def test_decode_body_nested_multipart():
 def test_decode_body_empty():
     payload = {"mimeType": "text/plain", "body": {}}
     assert decode_body(payload) == ""
+
+
+def test_parse_gmail_message_full():
+    raw = {
+        "id": "abc123",
+        "labelIds": ["Label_1", "Label_2"],
+        "payload": {
+            "mimeType": "text/html",
+            "headers": [
+                {"name": "From", "value": "Alice Smith <alice@example.com>"},
+                {"name": "Subject", "value": "Project update"},
+                {"name": "Date", "value": "Mon, 15 Jan 2025 10:00:00 +0000"},
+                {"name": "List-Id", "value": "<dev.lists.example.com>"},
+            ],
+            "body": {"data": _b64url("<p>Here is the update.</p>")},
+        },
+    }
+    msg = parse_gmail_message(raw)
+    assert msg.id == "abc123"
+    assert msg.from_name == "Alice Smith"
+    assert msg.from_address == "alice@example.com"
+    assert msg.subject == "Project update"
+    assert msg.body_html == "<p>Here is the update.</p>"
+    assert msg.labels == ["Label_1", "Label_2"]
+    assert msg.list_id == "dev.lists.example.com"
+    assert msg.date == "Mon, 15 Jan 2025 10:00:00 +0000"
+
+
+def test_parse_gmail_message_minimal():
+    raw = {
+        "id": "xyz789",
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [],
+            "body": {},
+        },
+    }
+    msg = parse_gmail_message(raw)
+    assert msg.id == "xyz789"
+    assert msg.from_name == ""
+    assert msg.from_address == ""
+    assert msg.subject == ""
+    assert msg.body_html == ""
+    assert msg.labels == []

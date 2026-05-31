@@ -67,3 +67,25 @@ def decode_body(payload: dict) -> str:
                     html_body = nested
 
     return html_body or plain_body
+
+
+def parse_gmail_message(raw: dict) -> "Message":
+    """Parse a Gmail API message resource into a Message object."""
+    from gmail_classifier.models import Message
+
+    payload = raw.get("payload", {})
+    headers = payload.get("headers", [])
+    extracted = extract_headers(headers)
+    from_name, from_address = parse_sender(extracted["from"])
+    body = decode_body(payload)
+
+    return Message(
+        id=raw["id"],
+        subject=extracted["subject"],
+        from_name=from_name,
+        from_address=from_address,
+        body_html=body,
+        labels=raw.get("labelIds", []),
+        list_id=extracted["list_id"],
+        date=extracted["date"],
+    )
