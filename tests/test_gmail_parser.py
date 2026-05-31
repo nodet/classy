@@ -1,4 +1,11 @@
-from gmail_classifier.gmail_parser import extract_headers, parse_sender
+import base64
+
+from gmail_classifier.gmail_parser import decode_body, extract_headers, parse_sender
+
+
+def _b64url(text: str) -> str:
+    """Helper to base64url-encode a string like Gmail API does."""
+    return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
 from gmail_classifier.models import Message
 
 
@@ -90,3 +97,56 @@ def test_extract_headers_case_insensitive():
     headers = [{"name": "subject", "value": "Hello"}]
     result = extract_headers(headers)
     assert result["subject"] == "Hello"
+
+
+def test_decode_body_simple_text_plain():
+    payload = {"mimeType": "text/plain", "body": {"data": _b64url("Hello world")}}
+    assert decode_body(payload) == "Hello world"
+
+
+def test_decode_body_simple_html():
+    payload = {"mimeType": "text/html", "body": {"data": _b64url("<p>Hello</p>")}}
+    assert decode_body(payload) == "<p>Hello</p>"
+
+
+def test_decode_body_multipart_prefers_html():
+    payload = {
+        "mimeType": "multipart/alternative",
+        "parts": [
+            {"mimeType": "text/plain", "body": {"data": _b64url("Hello")}},
+            {"mimeType": "text/html", "body": {"data": _b64url("<p>Hello</p>")}},
+        ],
+    }
+    assert decode_body(payload) == "<p>Hello</p>"
+
+
+def test_decode_body_multipart_falls_back_to_plain():
+    payload = {
+        "mimeType": "multipart/alternative",
+        "parts": [
+            {"mimeType": "text/plain", "body": {"data": _b64url("Hello")}},
+        ],
+    }
+    assert decode_body(payload) == "Hello"
+
+
+def test_decode_body_nested_multipart():
+    payload = {
+        "mimeType": "multipart/mixed",
+        "parts": [
+            {
+                "mimeType": "multipart/alternative",
+                "parts": [
+                    {"mimeType": "text/plain", "body": {"data": _b64url("plain")}},
+                    {"mimeType": "text/html", "body": {"data": _b64url("<b>html</b>")}},
+                ],
+            },
+            {"mimeType": "application/pdf", "body": {"size": 12345}},
+        ],
+    }
+    assert decode_body(payload) == "<b>html</b>"
+
+
+def test_decode_body_empty():
+    payload = {"mimeType": "text/plain", "body": {}}
+    assert decode_body(payload) == ""
