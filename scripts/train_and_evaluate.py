@@ -25,6 +25,14 @@ def main():
         "--exclude-labels", nargs="*", default=[],
         help="Labels to exclude from evaluation (e.g. --exclude-labels XLC XLE XLCap)",
     )
+    parser.add_argument(
+        "--skip-db", default="data/inbox_sample.db",
+        help="Path to inbox/skip messages used as negative examples (default: data/inbox_sample.db)",
+    )
+    parser.add_argument(
+        "--no-skip", action="store_true",
+        help="Don't use skip examples (evaluate without negative examples)",
+    )
     args = parser.parse_args()
 
     # Load messages
@@ -52,12 +60,29 @@ def main():
         print(f"  {label:30s} {count:5d}")
     print()
 
+    # Load skip examples
+    skip_messages = None
+    if not args.no_skip:
+        from pathlib import Path
+        skip_path = Path(args.skip_db)
+        if skip_path.exists():
+            from gmail_classifier.classifier import SKIP_LABEL
+            skip_store = MessageStore(args.skip_db)
+            skip_messages = skip_store.load_all()
+            skip_store.close()
+            for m in skip_messages:
+                m.labels = [SKIP_LABEL]
+            print(f"Skip examples: {len(skip_messages)} messages from {args.skip_db}")
+        else:
+            print(f"Skip DB not found: {args.skip_db} (running without skip examples)")
+    print()
+
     # Run evaluation
     print(f"Running leave-one-out cross-validation (k={args.k})...")
     print("(This embeds all messages and classifies each one — may take a while)")
     print()
 
-    table, results = run_evaluation(messages, k=args.k)
+    table, results = run_evaluation(messages, k=args.k, skip_messages=skip_messages)
 
     # Print metrics table
     print(f"{'Threshold':>10s} {'Precision':>10s} {'Coverage':>10s} {'Labeled':>8s}")
