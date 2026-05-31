@@ -34,3 +34,12 @@ def remove_quoted_replies(text: str) -> str:
     while result and not result[-1].strip():
         result.pop()
     return "\n".join(result)
+
+
+def remove_forwarded(text: str) -> str:
+    """Remove forwarded message blocks (everything after the forward separator)."""
+    # Match common forward separators
+    pattern = r"\n*-{5,}\s*Forwarded message\s*-{5,}"
+    parts = re.split(pattern, text, maxsplit=1)
+    result = parts[0].rstrip()
+    return result

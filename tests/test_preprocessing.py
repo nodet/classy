@@ -1,4 +1,8 @@
-from gmail_classifier.preprocessing import remove_quoted_replies, strip_html
+from gmail_classifier.preprocessing import (
+    remove_forwarded,
+    remove_quoted_replies,
+    strip_html,
+)
 
 
 def test_strip_html_basic():
@@ -48,3 +52,20 @@ def test_remove_outlook_style_quote():
 def test_no_quotes_unchanged():
     text = "Normal email with no quoting"
     assert remove_quoted_replies(text) == "Normal email with no quoting"
+
+
+def test_remove_forwarded_header_block():
+    text = (
+        "FYI see below\n\n"
+        "---------- Forwarded message ----------\n"
+        "From: someone@example.com\n"
+        "To: me@example.com\n"
+        "Subject: Original\n\n"
+        "Original body"
+    )
+    assert remove_forwarded(text) == "FYI see below"
+
+
+def test_no_forward_unchanged():
+    text = "Normal email"
+    assert remove_forwarded(text) == "Normal email"
