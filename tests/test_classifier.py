@@ -1,7 +1,12 @@
 import numpy as np
 import pytest
 
-from gmail_classifier.classifier import aggregate_scores, cosine_similarity, find_neighbors
+from gmail_classifier.classifier import (
+    aggregate_scores,
+    compute_confidence,
+    cosine_similarity,
+    find_neighbors,
+)
 
 
 def test_cosine_similarity_identical_vectors():
@@ -76,3 +81,30 @@ def test_score_aggregation_multiple_labels():
     ]
     scores = aggregate_scores(neighbors)
     assert scores == {"Tech": pytest.approx(2.4), "Travel": pytest.approx(1.1)}
+
+
+def test_confidence_all_same_label():
+    scores = {"Tech": 3.5}
+    label, confidence = compute_confidence(scores)
+    assert label == "Tech"
+    assert confidence == pytest.approx(1.0)
+
+
+def test_confidence_split_labels():
+    scores = {"Tech": 2.4, "Travel": 1.1}
+    label, confidence = compute_confidence(scores)
+    assert label == "Tech"
+    assert confidence == pytest.approx(2.4 / 3.5)
+
+
+def test_confidence_even_split():
+    scores = {"A": 1.0, "B": 1.0}
+    label, confidence = compute_confidence(scores)
+    assert confidence == pytest.approx(0.5)
+
+
+def test_confidence_three_labels():
+    scores = {"Tech": 2.0, "Travel": 0.8, "News": 0.2}
+    label, confidence = compute_confidence(scores)
+    assert label == "Tech"
+    assert confidence == pytest.approx(2.0 / 3.0)

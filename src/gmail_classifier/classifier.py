@@ -46,3 +46,18 @@ def aggregate_scores(neighbors: List[Tuple[float, str]]) -> dict:
     for sim, label in neighbors:
         scores[label] = scores.get(label, 0.0) + sim
     return scores
+
+
+def compute_confidence(scores: dict) -> Tuple[str, float]:
+    """Compute confidence as ratio of winning score to total score.
+
+    Returns (winning_label, confidence) where confidence is between 0 and 1.
+    """
+    if not scores:
+        return ("", 0.0)
+    total = sum(scores.values())
+    if total == 0:
+        return ("", 0.0)
+    winning_label = max(scores, key=scores.get)
+    confidence = scores[winning_label] / total
+    return (winning_label, confidence)
