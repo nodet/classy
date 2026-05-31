@@ -71,3 +71,11 @@ def trim_signature(text: str) -> str:
             return result
 
     return text
+
+
+def truncate(text: str, max_words: int = 400) -> str:
+    """Truncate text to approximately max_words words."""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])

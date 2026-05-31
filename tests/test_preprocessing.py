@@ -3,6 +3,7 @@ from gmail_classifier.preprocessing import (
     remove_quoted_replies,
     strip_html,
     trim_signature,
+    truncate,
 )
 
 
@@ -85,3 +86,16 @@ def test_trim_signature_no_separator():
 def test_trim_signature_sent_from_iphone():
     text = "Quick reply\n\nSent from my iPhone"
     assert trim_signature(text) == "Quick reply"
+
+
+def test_truncate_long_text():
+    # ~2000 words, well over 512 token limit
+    words = ["word"] * 2000
+    text = " ".join(words)
+    result = truncate(text, max_words=400)
+    assert len(result.split()) <= 400
+
+
+def test_truncate_short_text_unchanged():
+    text = "Short email"
+    assert truncate(text, max_words=400) == "Short email"
