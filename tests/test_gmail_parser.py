@@ -1,3 +1,4 @@
+from gmail_classifier.gmail_parser import parse_sender
 from gmail_classifier.models import Message
 
 
@@ -29,3 +30,33 @@ def test_message_model_defaults():
     assert msg.labels == []
     assert msg.list_id == ""
     assert msg.date == ""
+
+
+def test_parse_sender_name_and_email():
+    name, address = parse_sender("John Doe <john@example.com>")
+    assert name == "John Doe"
+    assert address == "john@example.com"
+
+
+def test_parse_sender_email_only():
+    name, address = parse_sender("john@example.com")
+    assert name == ""
+    assert address == "john@example.com"
+
+
+def test_parse_sender_quoted_name():
+    name, address = parse_sender('"Doe, John" <john@example.com>')
+    assert name == "Doe, John"
+    assert address == "john@example.com"
+
+
+def test_parse_sender_angle_brackets_only():
+    name, address = parse_sender("<bot@system.com>")
+    assert name == ""
+    assert address == "bot@system.com"
+
+
+def test_parse_sender_empty():
+    name, address = parse_sender("")
+    assert name == ""
+    assert address == ""
