@@ -158,7 +158,7 @@ def main():
             print(f"  [{action_str}] {result.label:20s} {result.confidence:5.1%}  {sender} — {msg.subject}")
 
             if not args.dry_run:
-                client.apply_label(mid, label_id)
+                client.apply_label(mid, label_id, archive=True)
 
             if result.action == Action.LABEL:
                 labeled_count += 1

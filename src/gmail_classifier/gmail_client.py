@@ -55,10 +55,13 @@ class GmailClient:
         """Get multiple messages by ID."""
         return [self.get_message(mid) for mid in message_ids]
 
-    def apply_label(self, message_id: str, label_id: str):
-        """Add a label to a message."""
+    def apply_label(self, message_id: str, label_id: str, archive: bool = False):
+        """Add a label to a message, optionally archiving it."""
+        body = {"addLabelIds": [label_id]}
+        if archive:
+            body["removeLabelIds"] = ["INBOX"]
         self._service.users().messages().modify(
-            userId="me", id=message_id, body={"addLabelIds": [label_id]}
+            userId="me", id=message_id, body=body
         ).execute()
 
     def get_message_labels(self, message_id: str) -> List[str]:
