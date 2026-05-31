@@ -90,7 +90,8 @@ def main():
         result = classify(query_embedding, train_embeddings, train_labels, k=args.k)
 
         sender = msg.from_name or msg.from_address
-        line = f"  {result.label or '(none)':20s} {result.confidence:5.1%}  {sender} — {msg.subject}"
+        top_sim = result.neighbors[0][0] if result.neighbors else 0.0
+        line = f"  {result.label or '(none)':20s} {result.confidence:5.1%} sim={top_sim:.3f}  {sender} — {msg.subject}"
 
         if result.action == Action.LABEL:
             sure.append(line)
