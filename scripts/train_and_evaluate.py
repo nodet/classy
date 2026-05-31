@@ -13,8 +13,8 @@ def main():
         description="Evaluate classification quality using leave-one-out cross-validation"
     )
     parser.add_argument(
-        "--db", default="messages.db",
-        help="Path to the SQLite message store (default: messages.db)",
+        "--db", default="data/training.db",
+        help="Path to the SQLite message store (default: data/training.db)",
     )
     parser.add_argument(
         "--k", type=int, default=5,
