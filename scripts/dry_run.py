@@ -138,17 +138,17 @@ def main():
         else:
             low.append(line)
 
-    # Print grouped results
-    print(f"SURE ({len(sure)}):")
-    for line in sure:
+    # Print grouped results (least interesting first)
+    print(f"LOW ({len(low)}):")
+    for line in low:
         print(line)
 
     print(f"\nREVIEW ({len(review)}):")
     for line in review:
         print(line)
 
-    print(f"\nLOW ({len(low)}):")
-    for line in low:
+    print(f"\nSURE ({len(sure)}):")
+    for line in sure:
         print(line)
 
     print(f"\nTotal: {len(sure)} sure, {len(review)} review, {len(low)} low")
