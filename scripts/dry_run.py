@@ -73,7 +73,9 @@ def main():
     print()
 
     # Classify each inbox message
-    action_counts = {Action.LABEL: 0, Action.LABEL_WITH_REVIEW: 0, Action.NO_LABEL: 0}
+    sure = []
+    review = []
+    low = []
 
     for msg in inbox_messages:
         body = preprocess_email_body(msg.body_html)
@@ -87,36 +89,30 @@ def main():
         query_embedding = embedder.embed(text)
         result = classify(query_embedding, train_embeddings, train_labels, k=args.k)
 
-        action_counts[result.action] += 1
-
-        # Format verdict
-        if result.action == Action.LABEL:
-            verdict = "WOULD LABEL"
-        elif result.action == Action.LABEL_WITH_REVIEW:
-            verdict = "WOULD LABEL (review)"
-        else:
-            verdict = "SKIP (low confidence)"
-
-        # Print result
         sender = msg.from_name or msg.from_address
-        print(f"{'─' * 70}")
-        print(f"From: {sender}")
-        print(f"Subject: {msg.subject}")
-        print(f"  → {result.label or '(none)'} (confidence: {result.confidence:.1%}) — {verdict}")
+        line = f"  {result.label or '(none)':20s} {result.confidence:5.1%}  {sender} — {msg.subject}"
 
-        # Show neighbors
-        if result.neighbors:
-            print(f"  Neighbors:")
-            for sim, lbl in result.neighbors[:5]:
-                print(f"    {sim:.3f}  [{lbl}]")
-        print()
+        if result.action == Action.LABEL:
+            sure.append(line)
+        elif result.action == Action.LABEL_WITH_REVIEW:
+            review.append(line)
+        else:
+            low.append(line)
 
-    # Summary
-    print(f"{'═' * 70}")
-    print(f"Summary ({len(inbox_messages)} messages):")
-    print(f"  WOULD LABEL:          {action_counts[Action.LABEL]:4d}")
-    print(f"  WOULD LABEL (review): {action_counts[Action.LABEL_WITH_REVIEW]:4d}")
-    print(f"  SKIP (low confidence):{action_counts[Action.NO_LABEL]:4d}")
+    # Print grouped results
+    print(f"SURE ({len(sure)}):")
+    for line in sure:
+        print(line)
+
+    print(f"\nREVIEW ({len(review)}):")
+    for line in review:
+        print(line)
+
+    print(f"\nLOW ({len(low)}):")
+    for line in low:
+        print(line)
+
+    print(f"\nTotal: {len(sure)} sure, {len(review)} review, {len(low)} low")
 
 
 if __name__ == "__main__":
