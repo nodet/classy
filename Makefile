@@ -1,4 +1,4 @@
-.PHONY: help setup test clean fetch-training fetch-inbox evaluate
+.PHONY: help setup test quick clean fetch-training fetch-inbox evaluate
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -8,6 +8,9 @@ setup: ## Install dependencies and set up dev environment
 
 test: ## Run all tests
 	uv run pytest
+
+quick: ## Run fast tests only (skip ML model loading)
+	uv run pytest -m "not slow"
 
 fetch-training: ## Fetch labeled messages from Gmail (see docs/gmail-setup.md)
 	uv run python scripts/fetch_training_data.py
