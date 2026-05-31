@@ -486,131 +486,66 @@ The primary risk is ML effectiveness, not infrastructure. Validate classificatio
 
 ---
 
-### Phase 1: Validate the ML Approach (laptop, no side effects)
+### Phase 1: Validate the ML Approach (laptop, no side effects) [DONE]
 
 Goal: answer the question "does this actually work on my email?" before writing any service code.
 
+**Result: YES.** 99.9% precision at 91.7% coverage on content-based labels, with skip examples preventing false positives on inbox messages.
+
 #### Step 1.1: Project Skeleton and Unit Tests [DONE]
 
-Set up the Python project with unit tests using synthetic data.
+Set up the Python project with unit tests using synthetic data (95 tests, all passing).
 
-**Implemented (39 tests, all passing):**
+#### Step 1.2: OAuth2 Setup and Gmail Fetch [DONE]
 
-- Preprocessing pipeline: strip_html, remove_quoted_replies, remove_forwarded, trim_signature, truncate, preprocess_email_body
-- Text representation: build_text_representation (sender, subject, body, optional list-id)
-- Classifier: cosine_similarity, find_neighbors (KNN), aggregate_scores, compute_confidence, decide_action, classify
-- ClassificationResult dataclass, Action enum, MIN_EXAMPLES_PER_LABEL threshold
-- All tests use plain strings or synthetic NumPy vectors — no embedding model needed, suite runs in <200ms
+- `scripts/fetch_training_data.py`: fetches labeled messages (500/label, stores in `data/training.db`)
+- `scripts/fetch_inbox.py`: fetches 500 recent inbox messages (stores in `data/inbox_sample.db`)
+- Incremental: re-running fetches only new messages.
 
-**Not tested with fake data (by design):**
+#### Step 1.3: Train + Cross-Validation [DONE]
 
-- ML quality. Synthetic text embeds differently than real email. Thresholds will be tuned on real data in Step 1.3.
+- Embeddings module (sentence-transformers, lazy-loaded)
+- Training pipeline: messages → preprocess → embed → (embeddings, labels)
+- Leave-one-out cross-validation with optional `__skip__` examples
+- Evaluation metrics: precision/coverage at threshold, per-label precision
+- CLI: `scripts/train_and_evaluate.py`
 
-#### Step 1.2: OAuth2 Setup and Gmail Fetch
+#### Step 1.4: Dry-Run + Skip Discovery [DONE]
 
-One-time interactive setup, then fetch and cache real data locally.
+- CLI: `scripts/dry_run.py` — classifies inbox messages without modifying Gmail
 
-**Steps:**
+**Key discovery: the false positive problem.**
 
-1. Create Google Cloud project, enable Gmail API, create OAuth credentials.
-2. Write a CLI script: `fetch_training_data.py`
-   - Authenticate (opens browser, stores refresh token in `credentials/token.json`)
-   - For each target label: call `messages.list(labelIds=[label_id])`, then batch `messages.get`
-   - Extract: message ID, sender, subject, headers, body (raw or parsed)
-   - Store in a local SQLite database or JSON file (not committed to git)
-3. Write a second script or flag: `fetch_inbox.py`
-   - Fetch the last N messages from INBOX that have no category label
-   - Same extraction logic
-   - These become the "dry run" test set
+Without negative examples, the classifier labels 54% of inbox messages (all incorrectly) because KNN confidence only measures neighbor agreement, not absolute fit. Bank alerts, booking confirmations, etc. have no training examples but land near "Pub" in embedding space — and all 5 neighbors agree, giving 100% confidence.
 
-**Output:** a local file like `data/training.db` with a few hundred to a few thousand labeled messages, and `data/inbox_sample.db` with N recent unlabeled messages.
+**Solution: `__skip__` pseudo-label.**
 
-**Privacy:** add `data/` and `credentials/` to `.gitignore`. Real email never leaves the laptop.
+Unlabeled inbox messages are used as negative training examples with a `__skip__` label. When `__skip__` wins the KNN vote, the message is left unlabeled. When it's among neighbors but doesn't win, its score dilutes confidence in the real label.
 
-**Rate limit handling:** batch fetches, exponential backoff, progress output. The initial fetch might take a few minutes depending on volume.
-
-#### Step 1.3: Train (Build the Index)
-
-**Steps:**
-
-1. Load training messages from the local store.
-2. Preprocess each (HTML strip, quote removal, signature trim, truncate).
-3. Construct the text representation: `"{from_name} <{from_address}> | {subject} | {body_snippet}"` (experiment with format).
-4. Compute embeddings using sentence-transformers.
-5. Store embeddings + labels in memory (NumPy arrays).
-
-**Validation via leave-one-out cross-validation:**
-
-Before testing on new messages, measure how well the system classifies its own training data:
-
-- For each training message, remove it from the index.
-- Classify it against the remaining messages.
-- Record: predicted label, true label, confidence.
-
-This gives a confusion matrix and per-threshold accuracy without needing separate test data.
-
-**Key metrics:**
-
-- **Precision at threshold T**: of messages where confidence >= T, what fraction are correctly labeled?
-- **Coverage at threshold T**: what fraction of messages have confidence >= T?
-
-The tradeoff: higher threshold = higher precision but lower coverage (more messages left unlabeled). This is acceptable — the system should be conservative.
-
-**Expected output:**
+**Results with skip examples (6 content-based labels, excluding filter-based XLC/XLE/XLCap):**
 
 ```
 Threshold  Precision  Coverage
-0.95       98%        45%
-0.90       95%        62%
-0.80       88%        78%
-0.70       82%        87%
+0.95       99.9%      91.7%
+0.80       99.8%      95.9%
+0.60       99.6%      98.8%
 ```
 
-This table directly informs threshold tuning.
+- Inbox false positives: 3.8% (19/500) — down from 54% without skip
+- Per-label precision: 99.1%–100% for all 6 content-based labels
+- Only 5 errors in LOO (4 are RO↔Gurobi which are legitimately related)
 
-#### Step 1.4: Dry-Run Classification
+#### Phase 1 Lessons Learned
 
-**Steps:**
+1. **Confidence alone is insufficient.** KNN confidence = neighbor agreement, not absolute similarity. A message far from all training data still gets 100% confidence if all distant neighbors share a label.
 
-1. Load the trained index (all training embeddings + labels).
-2. Load the inbox sample (N recent unlabeled messages).
-3. For each inbox message:
-   - Preprocess and embed.
-   - Run KNN classification.
-   - Record: predicted label, confidence, top 5 nearest neighbors (with their subjects/senders for interpretability).
-4. Output a report sorted by confidence (highest first).
+2. **Negative examples are essential.** The unlabeled inbox provides the "don't label" signal. Without it, the classifier has no concept of "none of the above."
 
-**Report format:**
+3. **Filter-based labels are not content-learnable.** Labels defined by recipient address (not by content) confuse the classifier. These should remain handled by Gmail filters. Per-label precision in evaluation naturally surfaces them.
 
-```
-Message: "Rust 1.80 release notes" from releases@rust-lang.org
-  Prediction: Technology (confidence: 0.89)
-  Neighbors:
-    1. "Rust 1.75 changelog" [Technology] (sim: 0.91)
-    2. "Go 1.22 release" [Technology] (sim: 0.84)
-    3. "LLVM weekly" [Technology] (sim: 0.79)
-    4. "RustConf CFP" [Conferences] (sim: 0.76)
-    5. "Cargo tips" [Technology] (sim: 0.74)
-  Verdict: WOULD LABEL (medium confidence)
+4. **Labeling must be exhaustive.** When creating a new label, label ALL matching messages in the inbox — leaving some unlabeled sends contradictory signal (same content in both label and skip pools).
 
-Message: "Re: dinner tonight?" from spouse@gmail.com
-  Prediction: Personal (confidence: 0.42)
-  Neighbors:
-    1. "Weekend plans" [Personal] (sim: 0.55)
-    2. "Team lunch Friday" [Work] (sim: 0.51)
-    ...
-  Verdict: WOULD NOT LABEL (low confidence)
-```
-
-**Manual review:** read the report, count how many predictions are correct, wrong, or debatable. This is the real test.
-
-#### Phase 1 Success Criteria
-
-- Precision >= 95% at the chosen threshold (i.e., when the system would label, it's almost always right)
-- Coverage is reasonable (the system labels at least 40-50% of fileable messages, not just the trivially obvious ones)
-- The failure modes make sense (ambiguous messages stay unlabeled, not mislabeled)
-
-If these aren't met, iterate: try a different embedding model, adjust preprocessing, change K, experiment with the text representation format.
+5. **The inbox IS the negative training set** (when Gmail filters handle everything that should be labeled). No bootstrapping problem in this case.
 
 ---
 
@@ -620,25 +555,37 @@ Goal: let the system actually modify Gmail, with guardrails.
 
 #### Steps:
 
-1. Add a `classify_and_label.py` script (or mode flag).
-2. Fetch recent unlabeled inbox messages via API.
-3. Classify each.
-4. For messages above threshold: apply the label via `messages.modify`.
-5. For medium-confidence messages: also apply `AI-Predicted` label.
-6. Log every action taken.
+1. Add a `classify_and_label.py` script.
+2. Build training index: labeled messages + inbox as `__skip__` examples.
+3. Fetch recent unlabeled inbox messages via API.
+4. For each message: if it already has a user label, skip (filter handled it).
+5. Classify against the training index.
+6. For messages above threshold: apply the label via `messages.modify`.
+7. For medium-confidence messages: also apply `AI-Predicted` label.
+8. Log every action taken.
+
+#### Training data refresh:
+
+Before each run:
+- Re-fetch training data (`make fetch-training`) — picks up newly labeled messages.
+- Re-fetch inbox (`make fetch-inbox`) — refreshes the `__skip__` pool, removing messages that were labeled since last fetch.
+
+#### Exclude non-content labels:
+
+Labels handled by Gmail filters (XLC, XLE, XLCap in current setup) should be excluded from predictions via `--exclude-labels`. These are detected by per-label precision in evaluation (<95% = likely not content-learnable).
 
 #### Guardrails:
 
-- Start with a very high threshold (95%+).
+- Start with the 0.95 threshold (99.9% precision validated).
 - Run manually (not on a schedule) for the first few days.
-- Review the log after each run. If mislabeling occurs, lower the threshold or investigate why.
-- Add a `--dry-run` flag that shows what would happen without modifying anything (reuse Phase 1 logic).
+- Review the log after each run.
+- Add a `--dry-run` flag that shows what would happen without modifying anything.
 
 #### Feedback loop:
 
-- After a few manual runs, check for corrections (labels you changed).
-- Feed corrections back into the training set (re-fetch labeled messages, rebuild index).
-- Track precision over time: is it improving as the training set grows?
+- After a few manual runs, check for corrections (labels you changed in Gmail).
+- Re-fetch training data to incorporate corrections.
+- The system self-improves: more labeled messages = better training, more inbox history = better skip signal.
 
 ---
 
