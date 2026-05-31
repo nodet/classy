@@ -178,3 +178,69 @@ def test_label_at_threshold_included():
 
     result = classify(query, training, labels, k=5)
     assert result.label == "NewLabel"
+
+
+def test_classify_clear_winner():
+    dim = 10
+    rng = np.random.default_rng(123)
+
+    # "Tech" cluster tightly packed around [1,0,0,...], 10 examples
+    tech_vecs = rng.normal(0, 0.05, (10, dim))
+    tech_vecs[:, 0] += 1.0
+    tech_vecs = tech_vecs / np.linalg.norm(tech_vecs, axis=1, keepdims=True)
+
+    # "Travel" cluster tightly packed around [0,1,0,...], 10 examples
+    travel_vecs = rng.normal(0, 0.05, (10, dim))
+    travel_vecs[:, 1] += 1.0
+    travel_vecs = travel_vecs / np.linalg.norm(travel_vecs, axis=1, keepdims=True)
+
+    training = np.vstack([tech_vecs, travel_vecs])
+    labels = ["Tech"] * 10 + ["Travel"] * 10
+
+    # Query very close to Tech
+    query = np.zeros(dim)
+    query[0] = 1.0
+
+    result = classify(query, training, labels, k=5)
+    assert result.label == "Tech"
+    assert result.confidence > 0.9
+    assert result.action == Action.LABEL
+    assert len(result.neighbors) == 5
+
+
+def test_classify_ambiguous():
+    dim = 10
+    rng = np.random.default_rng(99)
+
+    # Two clusters with slight noise, both at similar distance to query
+    tech_vecs = rng.normal(0, 0.05, (5, dim))
+    tech_vecs[:, 0] += 1.0
+    tech_vecs[:, 2] += 0.5
+    tech_vecs = tech_vecs / np.linalg.norm(tech_vecs, axis=1, keepdims=True)
+
+    travel_vecs = rng.normal(0, 0.05, (5, dim))
+    travel_vecs[:, 1] += 1.0
+    travel_vecs[:, 2] += 0.5
+    travel_vecs = travel_vecs / np.linalg.norm(travel_vecs, axis=1, keepdims=True)
+
+    training = np.vstack([tech_vecs, travel_vecs])
+    labels = ["Tech"] * 5 + ["Travel"] * 5
+
+    # Query along the shared dimension — roughly equidistant to both clusters
+    query = np.zeros(dim)
+    query[2] = 1.0
+
+    result = classify(query, training, labels, k=10)
+    # Both labels should get similar scores -> low confidence
+    assert result.confidence < 0.80
+    assert result.action == Action.NO_LABEL
+
+
+def test_classify_empty_training_set():
+    query = np.array([1.0, 0.0, 0.0])
+    training = np.empty((0, 3))
+    labels = []
+
+    result = classify(query, training, labels, k=5)
+    assert result.label == ""
+    assert result.action == Action.NO_LABEL
