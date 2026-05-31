@@ -451,27 +451,253 @@ This is expected to be rare.
 
 ---
 
-## Suggested MVP
+## Implementation Phases
 
-Technology Stack:
+The primary risk is ML effectiveness, not infrastructure. Validate classification quality first, on a laptop, before building a service.
 
-- Python
+---
+
+### Phase 1: Validate the ML Approach (laptop, no side effects)
+
+Goal: answer the question "does this actually work on my email?" before writing any service code.
+
+#### Step 1.1: Project Skeleton and Fake Dataset
+
+Set up the Python project with a synthetic dataset for fast unit tests.
+
+**What to test with fake data:**
+
+- The preprocessing pipeline (HTML stripping, quote removal, signature trimming)
+- The embedding → KNN → confidence calculation pipeline
+- Edge cases: empty body, very short messages, messages with only a subject
+- Threshold logic (high/medium/low confidence → correct action)
+
+**What NOT to test with fake data:**
+
+- ML quality. Synthetic text embeds differently than real email. Don't tune thresholds or evaluate accuracy on fake data.
+
+**Fake dataset structure:**
+
+```
+tests/fixtures/
+  emails.json   # ~50 synthetic messages across labels
+```
+
+Each entry:
+
+```json
+{
+  "id": "fake-001",
+  "from_name": "Alice",
+  "from_address": "alice@example.com",
+  "subject": "Q3 OKR planning",
+  "body_html": "<p>Hi team, here are the OKRs...</p>",
+  "labels": ["Work"]
+}
+```
+
+Include intentionally ambiguous cases (messages that could belong to multiple labels) and messages that should remain unlabeled (personal, important).
+
+**Tech:**
+
+- pytest
+- A small embedding model or even mock embeddings (random vectors with controlled similarity) for pure-logic tests
+- Real model only for integration tests
+
+#### Step 1.2: OAuth2 Setup and Gmail Fetch
+
+One-time interactive setup, then fetch and cache real data locally.
+
+**Steps:**
+
+1. Create Google Cloud project, enable Gmail API, create OAuth credentials.
+2. Write a CLI script: `fetch_training_data.py`
+   - Authenticate (opens browser, stores refresh token in `credentials/token.json`)
+   - For each target label: call `messages.list(labelIds=[label_id])`, then batch `messages.get`
+   - Extract: message ID, sender, subject, headers, body (raw or parsed)
+   - Store in a local SQLite database or JSON file (not committed to git)
+3. Write a second script or flag: `fetch_inbox.py`
+   - Fetch the last N messages from INBOX that have no category label
+   - Same extraction logic
+   - These become the "dry run" test set
+
+**Output:** a local file like `data/training.db` with a few hundred to a few thousand labeled messages, and `data/inbox_sample.db` with N recent unlabeled messages.
+
+**Privacy:** add `data/` and `credentials/` to `.gitignore`. Real email never leaves the laptop.
+
+**Rate limit handling:** batch fetches, exponential backoff, progress output. The initial fetch might take a few minutes depending on volume.
+
+#### Step 1.3: Train (Build the Index)
+
+**Steps:**
+
+1. Load training messages from the local store.
+2. Preprocess each (HTML strip, quote removal, signature trim, truncate).
+3. Construct the text representation: `"{from_name} <{from_address}> | {subject} | {body_snippet}"` (experiment with format).
+4. Compute embeddings using sentence-transformers.
+5. Store embeddings + labels in memory (NumPy arrays).
+
+**Validation via leave-one-out cross-validation:**
+
+Before testing on new messages, measure how well the system classifies its own training data:
+
+- For each training message, remove it from the index.
+- Classify it against the remaining messages.
+- Record: predicted label, true label, confidence.
+
+This gives a confusion matrix and per-threshold accuracy without needing separate test data.
+
+**Key metrics:**
+
+- **Precision at threshold T**: of messages where confidence >= T, what fraction are correctly labeled?
+- **Coverage at threshold T**: what fraction of messages have confidence >= T?
+
+The tradeoff: higher threshold = higher precision but lower coverage (more messages left unlabeled). This is acceptable — the system should be conservative.
+
+**Expected output:**
+
+```
+Threshold  Precision  Coverage
+0.95       98%        45%
+0.90       95%        62%
+0.80       88%        78%
+0.70       82%        87%
+```
+
+This table directly informs threshold tuning.
+
+#### Step 1.4: Dry-Run Classification
+
+**Steps:**
+
+1. Load the trained index (all training embeddings + labels).
+2. Load the inbox sample (N recent unlabeled messages).
+3. For each inbox message:
+   - Preprocess and embed.
+   - Run KNN classification.
+   - Record: predicted label, confidence, top 5 nearest neighbors (with their subjects/senders for interpretability).
+4. Output a report sorted by confidence (highest first).
+
+**Report format:**
+
+```
+Message: "Rust 1.80 release notes" from releases@rust-lang.org
+  Prediction: Technology (confidence: 0.89)
+  Neighbors:
+    1. "Rust 1.75 changelog" [Technology] (sim: 0.91)
+    2. "Go 1.22 release" [Technology] (sim: 0.84)
+    3. "LLVM weekly" [Technology] (sim: 0.79)
+    4. "RustConf CFP" [Conferences] (sim: 0.76)
+    5. "Cargo tips" [Technology] (sim: 0.74)
+  Verdict: WOULD LABEL (medium confidence)
+
+Message: "Re: dinner tonight?" from spouse@gmail.com
+  Prediction: Personal (confidence: 0.42)
+  Neighbors:
+    1. "Weekend plans" [Personal] (sim: 0.55)
+    2. "Team lunch Friday" [Work] (sim: 0.51)
+    ...
+  Verdict: WOULD NOT LABEL (low confidence)
+```
+
+**Manual review:** read the report, count how many predictions are correct, wrong, or debatable. This is the real test.
+
+#### Phase 1 Success Criteria
+
+- Precision >= 95% at the chosen threshold (i.e., when the system would label, it's almost always right)
+- Coverage is reasonable (the system labels at least 40-50% of fileable messages, not just the trivially obvious ones)
+- The failure modes make sense (ambiguous messages stay unlabeled, not mislabeled)
+
+If these aren't met, iterate: try a different embedding model, adjust preprocessing, change K, experiment with the text representation format.
+
+---
+
+### Phase 2: Apply Labels (laptop, writes to Gmail)
+
+Goal: let the system actually modify Gmail, with guardrails.
+
+#### Steps:
+
+1. Add a `classify_and_label.py` script (or mode flag).
+2. Fetch recent unlabeled inbox messages via API.
+3. Classify each.
+4. For messages above threshold: apply the label via `messages.modify`.
+5. For medium-confidence messages: also apply `AI-Predicted` label.
+6. Log every action taken.
+
+#### Guardrails:
+
+- Start with a very high threshold (95%+).
+- Run manually (not on a schedule) for the first few days.
+- Review the log after each run. If mislabeling occurs, lower the threshold or investigate why.
+- Add a `--dry-run` flag that shows what would happen without modifying anything (reuse Phase 1 logic).
+
+#### Feedback loop:
+
+- After a few manual runs, check for corrections (labels you changed).
+- Feed corrections back into the training set (re-fetch labeled messages, rebuild index).
+- Track precision over time: is it improving as the training set grows?
+
+---
+
+### Phase 3: Autonomous Service (remote, runs unattended)
+
+Goal: move from manual laptop runs to a self-running service.
+
+Only start this phase after Phase 2 has been running successfully for a few weeks with stable precision.
+
+#### Steps:
+
+1. Package into a Docker container.
+2. Add the polling loop (History API every 5 minutes).
+3. Add incremental index updates (label changes update the training set without full rebuild).
+4. Add the history ID persistence and staleness handling.
+5. Deploy to any always-on machine (home server, VPS, or cloud).
+
+#### What changes from Phase 2:
+
+- Polling replaces manual invocation.
+- History API replaces "fetch last N inbox messages".
+- Incremental index updates replace full rebuilds.
+- Needs to handle restarts, token refresh, and error recovery gracefully.
+
+---
+
+## Technology Stack
+
+- Python 3.11+
 - sentence-transformers (all-MiniLM-L6-v2)
-- Gmail API + History API
-- SQLite
-- NumPy (cosine similarity)
-- Docker
+- NumPy
+- google-api-python-client + google-auth
+- SQLite (local cache)
+- pytest (testing)
+- Docker (Phase 3 only)
 
-Workflow:
+---
 
-1. One-time OAuth2 setup to obtain refresh token.
-2. Fetch historical labeled messages (with rate limit handling).
-3. Preprocess and embed messages.
-4. Build similarity index in memory.
-5. Poll History API every 5 minutes.
-6. Classify new unlabeled messages (high threshold to avoid false positives).
-7. Apply Gmail labels for high-confidence predictions.
-8. Update training set when label state changes.
-9. Leave uncertain messages unlabeled (they surface in the inbox).
+## Project Structure (proposed)
 
-This provides semantic email filing with minimal operational complexity, a recoverable nearly-stateless architecture, and a strong bias toward precision over recall.
+```
+gmail-classifier/
+  src/
+    preprocessing.py    # HTML strip, quote removal, signature trim
+    embeddings.py       # sentence-transformers wrapper
+    classifier.py       # KNN logic, confidence calculation
+    gmail_client.py     # API wrapper: fetch, label, history
+    storage.py          # SQLite read/write for messages + embeddings
+  scripts/
+    fetch_training_data.py
+    fetch_inbox.py
+    train_and_evaluate.py
+    classify_dry_run.py
+    classify_and_label.py
+  tests/
+    fixtures/emails.json
+    test_preprocessing.py
+    test_classifier.py
+    test_confidence.py
+  credentials/          # .gitignored
+  data/                 # .gitignored
+  requirements.txt
+  .gitignore
+```
