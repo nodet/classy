@@ -43,3 +43,31 @@ def remove_forwarded(text: str) -> str:
     parts = re.split(pattern, text, maxsplit=1)
     result = parts[0].rstrip()
     return result
+
+
+_MOBILE_SIGNATURES = [
+    "Sent from my iPhone",
+    "Sent from my iPad",
+    "Sent from my Galaxy",
+    "Sent from my Android",
+]
+
+
+def trim_signature(text: str) -> str:
+    """Remove email signatures (-- separator and common mobile signatures)."""
+    lines = text.splitlines()
+
+    # Look for "-- " separator (standard sig delimiter)
+    for i, line in enumerate(lines):
+        if line.rstrip() == "--":
+            result = "\n".join(lines[:i]).rstrip()
+            return result
+
+    # Look for mobile signatures
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if any(stripped.startswith(sig) for sig in _MOBILE_SIGNATURES):
+            result = "\n".join(lines[:i]).rstrip()
+            return result
+
+    return text

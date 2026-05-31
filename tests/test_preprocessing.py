@@ -2,6 +2,7 @@ from gmail_classifier.preprocessing import (
     remove_forwarded,
     remove_quoted_replies,
     strip_html,
+    trim_signature,
 )
 
 
@@ -69,3 +70,18 @@ def test_remove_forwarded_header_block():
 def test_no_forward_unchanged():
     text = "Normal email"
     assert remove_forwarded(text) == "Normal email"
+
+
+def test_trim_signature_dash_separator():
+    text = "Main content\n\n-- \nJohn Doe\nSenior Engineer"
+    assert trim_signature(text) == "Main content"
+
+
+def test_trim_signature_no_separator():
+    text = "Email with no signature"
+    assert trim_signature(text) == "Email with no signature"
+
+
+def test_trim_signature_sent_from_iphone():
+    text = "Quick reply\n\nSent from my iPhone"
+    assert trim_signature(text) == "Quick reply"
