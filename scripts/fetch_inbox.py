@@ -18,7 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch recent inbox messages")
     parser.add_argument("--db", default="data/inbox_sample.db", help="SQLite database path")
     parser.add_argument("--credentials", default="credentials", help="Credentials directory")
-    parser.add_argument("--count", type=int, default=100, help="Number of messages to fetch")
+    parser.add_argument("--count", type=int, default=500, help="Number of messages to fetch")
     args = parser.parse_args()
 
     credentials_dir = Path(args.credentials)
