@@ -120,7 +120,8 @@ def main():
     print(f"\nClassifying {len(new_ids)} messages...")
     labeled_count = 0
     review_count = 0
-    skipped_count = 0
+    already_labeled_count = 0
+    low_confidence_count = 0
 
     for mid in new_ids:
         # Fetch message
@@ -129,7 +130,7 @@ def main():
         # Check if it already has a user label
         msg_label_ids = raw.get("labelIds", [])
         if any(lid in user_label_ids for lid in msg_label_ids):
-            skipped_count += 1
+            already_labeled_count += 1
             continue
 
         # Parse and classify
@@ -164,13 +165,14 @@ def main():
             else:
                 review_count += 1
         else:
-            skipped_count += 1
+            low_confidence_count += 1
 
     # Summary
     print(f"\n{'DRY RUN — ' if args.dry_run else ''}Summary:")
-    print(f"  Labeled:  {labeled_count}")
-    print(f"  Review:   {review_count}")
-    print(f"  Skipped:  {skipped_count}")
+    print(f"  Labeled:          {labeled_count}")
+    print(f"  Review:           {review_count}")
+    print(f"  Low confidence:   {low_confidence_count}")
+    print(f"  Already labeled:  {already_labeled_count}")
 
 
 if __name__ == "__main__":
