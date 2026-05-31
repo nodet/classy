@@ -108,26 +108,94 @@ For each message, construct a text representation from:
 
 ### Similarity-Based Classification
 
+#### Cosine Similarity
+
+For a new message with embedding `v` and a stored embedding `e_i`:
+
+```
+sim(v, e_i) = (v · e_i) / (||v|| * ||e_i||)
+```
+
+sentence-transformers outputs are unit-normalized, so this simplifies to the dot product:
+
+```
+sim(v, e_i) = v · e_i
+```
+
+Result is between -1 and 1. Higher means more semantically similar.
+
+#### KNN Classification (K-Nearest Neighbors)
+
+Labels often cover diverse subtopics. "Technology" might include hardware news, AI research, and developer tools — several clusters within one label. A single centroid per label would average these out and land close to nothing real.
+
+KNN handles this naturally: it looks at individual training examples, not averages. If the new message is closest to 4 AI research emails and 1 hardware email, all labeled "Technology", it correctly classifies as Technology regardless of how diverse that label is overall.
+
+**Algorithm:**
+
+Find the K most similar training examples. Each neighbor votes for its label, weighted by similarity:
+
+```
+score(L) = sum of sim(v, e_i) for the K nearest neighbors that have label L
+```
+
+K=5 is a reasonable default. The system does not need to know or discover how many subclusters exist within a label — it works regardless.
+
+**Why not centroids:**
+
+Centroid-based classification (one mean vector per label) is simpler and faster, but assumes each label forms a single coherent cluster in embedding space. In practice, labels span multiple senders, topics, and writing styles. Centroids would require explicit sub-clustering (choosing how many clusters per label), which adds complexity and parameters to tune. KNN avoids this entirely.
+
+**Why not all-vote:**
+
+Having all training examples vote (weighted by similarity) biases toward labels with more examples. Normalizing by label count is mathematically equivalent to centroid comparison, which has the same single-cluster problem.
+
+#### Confidence Score
+
+```
+confidence = score(winning_label) / sum of score(L) for all labels L
+```
+
+This gives a probability-like value between 0 and 1. High confidence means the nearest neighbors strongly agree on one label. Low confidence means the neighbors are split across multiple labels.
+
+Alternative (margin-based):
+
+```
+confidence = score(winning_label) - score(second_best_label)
+```
+
+Both work. The ratio-based approach maps more naturally to the percentage thresholds (95%, 80%) defined in the confidence levels section.
+
+#### Workflow
+
 For a new message:
 
-1. Compute its embedding.
-2. Compute cosine similarity against all stored labeled embeddings.
-3. Weight votes by similarity.
-4. Identify the most likely label.
-5. Compute a confidence score.
+1. Compute its embedding `v`.
+2. Compute cosine similarity against all stored training embeddings.
+3. Take the top K=5 most similar examples.
+4. Sum their similarity scores per label.
+5. Compute confidence for the winning label.
+6. If confidence is above threshold, apply the label.
+7. Otherwise, leave unlabeled.
 
-At MVP scale (a few thousand training examples), brute-force cosine similarity over all embeddings is fast enough with NumPy. No approximate nearest-neighbor index is needed.
+At MVP scale (a few thousand training examples), brute-force cosine similarity against all embeddings is fast enough with NumPy. No approximate nearest-neighbor index is needed. If the training set grows to tens of thousands of examples, add FAISS for faster lookup.
 
-If the training set grows to tens of thousands of examples, add FAISS for faster lookup.
-
-Example:
+#### Example
 
 ```text
-Technology (94%)
-Nearest examples:
-- ACM newsletter
-- NVIDIA developer update
-- Google AI announcement
+New message: "Rust 1.80 release notes and migration guide"
+
+Top 5 nearest neighbors:
+  1. "Rust 1.75 changelog"          → Technology  (sim: 0.91)
+  2. "Go 1.22 release announcement" → Technology  (sim: 0.84)
+  3. "LLVM weekly newsletter"       → Technology  (sim: 0.79)
+  4. "RustConf 2025 CFP"            → Conferences (sim: 0.76)
+  5. "Cargo workspace tips"         → Technology  (sim: 0.74)
+
+Scores:
+  Technology:  0.91 + 0.84 + 0.79 + 0.74 = 3.28
+  Conferences: 0.76
+
+Confidence: 3.28 / (3.28 + 0.76) = 81%
+Prediction: Technology (medium confidence → apply + AI-Predicted)
 ```
 
 ---
