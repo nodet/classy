@@ -1,3 +1,5 @@
+from typing import List, Tuple
+
 import numpy as np
 
 
@@ -9,3 +11,30 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return float(dot / (norm_a * norm_b))
+
+
+def find_neighbors(
+    query: np.ndarray,
+    training_embeddings: np.ndarray,
+    labels: List[str],
+    k: int = 5,
+) -> List[Tuple[float, str]]:
+    """Find the K most similar training examples to the query.
+
+    Returns a list of (similarity, label) tuples sorted by similarity descending.
+    """
+    # Compute similarities against all training examples at once
+    norm_query = np.linalg.norm(query)
+    if norm_query == 0:
+        return []
+    norms = np.linalg.norm(training_embeddings, axis=1)
+    # Avoid division by zero
+    valid = norms > 0
+    sims = np.zeros(len(training_embeddings))
+    sims[valid] = training_embeddings[valid] @ query / (norms[valid] * norm_query)
+
+    # Get top-k indices
+    actual_k = min(k, len(training_embeddings))
+    top_indices = np.argsort(sims)[::-1][:actual_k]
+
+    return [(float(sims[i]), labels[i]) for i in top_indices]
