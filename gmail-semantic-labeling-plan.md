@@ -312,40 +312,15 @@ If the stored history ID is too old (Gmail returns 404), fall back to a partial 
 
 ---
 
-## Polling Strategy
+## Notification Strategy
 
-Every 5 minutes:
+### Current (Phase 2): Polling loop
 
-1. Query Gmail History API.
-2. Retrieve changes since the previous history ID.
-3. Process new messages (classify if unlabeled).
-4. Process label changes (update training set).
-5. Update local cache.
+The classifier loops every 5 minutes, fetching inbox messages and classifying new ones. Simple but makes unnecessary API calls when idle.
 
-This is efficient because only mailbox deltas are retrieved.
+### Target (Phase 3): Push via Pub/Sub
 
----
-
-## Future Optimization: Push Notifications
-
-Possible future enhancement:
-
-```text
-Gmail Watch API
-        |
-        v
-Google Pub/Sub
-        |
-        v
-Classifier Service
-        |
-        v
-History API
-```
-
-This removes periodic polling and provides near-real-time updates.
-
-Not required for the first version.
+Gmail Watch API notifies a Cloud Pub/Sub topic on mailbox changes. The classifier pulls from the subscription (blocking, instant delivery). Zero API calls when idle, reacts within seconds. See Phase 3 implementation plan for details.
 
 ---
 
@@ -589,26 +564,82 @@ Labels handled by Gmail filters (XLC, XLE, XLCap in current setup) must be exclu
 
 ---
 
-### Phase 3: Autonomous Service (remote, runs unattended)
+### Phase 3: Push Notifications (laptop, near-real-time)
 
-Goal: move from manual laptop runs to a self-running service.
+Goal: replace polling with push notifications via Gmail Watch API + Cloud Pub/Sub. React instantly to new mail and manual label changes.
 
-Only start this phase after Phase 2 has been running successfully for a few weeks with stable precision.
+#### How it works
 
-#### Steps:
+Gmail's `users.watch()` API sends a notification to a Cloud Pub/Sub topic whenever the mailbox changes (new mail, label added/removed). The notification is minimal — just "something changed" + a `historyId`. The service then calls `history.list()` to find out what actually happened.
 
-1. Package into a Docker container.
-2. Add the polling loop (History API every 5 minutes).
-3. Add incremental index updates (label changes update the training set without full rebuild).
-4. Add the history ID persistence and staleness handling.
-5. Deploy to any always-on machine (home server, VPS, or cloud).
+#### Architecture: Pub/Sub pull subscription
 
-#### What changes from Phase 2:
+```text
+Gmail
+  |  (mailbox change)
+  v
+users.watch() → Cloud Pub/Sub topic
+                      |
+                      v
+              Pull subscription
+                      |
+                      v
+              Classifier process (local)
+                      |
+                      v
+              history.list() → classify / update training
+```
 
-- Polling replaces manual invocation.
-- History API replaces "fetch last N inbox messages".
-- Incremental index updates replace full rebuilds.
-- Needs to handle restarts, token refresh, and error recovery gracefully.
+The classifier process pulls from the subscription (blocking, instant delivery). No public URL needed. The model stays loaded in memory. Functionally similar to the current polling loop, but reacts within seconds instead of minutes, and makes zero API calls when idle.
+
+#### One-time GCP setup
+
+1. Enable the Pub/Sub API in the existing Google Cloud project (the one used for OAuth).
+2. Create a Pub/Sub topic (e.g., `gmail-notifications`).
+3. Grant publish rights: add `gmail-api-push@system.gserviceaccount.com` as publisher on the topic.
+4. Create a pull subscription on the topic.
+5. Add scope `https://www.googleapis.com/auth/pubsub` to OAuth (requires token refresh).
+6. Install `google-cloud-pubsub` Python package.
+
+#### Code changes
+
+1. **On startup**: call `users.watch()` to register notifications, store the returned `historyId`.
+2. **Main loop**: replace `time.sleep(300)` with blocking Pub/Sub pull (with timeout).
+3. **On notification**: call `history.list(startHistoryId=...)` to get changes since last check.
+4. **Filter changes**:
+   - `messagesAdded` with INBOX label → new mail, classify it.
+   - `labelsAdded` / `labelsRemoved` → manual label change, update training DB.
+5. **Classify**: same KNN logic as today, but only for affected message IDs.
+6. **Renew watch**: `watch()` expires after 7 days — renew on startup and periodically.
+
+#### Reacting to label changes
+
+When the user manually labels or unlabels a message:
+
+- **Label added**: fetch the message, add to training DB under that label.
+- **Label removed**: remove from training DB for that label.
+- **Label moved** (remove A + add B): update training DB accordingly.
+- **Incremental re-index**: re-embed only affected messages, update the in-memory training index.
+
+This eliminates the need for manual `make fetch-training` / `make fetch-inbox`.
+
+#### Risks and gotchas
+
+- `history.list()` can miss events if the `historyId` is too old (~30 days) — need fallback to full sync.
+- Watch notifications are "at least once" — may get duplicates (harmless, just re-check).
+- Watch expires after 7 days — must renew proactively.
+- Pub/Sub pull still needs a running process; not truly serverless.
+- Need service account credentials or user OAuth for Pub/Sub access.
+
+#### Incremental implementation steps
+
+1. Add `google-cloud-pubsub` dependency.
+2. Add `history.list()` support to `GmailClient`.
+3. Create a setup script for the one-time GCP/Pub/Sub configuration.
+4. Replace the sleep loop with Pub/Sub pull + history sync.
+5. Handle watch renewal (every 7 days).
+6. React to label changes (auto-update training/skip data in memory).
+7. Remove the need for `make fetch-training` / `make fetch-inbox` in normal operation.
 
 ---
 
