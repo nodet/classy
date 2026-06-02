@@ -1,5 +1,5 @@
 """Process Gmail history events: classify new messages."""
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Optional
 
 import numpy as np
 
@@ -7,6 +7,7 @@ from gmail_classifier.classifier import classify, Action, SKIP_LABEL
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.gmail_parser import parse_gmail_message
+from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.models import HistoryEvent
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
 
@@ -23,12 +24,21 @@ def process_history_events(
     skip_ids: Set[str],
     k: int = 5,
     dry_run: bool = False,
+    registry: Optional[LabelRegistry] = None,
 ) -> List[dict]:
     """Process history events and classify new inbox messages.
+
+    If registry is provided, it is used for label lookups (supports
+    dynamically discovered labels).
 
     Returns a list of result dicts with keys:
         message_id, action, label, confidence, sender, subject
     """
+    # Use registry as source of truth if available
+    if registry is not None:
+        label_name_to_id = registry.name_to_id
+        user_label_ids = registry.user_label_ids
+
     # Collect unique new-message IDs from events
     new_message_ids = []
     seen = set()

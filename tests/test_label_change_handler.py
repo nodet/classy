@@ -4,6 +4,7 @@ import numpy as np
 
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.label_change_handler import process_label_changes
+from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.models import HistoryEvent, Message
 from gmail_classifier.storage import MessageStore
 from gmail_classifier.training_index import TrainingIndex
@@ -268,6 +269,134 @@ def test_label_removed_updates_in_memory_index_to_skip(tmp_path):
     assert "msg1" in index
     idx = index._id_to_idx["msg1"]
     assert index.labels[idx] == SKIP_LABEL
+
+    training_store.close()
+    skip_store.close()
+
+
+# --- Tests for dynamic label discovery via LabelRegistry ---
+
+
+def test_unknown_label_triggers_refresh_and_processes(tmp_path):
+    """When a label ID is unknown and registry is provided, refresh discovers it."""
+    events = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_NEW"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_NEW"])
+    # First call: only L1. After refresh: L1 + Label_NEW.
+    client.list_user_labels.side_effect = [
+        [("L1", "Tech")],
+        [("L1", "Tech"), ("Label_NEW", "Science")],
+    ]
+
+    registry = LabelRegistry(client, excluded=set())
+    training_store = MessageStore(str(tmp_path / "training.db"))
+    skip_store = MessageStore(str(tmp_path / "skip.db"))
+
+    index = TrainingIndex(
+        np.random.randn(1, 384).astype(np.float32),
+        ["dummy"],
+        ["dummy_id"],
+    )
+    embedder = MagicMock()
+    embedder.embed.return_value = np.ones(384, dtype=np.float32)
+
+    process_label_changes(
+        events=events,
+        client=client,
+        training_store=training_store,
+        skip_store=skip_store,
+        label_id_to_name={},  # ignored when registry provided
+        user_label_ids=set(),
+        excluded_labels=set(),
+        index=index,
+        embedder=embedder,
+        registry=registry,
+    )
+
+    # Registry should have refreshed and discovered the new label
+    assert registry.is_known("Label_NEW")
+    assert registry.get_name("Label_NEW") == "Science"
+
+    # Message should be in training under the new label
+    training_msgs = training_store.load_all()
+    assert len(training_msgs) == 1
+    assert training_msgs[0].labels == ["Science"]
+
+    # In-memory index should have the new entry
+    assert "msg1" in index
+    idx = index._id_to_idx["msg1"]
+    assert index.labels[idx] == "Science"
+
+    training_store.close()
+    skip_store.close()
+
+
+def test_unknown_label_still_unknown_after_refresh_is_skipped(tmp_path):
+    """If label is still unknown after refresh, the event is silently skipped."""
+    events = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_GHOST"]),
+    ]
+
+    client = MagicMock()
+    # Refresh still doesn't find it
+    client.list_user_labels.return_value = [("L1", "Tech")]
+
+    registry = LabelRegistry(client, excluded=set())
+    training_store = MessageStore(str(tmp_path / "training.db"))
+    skip_store = MessageStore(str(tmp_path / "skip.db"))
+
+    process_label_changes(
+        events=events,
+        client=client,
+        training_store=training_store,
+        skip_store=skip_store,
+        label_id_to_name={},
+        user_label_ids=set(),
+        excluded_labels=set(),
+        registry=registry,
+    )
+
+    # No message fetched, nothing stored
+    client.get_message.assert_not_called()
+    assert training_store.load_all() == []
+
+    training_store.close()
+    skip_store.close()
+
+
+def test_new_excluded_label_is_ignored(tmp_path):
+    """A newly discovered label that's in the excluded set is not processed."""
+    events = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_XLZ"]),
+    ]
+
+    client = MagicMock()
+    client.list_user_labels.side_effect = [
+        [("L1", "Tech")],
+        [("L1", "Tech"), ("Label_XLZ", "XLZ")],
+    ]
+
+    registry = LabelRegistry(client, excluded={"XLZ"})
+    training_store = MessageStore(str(tmp_path / "training.db"))
+    skip_store = MessageStore(str(tmp_path / "skip.db"))
+
+    process_label_changes(
+        events=events,
+        client=client,
+        training_store=training_store,
+        skip_store=skip_store,
+        label_id_to_name={},
+        user_label_ids=set(),
+        excluded_labels=set(),
+        registry=registry,
+    )
+
+    # Excluded label: no message fetch, no storage
+    client.get_message.assert_not_called()
+    assert training_store.load_all() == []
 
     training_store.close()
     skip_store.close()

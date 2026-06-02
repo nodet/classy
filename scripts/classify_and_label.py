@@ -23,6 +23,7 @@ from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.gmail_parser import parse_gmail_message
 from gmail_classifier.history_processor import process_history_events
 from gmail_classifier.label_change_handler import process_label_changes
+from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.models import HistoryExpiredError
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
 from gmail_classifier.storage import MessageStore
@@ -129,32 +130,26 @@ def main():
     client = GmailClient(service)
     _credentials = creds  # saved for Pub/Sub client
 
-    # Get label name→id mapping
-    user_labels = client.list_user_labels()
-    label_name_to_id = {name: lid for lid, name in user_labels}
-    user_label_ids = {lid for lid, name in user_labels}
-
-    label_id_to_name = {lid: name for name, lid in label_name_to_id.items()}
+    # Build label registry (refreshes automatically on new labels)
+    registry = LabelRegistry(client, excluded=excluded)
 
     index = TrainingIndex(train_embeddings, train_labels, train_ids)
 
     if args.mode == "pubsub":
         _run_pubsub_mode(args, client, _credentials, embedder, index,
-                         label_name_to_id, label_id_to_name,
-                         user_label_ids, excluded, skip_ids)
+                         registry, skip_ids)
     else:
         _run_poll_mode(args, client, embedder, index,
-                       label_name_to_id, user_label_ids, excluded, skip_ids)
+                       registry, skip_ids)
 
 
 def _run_poll_mode(args, client, embedder, index,
-                   label_name_to_id, user_label_ids, excluded, skip_ids):
+                   registry, skip_ids):
     """Poll inbox every N seconds."""
     print(f"\nReady (poll mode, every {args.interval}s). Ctrl+C to stop.\n")
 
     while True:
-        _check_inbox(args, client, embedder, index,
-                     label_name_to_id, user_label_ids, skip_ids)
+        _check_inbox(args, client, embedder, index, registry, skip_ids)
 
         if args.once:
             break
@@ -162,8 +157,7 @@ def _run_poll_mode(args, client, embedder, index,
 
 
 def _run_pubsub_mode(args, client, credentials, embedder, index,
-                     label_name_to_id, label_id_to_name,
-                     user_label_ids, excluded, skip_ids):
+                     registry, skip_ids):
     """Wait for Pub/Sub notifications and process via history API."""
     from gmail_classifier.pubsub import PubSubSubscriber
 
@@ -174,8 +168,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
 
     # Do an initial inbox check to catch anything missed
     print("Initial inbox check...")
-    _check_inbox(args, client, embedder, index,
-                 label_name_to_id, user_label_ids, skip_ids)
+    _check_inbox(args, client, embedder, index, registry, skip_ids)
 
     if args.once:
         return
@@ -205,8 +198,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
             events = client.get_history(history_id)
         except HistoryExpiredError:
             print(f"{now()} History expired, falling back to inbox poll")
-            _check_inbox(args, client, embedder, index,
-                         label_name_to_id, user_label_ids, skip_ids)
+            _check_inbox(args, client, embedder, index, registry, skip_ids)
             # Re-watch to get fresh historyId
             history_id, expiration = client.watch(PUBSUB_TOPIC)
             continue
@@ -222,11 +214,12 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 client=client,
                 training_store=training_store,
                 skip_store=skip_store,
-                label_id_to_name=label_id_to_name,
-                user_label_ids=user_label_ids,
-                excluded_labels=excluded,
+                label_id_to_name=registry.id_to_name,
+                user_label_ids=registry.user_label_ids,
+                excluded_labels=set(),
                 index=index,
                 embedder=embedder,
+                registry=registry,
             )
 
             # Process new inbox messages
@@ -236,12 +229,13 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 embedder=embedder,
                 train_embeddings=index.embeddings,
                 train_labels=index.labels,
-                label_name_to_id=label_name_to_id,
-                user_label_ids=user_label_ids,
-                excluded_labels=excluded,
+                label_name_to_id=registry.name_to_id,
+                user_label_ids=registry.user_label_ids,
+                excluded_labels=registry._excluded,
                 skip_ids=skip_ids,
                 k=args.k,
                 dry_run=args.dry_run,
+                registry=registry,
             )
 
             # Print and persist results
@@ -267,8 +261,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         history_id = max_history
 
 
-def _check_inbox(args, client, embedder, index,
-                 label_name_to_id, user_label_ids, skip_ids):
+def _check_inbox(args, client, embedder, index, registry, skip_ids):
     """Check inbox and classify new messages (poll mode)."""
     inbox_ids = client.list_message_ids(label_id="INBOX", max_results=args.max_messages)
     new_ids = [mid for mid in inbox_ids if mid not in skip_ids]
@@ -285,7 +278,7 @@ def _check_inbox(args, client, embedder, index,
 
         # Check if it already has a user label
         msg_label_ids = raw.get("labelIds", [])
-        if any(lid in user_label_ids for lid in msg_label_ids):
+        if any(lid in registry.user_label_ids for lid in msg_label_ids):
             continue
 
         # Parse and classify
@@ -304,7 +297,7 @@ def _check_inbox(args, client, embedder, index,
         sender = msg.from_name or msg.from_address
 
         if result.action == Action.LABEL or result.action == Action.LABEL_WITH_REVIEW:
-            label_id = label_name_to_id.get(result.label)
+            label_id = registry.get_id(result.label)
             if not label_id:
                 print(f"{now()} WARNING: label '{result.label}' not found in Gmail, skipping")
                 continue

@@ -648,6 +648,186 @@ make classify       # one-shot: classify once and exit
 
 ---
 
+### Phase 4: Deploy as a Service (always-on, no laptop needed)
+
+Goal: run the classifier permanently without keeping a laptop open.
+
+#### Monitoring
+
+Beyond "is the process alive":
+
+- **Correction tracking**: when `process_label_changes` sees the user relabel something the classifier labeled, that's a misclassification. Count these. Alert if the rate spikes.
+- **Activity heartbeat**: "last successful classification at T" / "N messages processed in last 24h". Alert if too old.
+- **Watch renewal**: log renewals; alert if time-since-last-renewal exceeds 24h.
+- **Confidence drift**: track confidence distribution over time. A shift toward low-confidence signals training data staleness.
+
+#### Logging
+
+Replace `print()` with Python `logging` (JSON lines to stdout). The container runtime captures stdout. Structured logs enable querying after crashes.
+
+#### Hosting options evaluated
+
+**AWS (already a user)**
+
+| Option | Specs | $/month |
+|--------|-------|---------|
+| Lightsail | 1GB RAM, 2 vCPU, flat pricing | $5 |
+| EC2 t4g.micro | 1GB RAM, 2 vCPU ARM (tight) | ~$6 |
+| EC2 t4g.small | 2GB RAM, 2 vCPU ARM (comfortable) | ~$12 |
+
+Lightsail is simplest: flat bill, built-in monitoring, SSH access, no VPC/SG fiddling.
+
+**GCP (already have project classy-498012 with Pub/Sub)**
+
+| Option | Specs | $/month |
+|--------|-------|---------|
+| e2-micro | 1GB RAM, 2 shared vCPU | **Free** (perpetual, 1/account, us-central1/us-west1/us-east1) |
+| e2-small | 2GB RAM, 2 shared vCPU | ~$13 |
+| Cloud Run (push) | Scale to zero, pay per request | ~free for low volume |
+
+The e2-micro free tier is perpetual (not 12-month trial). 30GB disk also free. 1GB RAM is tight but might fit. Pub/Sub is in the same project (no egress cost).
+
+Cloud Run alternative: flip to a push subscription (Pub/Sub POSTs to Cloud Run). Service scales to zero when idle. Essentially free at personal email volume. Catch: cold start reloads the model (~5-10s), needs min-instances=1 to avoid that (~$15/month).
+
+**Oracle Cloud (free tier)**
+
+4 ARM cores, 24GB RAM, perpetually free. Catches: capacity hard to provision (retry for days), idle instances get reclaimed (bad for a mostly-sleeping classifier), no SLA, account closure risk.
+
+**Raspberry Pi 4/5**
+
+~50 EUR one-time, ~5 EUR/year electricity. No vendor dependency. 4GB+ RAM runs the model fine. Needs physical setup + network config.
+
+**Synology NAS (DS213j)**
+
+Not viable. ARM (Marvell Armada 370), 512MB RAM, no Docker. Too underpowered for the embedding model.
+
+#### Recommendation
+
+Try **GCP e2-micro** first (free, same project as Pub/Sub). If 1GB RAM is too tight, upgrade to e2-small ($13/month) or switch to AWS Lightsail ($5/month). Both run Docker with restart policies and capture stdout logs.
+
+#### TODO when ready to deploy
+
+1. Switch prints to `logging` module (JSON lines).
+2. Optimize Dockerfile for low memory (slim base image, no dev deps).
+3. Add health check endpoint or script.
+4. Add correction-rate counter (label_change_handler already has the data).
+5. Set up alerting on: process down, no activity in 24h, correction rate spike.
+6. Persist historyId to disk so restarts don't trigger full inbox scan.
+
+---
+
+### Phase 5: Dynamic Label Discovery (no restart on new labels)
+
+Goal: when the user creates a new Gmail label and moves messages to it, the running classifier picks this up automatically and starts classifying into the new label — no restart needed.
+
+#### Current state (broken without restart)
+
+Three data structures are built once at startup and never refreshed:
+
+1. `label_name_to_id` — maps label names to Gmail IDs. Used when applying a predicted label.
+2. `label_id_to_name` — maps Gmail IDs to names. Used in `process_label_changes` to look up label names from history events.
+3. `user_label_ids` — set of all user label IDs. Used to check "does this message already have a user label?"
+
+When a new label is created:
+- `labelsAdded` events arrive with an unknown label ID.
+- `label_id_to_name.get(lid)` returns `None` → event silently skipped.
+- Training index never learns the new label.
+- Even if it did, `label_name_to_id` wouldn't have it, so predictions couldn't be applied.
+
+#### Design
+
+**Trigger:** detect an unknown label ID in a history event.
+
+When `process_label_changes` encounters a label ID not in `label_id_to_name`:
+1. Refresh the label maps from Gmail (`client.list_user_labels()`).
+2. If the unknown ID is now in the refreshed map (confirming a new label exists):
+   - Update all three data structures in place.
+   - Log: "New label discovered: {name}".
+   - Check if the new label is in the excluded set. If so, skip it.
+   - Otherwise, proceed with normal `labelsAdded` processing (fetch message, embed, add to training index).
+3. If the unknown ID is still not found after refresh (deleted between event and refresh?), skip it.
+
+This is a lazy refresh — we only hit the API when we see something unexpected. During normal operation (no new labels), zero extra API calls.
+
+#### Implementation plan
+
+**Step 1: Extract label maps into a mutable container**
+
+Currently the three dicts are passed as separate arguments throughout the call chain. Refactor into a single `LabelRegistry` object:
+
+```python
+class LabelRegistry:
+    def __init__(self, client: GmailClient, excluded: Set[str]):
+        self._client = client
+        self._excluded = excluded
+        self.refresh()
+
+    def refresh(self):
+        """Re-fetch label list from Gmail."""
+        user_labels = self._client.list_user_labels()
+        self.name_to_id = {name: lid for lid, name in user_labels}
+        self.id_to_name = {lid: name for lid, name in user_labels}
+        self.user_label_ids = {lid for lid, name in user_labels}
+
+    def is_known(self, label_id: str) -> bool:
+        return label_id in self.id_to_name
+
+    def is_excluded(self, label_id: str) -> bool:
+        name = self.id_to_name.get(label_id)
+        return name in self._excluded if name else False
+
+    def get_name(self, label_id: str) -> Optional[str]:
+        return self.id_to_name.get(label_id)
+
+    def get_id(self, label_name: str) -> Optional[str]:
+        return self.name_to_id.get(label_name)
+```
+
+Passed by reference, so all callers see updates immediately.
+
+**Step 2: Add unknown-label detection to `process_label_changes`**
+
+Before the current filtering loop, check if any label ID in the event is unknown:
+
+```python
+# Check for unknown label IDs → trigger refresh
+unknown_ids = set()
+for event in events:
+    if event.type in ("labelsAdded", "labelsRemoved"):
+        for lid in event.label_ids:
+            if lid not in registry.user_label_ids and not lid.startswith(("CATEGORY_", "IMPORTANT", "INBOX", "SENT", "DRAFT", "SPAM", "TRASH", "UNREAD", "STARRED")):
+                unknown_ids.add(lid)
+
+if unknown_ids:
+    registry.refresh()
+    new_labels = [registry.get_name(lid) for lid in unknown_ids if registry.is_known(lid)]
+    for name in new_labels:
+        print(f"{now()} New label discovered: {name}")
+```
+
+**Step 3: Update callers**
+
+Replace all `label_name_to_id`, `label_id_to_name`, `user_label_ids` parameters with a single `registry: LabelRegistry` parameter throughout:
+- `_run_pubsub_mode`
+- `_run_poll_mode`
+- `_check_inbox`
+- `process_label_changes`
+- `process_history_events`
+
+**Step 4: Handle excluded labels**
+
+When a new label is discovered, it's NOT excluded by default (the excluded set is explicit configuration). If the user creates a filter-based label and wants it excluded, they restart with the updated `--exclude-labels`. This is acceptable: new content-based labels (the common case) work immediately; new filter-based labels (rare) need a restart.
+
+**Step 5: Tests**
+
+- Test that `LabelRegistry.refresh()` picks up new labels.
+- Test that `process_label_changes` with an unknown label ID triggers refresh and processes the event.
+- Test that a still-unknown ID after refresh is silently skipped.
+- Test that excluded labels discovered via refresh are skipped.
+- Integration: new label → move messages → verify training index updated → verify classification uses new label.
+
+---
+
 ## Technology Stack
 
 - Python 3.11+

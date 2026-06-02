@@ -5,6 +5,7 @@ from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.gmail_parser import parse_gmail_message
+from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.models import HistoryEvent
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
 from gmail_classifier.storage import MessageStore
@@ -21,6 +22,7 @@ def process_label_changes(
     excluded_labels: Set[str],
     index: Optional[TrainingIndex] = None,
     embedder: Optional[Embedder] = None,
+    registry: Optional[LabelRegistry] = None,
 ):
     """Process labelsAdded and labelsRemoved events.
 
@@ -31,7 +33,23 @@ def process_label_changes(
 
     If index and embedder are provided, also updates the in-memory
     training index for immediate effect on classification.
+
+    If registry is provided, unknown label IDs trigger a refresh
+    (supporting newly created labels without restart).
     """
+    # If registry provided, use it as the source of truth and detect unknowns
+    if registry is not None:
+        new_labels = _refresh_if_unknown(events, registry)
+        for name in new_labels:
+            print(f"New label discovered: {name}")
+        label_id_to_name = registry.id_to_name
+        user_label_ids = registry.user_label_ids
+        excluded_labels_set = set()
+        for lid, name in registry.id_to_name.items():
+            if registry.is_excluded(lid):
+                excluded_labels_set.add(name)
+        excluded_labels = excluded_labels_set
+
     # Collect affected messages and their events
     affected = {}  # message_id -> {"added": set(), "removed": set()}
     for event in events:
@@ -103,6 +121,38 @@ def process_label_changes(
                 # Still has a user label (maybe a different one) — just remove old entry
                 # The labelsAdded event for the new label will handle re-adding
                 training_store.delete_messages([mid])
+
+
+def _refresh_if_unknown(events: List[HistoryEvent], registry: LabelRegistry) -> List[str]:
+    """If any event references an unknown label ID, refresh the registry.
+
+    Returns a list of newly discovered label names (empty if no refresh needed).
+    """
+    # System label prefixes to ignore
+    SYSTEM_PREFIXES = (
+        "CATEGORY_", "IMPORTANT", "INBOX", "SENT", "DRAFT",
+        "SPAM", "TRASH", "UNREAD", "STARRED", "CHAT",
+    )
+
+    unknown_ids = set()
+    for event in events:
+        if event.type not in ("labelsAdded", "labelsRemoved"):
+            continue
+        for lid in event.label_ids:
+            if any(lid == p or lid.startswith(p) for p in SYSTEM_PREFIXES):
+                continue
+            if not registry.is_known(lid):
+                unknown_ids.add(lid)
+
+    if not unknown_ids:
+        return []
+
+    registry.refresh()
+    return [
+        registry.get_name(lid)
+        for lid in unknown_ids
+        if registry.is_known(lid)
+    ]
 
 
 def _embed_message(msg, embedder: Embedder):
