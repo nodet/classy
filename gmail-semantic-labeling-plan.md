@@ -636,9 +636,6 @@ This eliminates the need for manual `make fetch-training` / `make fetch-inbox` d
 
 #### Known limitations
 
-- `history.list()` can miss events if the `historyId` is too old (~30 days) — fallback to full inbox scan handles this.
-- Watch notifications are "at least once" — duplicates are harmless (deduplication by message ID).
-- Watch expires after 7 days — auto-renewed.
 - In-memory training index is NOT updated after label changes (would require re-embedding). The on-disk DBs are updated; restart picks up changes. Full incremental re-indexing is a future enhancement.
 - Pub/Sub pull still needs a running process on the laptop.
 
