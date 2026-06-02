@@ -2,7 +2,11 @@
 """Classify unlabeled inbox messages and apply labels via Gmail API.
 
 Uses training data + inbox snapshot as skip examples to classify
-new messages that aren't in the skip pool. Runs in a loop every 5 minutes.
+new messages that aren't in the skip pool.
+
+Modes:
+  poll (default): check inbox every N seconds
+  pubsub: wait for Gmail push notifications via Pub/Sub
 """
 import argparse
 import sys
@@ -17,9 +21,14 @@ from gmail_classifier.classifier import classify, Action, SKIP_LABEL
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.gmail_parser import parse_gmail_message
+from gmail_classifier.history_processor import process_history_events
+from gmail_classifier.models import HistoryExpiredError
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
 from gmail_classifier.storage import MessageStore
 from gmail_classifier.training import build_training_data
+
+PUBSUB_TOPIC = "projects/classy-498012/topics/gmail-notifications"
+PUBSUB_SUBSCRIPTION = "projects/classy-498012/subscriptions/gmail-notifications-sub"
 
 
 def now():
@@ -60,11 +69,15 @@ def main():
     )
     parser.add_argument(
         "--interval", type=int, default=300,
-        help="Seconds between checks (default: 300)",
+        help="Seconds between checks in poll mode (default: 300)",
     )
     parser.add_argument(
         "--once", action="store_true",
         help="Run once and exit (no loop)",
+    )
+    parser.add_argument(
+        "--mode", choices=["poll", "pubsub"], default="poll",
+        help="Notification mode: poll (default) or pubsub",
     )
     args = parser.parse_args()
 
@@ -117,7 +130,18 @@ def main():
     label_name_to_id = {name: lid for lid, name in user_labels}
     user_label_ids = {lid for lid, name in user_labels}
 
-    print(f"\nReady. Checking every {args.interval}s (Ctrl+C to stop).\n")
+    if args.mode == "pubsub":
+        _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
+                         label_name_to_id, user_label_ids, excluded, skip_ids)
+    else:
+        _run_poll_mode(args, client, embedder, train_embeddings, train_labels,
+                       label_name_to_id, user_label_ids, excluded, skip_ids)
+
+
+def _run_poll_mode(args, client, embedder, train_embeddings, train_labels,
+                   label_name_to_id, user_label_ids, excluded, skip_ids):
+    """Poll inbox every N seconds."""
+    print(f"\nReady (poll mode, every {args.interval}s). Ctrl+C to stop.\n")
 
     while True:
         _check_inbox(args, client, embedder, train_embeddings, train_labels,
@@ -128,9 +152,94 @@ def main():
         time.sleep(args.interval)
 
 
+def _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
+                     label_name_to_id, user_label_ids, excluded, skip_ids):
+    """Wait for Pub/Sub notifications and process via history API."""
+    from gmail_classifier.pubsub import PubSubSubscriber
+
+    # Register for notifications
+    print("Registering Gmail watch...")
+    history_id, expiration = client.watch(PUBSUB_TOPIC)
+    print(f"  Watch active, historyId={history_id}")
+
+    # Do an initial inbox check to catch anything missed
+    print("Initial inbox check...")
+    _check_inbox(args, client, embedder, train_embeddings, train_labels,
+                 label_name_to_id, user_label_ids, skip_ids)
+
+    if args.once:
+        return
+
+    subscriber = PubSubSubscriber(subscription_path=PUBSUB_SUBSCRIPTION)
+    print(f"\nReady (pubsub mode). Waiting for notifications...\n")
+
+    while True:
+        # Renew watch if expiring within 1 hour
+        now_ms = int(time.time() * 1000)
+        if expiration - now_ms < 3600_000:
+            history_id_new, expiration = client.watch(PUBSUB_TOPIC)
+            print(f"{now()} Watch renewed")
+
+        # Pull notifications (blocks up to 60s)
+        notifications = subscriber.pull(timeout=60)
+
+        if not notifications:
+            continue
+
+        # Use the most recent historyId from notifications
+        max_history = max(n.history_id for n in notifications)
+
+        try:
+            events = client.get_history(history_id)
+        except HistoryExpiredError:
+            print(f"{now()} History expired, falling back to inbox poll")
+            _check_inbox(args, client, embedder, train_embeddings, train_labels,
+                         label_name_to_id, user_label_ids, skip_ids)
+            # Re-watch to get fresh historyId
+            history_id, expiration = client.watch(PUBSUB_TOPIC)
+            continue
+
+        if events:
+            # Process new messages
+            results = process_history_events(
+                events=events,
+                client=client,
+                embedder=embedder,
+                train_embeddings=train_embeddings,
+                train_labels=train_labels,
+                label_name_to_id=label_name_to_id,
+                user_label_ids=user_label_ids,
+                excluded_labels=excluded,
+                skip_ids=skip_ids,
+                k=args.k,
+                dry_run=args.dry_run,
+            )
+
+            # Print results
+            skip_store = MessageStore(args.skip_db)
+            for r in results:
+                sender = r["sender"]
+                subject = r["subject"]
+                if r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
+                    action_str = "LABEL" if r["action"] == Action.LABEL else "REVIEW"
+                    print(f"{now()} [{action_str}] {r['label']:20s} {r['confidence']:5.1%}  {sender} — {subject}")
+                else:
+                    print(f"{now()} [SKIP]  {r['confidence']:5.1%}  {sender} — {subject}")
+                    if not args.dry_run:
+                        msg = r["message"]
+                        msg.labels = []
+                        skip_store.save_message(msg)
+            skip_store.close()
+        else:
+            print(".", end="", flush=True)
+
+        # Advance history pointer
+        history_id = max_history
+
+
 def _check_inbox(args, client, embedder, train_embeddings, train_labels,
                  label_name_to_id, user_label_ids, skip_ids):
-    """Check inbox and classify new messages."""
+    """Check inbox and classify new messages (poll mode)."""
     inbox_ids = client.list_message_ids(label_id="INBOX", max_results=args.max_messages)
     new_ids = [mid for mid in inbox_ids if mid not in skip_ids]
 
