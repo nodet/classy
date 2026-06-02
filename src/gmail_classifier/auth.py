@@ -8,7 +8,10 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/pubsub",
+]
 
 DEFAULT_CREDENTIALS_DIR = Path("credentials")
 TOKEN_FILE = "token.json"
