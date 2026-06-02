@@ -18,8 +18,8 @@ TOKEN_FILE = "token.json"
 CLIENT_SECRETS_FILE = "client_secret.json"
 
 
-def get_gmail_service(credentials_dir: Path = DEFAULT_CREDENTIALS_DIR):
-    """Authenticate and return a Gmail API service object.
+def get_credentials(credentials_dir: Path = DEFAULT_CREDENTIALS_DIR):
+    """Get OAuth2 credentials, refreshing or creating as needed.
 
     On first run, opens a browser for OAuth consent.
     On subsequent runs, uses the stored refresh token.
@@ -46,4 +46,10 @@ def get_gmail_service(credentials_dir: Path = DEFAULT_CREDENTIALS_DIR):
         token_path.parent.mkdir(parents=True, exist_ok=True)
         token_path.write_text(creds.to_json())
 
+    return creds
+
+
+def get_gmail_service(credentials_dir: Path = DEFAULT_CREDENTIALS_DIR):
+    """Authenticate and return a Gmail API service object."""
+    creds = get_credentials(credentials_dir)
     return build("gmail", "v1", credentials=creds)

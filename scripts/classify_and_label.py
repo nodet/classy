@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from gmail_classifier.auth import get_gmail_service
+from gmail_classifier.auth import get_credentials, get_gmail_service
 from gmail_classifier.classifier import classify, Action, SKIP_LABEL
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
@@ -123,8 +123,10 @@ def main():
     # Connect to Gmail
     print("Authenticating...")
     credentials_dir = Path(args.credentials)
+    creds = get_credentials(credentials_dir)
     service = get_gmail_service(credentials_dir)
     client = GmailClient(service)
+    _credentials = creds  # saved for Pub/Sub client
 
     # Get label name→id mapping
     user_labels = client.list_user_labels()
@@ -134,9 +136,9 @@ def main():
     label_id_to_name = {lid: name for name, lid in label_name_to_id.items()}
 
     if args.mode == "pubsub":
-        _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
-                         label_name_to_id, label_id_to_name, user_label_ids,
-                         excluded, skip_ids)
+        _run_pubsub_mode(args, client, _credentials, embedder, train_embeddings,
+                         train_labels, label_name_to_id, label_id_to_name,
+                         user_label_ids, excluded, skip_ids)
     else:
         _run_poll_mode(args, client, embedder, train_embeddings, train_labels,
                        label_name_to_id, user_label_ids, excluded, skip_ids)
@@ -156,9 +158,9 @@ def _run_poll_mode(args, client, embedder, train_embeddings, train_labels,
         time.sleep(args.interval)
 
 
-def _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
-                     label_name_to_id, label_id_to_name, user_label_ids,
-                     excluded, skip_ids):
+def _run_pubsub_mode(args, client, credentials, embedder, train_embeddings,
+                     train_labels, label_name_to_id, label_id_to_name,
+                     user_label_ids, excluded, skip_ids):
     """Wait for Pub/Sub notifications and process via history API."""
     from gmail_classifier.pubsub import PubSubSubscriber
 
@@ -175,7 +177,9 @@ def _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
     if args.once:
         return
 
-    subscriber = PubSubSubscriber(subscription_path=PUBSUB_SUBSCRIPTION)
+    subscriber = PubSubSubscriber(
+        subscription_path=PUBSUB_SUBSCRIPTION, credentials=credentials
+    )
     print(f"\nReady (pubsub mode). Waiting for notifications...\n")
 
     while True:

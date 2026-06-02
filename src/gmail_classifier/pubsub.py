@@ -14,11 +14,11 @@ class PubSubNotification:
 class PubSubSubscriber:
     """Wraps google.cloud.pubsub_v1.SubscriberClient for Gmail notifications."""
 
-    def __init__(self, subscription_path: str, client=None):
+    def __init__(self, subscription_path: str, client=None, credentials=None):
         self._subscription_path = subscription_path
         if client is None:
             from google.cloud.pubsub_v1 import SubscriberClient
-            client = SubscriberClient()
+            client = SubscriberClient(credentials=credentials)
         self._client = client
 
     def pull(self, timeout: int = 60) -> List[PubSubNotification]:
