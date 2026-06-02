@@ -637,6 +637,7 @@ This eliminates the need for manual `make fetch-training` / `make fetch-inbox` d
 #### Known limitations
 
 - Pub/Sub pull still needs a running process on the laptop.
+- **Gmail bulk operations may not trigger notifications.** When Gmail processes bulk label changes "in the background" (e.g., applying a label to hundreds of messages at once), it may not send Pub/Sub notifications for all of them. The Watch API is documented as "best effort." Workaround: run `make fetch-training` to re-sync from Gmail, then restart. A periodic history poll (every ~5 min) would catch these automatically but is not yet implemented.
 
 #### Usage
 
