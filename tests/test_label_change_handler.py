@@ -367,6 +367,118 @@ def test_unknown_label_still_unknown_after_refresh_is_skipped(tmp_path):
     skip_store.close()
 
 
+def test_movements_summary_inbox_to_label(tmp_path):
+    """Movement summary reports messages moved from inbox to a label."""
+    events = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
+        HistoryEvent(type="labelsAdded", message_id="msg2", label_ids=["Label_1"]),
+        HistoryEvent(type="labelsAdded", message_id="msg3", label_ids=["Label_2"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.side_effect = [
+        _make_raw_message("msg1", label_ids=["Label_1"]),
+        _make_raw_message("msg2", label_ids=["Label_1"]),
+        _make_raw_message("msg3", label_ids=["Label_2"]),
+    ]
+
+    training_store = MessageStore(str(tmp_path / "training.db"))
+    skip_store = MessageStore(str(tmp_path / "skip.db"))
+
+    label_id_to_name = {"Label_1": "Tech", "Label_2": "Travel"}
+    user_label_ids = {"Label_1", "Label_2"}
+
+    movements = process_label_changes(
+        events=events,
+        client=client,
+        training_store=training_store,
+        skip_store=skip_store,
+        label_id_to_name=label_id_to_name,
+        user_label_ids=user_label_ids,
+        excluded_labels=set(),
+    )
+
+    # Should report 2 from inbox→Tech, 1 from inbox→Travel
+    assert sorted(movements) == sorted([
+        ("inbox", "Tech", 2),
+        ("inbox", "Travel", 1),
+    ])
+
+    training_store.close()
+    skip_store.close()
+
+
+def test_movements_summary_label_to_inbox(tmp_path):
+    """Movement summary reports messages moved from a label to inbox (unlabeled)."""
+    events = [
+        HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
+        HistoryEvent(type="labelsRemoved", message_id="msg2", label_ids=["Label_1"]),
+    ]
+
+    client = MagicMock()
+    # Both messages now have no user labels
+    client.get_message.side_effect = [
+        _make_raw_message("msg1", label_ids=["INBOX"]),
+        _make_raw_message("msg2", label_ids=["INBOX"]),
+    ]
+
+    training_store = MessageStore(str(tmp_path / "training.db"))
+    skip_store = MessageStore(str(tmp_path / "skip.db"))
+    training_store.save_message(Message(id="msg1", subject="A", from_address="a@x.com", labels=["Tech"]))
+    training_store.save_message(Message(id="msg2", subject="B", from_address="b@x.com", labels=["Tech"]))
+
+    label_id_to_name = {"Label_1": "Tech"}
+    user_label_ids = {"Label_1"}
+
+    movements = process_label_changes(
+        events=events,
+        client=client,
+        training_store=training_store,
+        skip_store=skip_store,
+        label_id_to_name=label_id_to_name,
+        user_label_ids=user_label_ids,
+        excluded_labels=set(),
+    )
+
+    assert movements == [("Tech", "inbox", 2)]
+
+    training_store.close()
+    skip_store.close()
+
+
+def test_movements_summary_label_to_label(tmp_path):
+    """Movement summary reports messages moved between labels."""
+    events = [
+        HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_2"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_2"])
+
+    training_store = MessageStore(str(tmp_path / "training.db"))
+    skip_store = MessageStore(str(tmp_path / "skip.db"))
+    training_store.save_message(Message(id="msg1", subject="A", from_address="a@x.com", labels=["Tech"]))
+
+    label_id_to_name = {"Label_1": "Tech", "Label_2": "Travel"}
+    user_label_ids = {"Label_1", "Label_2"}
+
+    movements = process_label_changes(
+        events=events,
+        client=client,
+        training_store=training_store,
+        skip_store=skip_store,
+        label_id_to_name=label_id_to_name,
+        user_label_ids=user_label_ids,
+        excluded_labels=set(),
+    )
+
+    assert movements == [("Tech", "Travel", 1)]
+
+    training_store.close()
+    skip_store.close()
+
+
 def test_new_excluded_label_is_ignored(tmp_path):
     """A newly discovered label that's in the excluded set is not processed."""
     events = [

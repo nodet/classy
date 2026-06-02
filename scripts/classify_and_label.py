@@ -209,7 +209,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
             training_store = MessageStore(args.training_db)
             skip_store = MessageStore(args.skip_db)
 
-            process_label_changes(
+            movements = process_label_changes(
                 events=events,
                 client=client,
                 training_store=training_store,
@@ -221,6 +221,8 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 embedder=embedder,
                 registry=registry,
             )
+            for src, dst, count in movements:
+                print(f"{now()} {count} {'email' if count == 1 else 'emails'} moved from {src} to {dst}")
 
             # Process new inbox messages
             results = process_history_events(

@@ -1,5 +1,6 @@
 """Handle label change events from Gmail history."""
-from typing import Dict, List, Optional, Set
+from collections import defaultdict
+from typing import Dict, List, Optional, Set, Tuple
 
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.embeddings import Embedder
@@ -23,7 +24,7 @@ def process_label_changes(
     index: Optional[TrainingIndex] = None,
     embedder: Optional[Embedder] = None,
     registry: Optional[LabelRegistry] = None,
-):
+) -> List[Tuple[str, str, int]]:
     """Process labelsAdded and labelsRemoved events.
 
     - Label added: fetch message, add to training, remove from skip.
@@ -36,6 +37,9 @@ def process_label_changes(
 
     If registry is provided, unknown label IDs trigger a refresh
     (supporting newly created labels without restart).
+
+    Returns a list of (source, destination, count) tuples summarizing
+    the label movements (e.g., [("inbox", "Biology", 12), ("Tech", "inbox", 2)]).
     """
     # If registry provided, use it as the source of truth and detect unknowns
     if registry is not None:
@@ -75,6 +79,9 @@ def process_label_changes(
         else:
             affected[mid]["removed"].update(relevant_labels)
 
+    # Track movements: (source, destination) -> count
+    movements = defaultdict(int)
+
     # Process each affected message
     for mid, changes in affected.items():
         added = changes["added"]
@@ -100,6 +107,15 @@ def process_label_changes(
                 embedding = _embed_message(msg, embedder)
                 index.add(mid, embedding, label_name)
 
+            # Track the movement
+            if removed:
+                # Moved from one label to another
+                removed_id = next(iter(removed))
+                source = label_id_to_name.get(removed_id, "unknown")
+            else:
+                source = "inbox"
+            movements[(source, label_name)] += 1
+
         elif removed:
             # Label removed, no label added — check if message still has any user label
             raw = client.get_message(mid)
@@ -117,10 +133,17 @@ def process_label_changes(
                 if index is not None and embedder is not None:
                     embedding = _embed_message(msg, embedder)
                     index.add(mid, embedding, SKIP_LABEL)
+
+                # Track the movement
+                removed_id = next(iter(removed))
+                source = label_id_to_name.get(removed_id, "unknown")
+                movements[(source, "inbox")] += 1
             else:
                 # Still has a user label (maybe a different one) — just remove old entry
                 # The labelsAdded event for the new label will handle re-adding
                 training_store.delete_messages([mid])
+
+    return [(src, dst, count) for (src, dst), count in movements.items()]
 
 
 def _refresh_if_unknown(events: List[HistoryEvent], registry: LabelRegistry) -> List[str]:
