@@ -564,13 +564,25 @@ Labels handled by Gmail filters (XLC, XLE, XLCap in current setup) must be exclu
 
 ---
 
-### Phase 3: Push Notifications (laptop, near-real-time)
+### Phase 3: Push Notifications (laptop, near-real-time) [DONE]
 
 Goal: replace polling with push notifications via Gmail Watch API + Cloud Pub/Sub. React instantly to new mail and manual label changes.
 
-#### How it works
+**Result:** Working. Reacts to new mail within seconds. Label changes auto-update training/skip DBs.
 
-Gmail's `users.watch()` API sends a notification to a Cloud Pub/Sub topic whenever the mailbox changes (new mail, label added/removed). The notification is minimal — just "something changed" + a `historyId`. The service then calls `history.list()` to find out what actually happened.
+#### Background: Google Cloud Pub/Sub
+
+**What is Pub/Sub?** A message queue service from Google Cloud. Publishers send messages to a *topic*; subscribers read from a *subscription* attached to that topic. Decouples producers from consumers.
+
+**What is a topic?** A named channel. In our case, Gmail publishes "something changed in your mailbox" messages to the topic. You never write to it directly — Gmail does.
+
+**What is a subscription?** A consumer endpoint attached to a topic. Messages accumulate until acknowledged. A *pull* subscription means your code fetches messages on demand (no public URL needed). A *push* subscription would require a public HTTPS endpoint.
+
+**Permissions model:**
+
+- The topic needs exactly one special permission: `gmail-api-push@system.gserviceaccount.com` as **Publisher**. This is a Google-owned service account that Gmail uses to push notifications. It cannot read your messages — it only writes small notification payloads (`{"emailAddress": "...", "historyId": "..."}`).
+- Your OAuth user credentials (with `pubsub` scope) have **Subscriber** access by default as the project owner. No additional IAM configuration needed for pull.
+- Do NOT grant broader permissions (Editor, Owner) to the Gmail push service account. Publisher is sufficient and minimal.
 
 #### Architecture: Pub/Sub pull subscription
 
@@ -590,27 +602,27 @@ users.watch() → Cloud Pub/Sub topic
               history.list() → classify / update training
 ```
 
-The classifier process pulls from the subscription (blocking, instant delivery). No public URL needed. The model stays loaded in memory. Functionally similar to the current polling loop, but reacts within seconds instead of minutes, and makes zero API calls when idle.
+The classifier process pulls from the subscription (blocking, instant delivery). No public URL needed. The model stays loaded in memory. Reacts within seconds, makes zero API calls when idle.
 
-#### One-time GCP setup
+#### GCP setup (completed)
 
-1. Enable the Pub/Sub API in the existing Google Cloud project (the one used for OAuth).
-2. Create a Pub/Sub topic (e.g., `gmail-notifications`).
-3. Grant publish rights: add `gmail-api-push@system.gserviceaccount.com` as publisher on the topic.
-4. Create a pull subscription on the topic.
-5. Add scope `https://www.googleapis.com/auth/pubsub` to OAuth (requires token refresh).
-6. Install `google-cloud-pubsub` Python package.
+Project: `classy-498012`
 
-#### Code changes
+1. Enabled Pub/Sub API in the Google Cloud project.
+2. Created topic: `projects/classy-498012/topics/gmail-notifications`.
+3. Granted publish rights to `gmail-api-push@system.gserviceaccount.com` (Pub/Sub Publisher role, topic-level only).
+4. Created pull subscription: `projects/classy-498012/subscriptions/gmail-notifications-sub` (never-expire).
+5. Added `https://www.googleapis.com/auth/pubsub` to OAuth scopes.
+6. Installed `google-cloud-pubsub` Python package.
 
-1. **On startup**: call `users.watch()` to register notifications, store the returned `historyId`.
-2. **Main loop**: replace `time.sleep(300)` with blocking Pub/Sub pull (with timeout).
-3. **On notification**: call `history.list(startHistoryId=...)` to get changes since last check.
-4. **Filter changes**:
-   - `messagesAdded` with INBOX label → new mail, classify it.
-   - `labelsAdded` / `labelsRemoved` → manual label change, update training DB.
-5. **Classify**: same KNN logic as today, but only for affected message IDs.
-6. **Renew watch**: `watch()` expires after 7 days — renew on startup and periodically.
+#### How it works
+
+1. **On startup**: loads training data, embeddings, authenticates. Calls `users.watch()` to register for notifications. Does an initial inbox check to catch anything missed while offline.
+2. **Main loop**: blocks on Pub/Sub pull (60s timeout). On notification, calls `history.list()` to get what changed.
+3. **New inbox message**: classifies it (same KNN logic). Labels+archives if confident, adds to skip pool if not.
+4. **Label change**: updates training DB (label added → training, label removed → skip pool).
+5. **Watch renewal**: checked before each pull, renewed if expiring within 1 hour.
+6. **History expired**: falls back to full inbox scan, re-watches to get fresh historyId.
 
 #### Reacting to label changes
 
@@ -619,256 +631,24 @@ When the user manually labels or unlabels a message:
 - **Label added**: fetch the message, add to training DB under that label. Remove from skip pool (if present).
 - **Label removed**: remove from training DB for that label. Add to skip pool (message is now an unlabeled inbox message that shouldn't be labeled).
 - **Label moved** (remove A + add B): remove from training under A, add under B. Not a skip example (it still has a label).
-- **Incremental re-index**: re-embed only affected messages, update the in-memory training index.
 
-This eliminates the need for manual `make fetch-training` / `make fetch-inbox`.
+This eliminates the need for manual `make fetch-training` / `make fetch-inbox` during normal operation.
 
-#### Risks and gotchas
+#### Known limitations
 
-- `history.list()` can miss events if the `historyId` is too old (~30 days) — need fallback to full sync.
-- Watch notifications are "at least once" — may get duplicates (harmless, just re-check).
-- Watch expires after 7 days — must renew proactively.
-- Pub/Sub pull still needs a running process; not truly serverless.
-- Need service account credentials or user OAuth for Pub/Sub access.
+- `history.list()` can miss events if the `historyId` is too old (~30 days) — fallback to full inbox scan handles this.
+- Watch notifications are "at least once" — duplicates are harmless (deduplication by message ID).
+- Watch expires after 7 days — auto-renewed.
+- In-memory training index is NOT updated after label changes (would require re-embedding). The on-disk DBs are updated; restart picks up changes. Full incremental re-indexing is a future enhancement.
+- Pub/Sub pull still needs a running process on the laptop.
 
-#### Incremental implementation steps (TDD)
+#### Usage
 
-##### Step 1: Add `google-cloud-pubsub` dependency
-
-No tests needed — just dependency management.
-
-- Add `google-cloud-pubsub` to `pyproject.toml` under dependencies.
-- Run `uv sync` to verify installation.
-- Commit.
-
-##### Step 2: Add `history.list()` support to `GmailClient`
-
-**Test 2a: `get_history` returns added messages**
-
-```python
-def test_get_history_returns_messages_added():
-    # Mock history.list response with messagesAdded
-    # Verify returns list of HistoryEvent(type="messageAdded", message_id=..., label_ids=[...])
+```bash
+make watch-pubsub   # run with push notifications (preferred)
+make watch          # fallback: poll every 5 minutes
+make classify       # one-shot: classify once and exit
 ```
-
-- Implement `GmailClient.get_history(start_history_id) -> List[HistoryEvent]`.
-- `HistoryEvent` dataclass: `type` (messageAdded/labelsAdded/labelsRemoved), `message_id`, `label_ids`.
-- Commit.
-
-**Test 2b: `get_history` returns label changes**
-
-```python
-def test_get_history_returns_labels_added():
-    # Mock history with labelsAdded entries
-    # Verify returns HistoryEvent(type="labelsAdded", message_id=..., label_ids=[added_ids])
-
-def test_get_history_returns_labels_removed():
-    # Mock history with labelsRemoved entries
-    # Verify returns HistoryEvent(type="labelsRemoved", message_id=..., label_ids=[removed_ids])
-```
-
-- Extend parsing to handle `labelsAdded` and `labelsRemoved` history records.
-- Commit.
-
-**Test 2c: `get_history` handles pagination**
-
-```python
-def test_get_history_paginates():
-    # Mock two pages of history results
-    # Verify all events from both pages are returned
-```
-
-- Add `nextPageToken` handling in the loop.
-- Commit.
-
-**Test 2d: `get_history` raises on expired history ID**
-
-```python
-def test_get_history_raises_on_expired_id():
-    # Mock 404 response
-    # Verify raises HistoryExpiredError
-```
-
-- Define `HistoryExpiredError`. Raise when API returns 404.
-- Commit.
-
-**Test 2e: `watch()` registers notifications**
-
-```python
-def test_watch_returns_history_id_and_expiration():
-    # Mock users.watch response: {"historyId": "12345", "expiration": "1234567890000"}
-    # Verify returns (history_id, expiration_ms)
-```
-
-- Implement `GmailClient.watch(topic_name) -> Tuple[str, int]`.
-- Commit.
-
-##### Step 3: Pub/Sub subscriber wrapper
-
-**Test 3a: `PubSubSubscriber.pull` returns messages**
-
-```python
-def test_pull_returns_decoded_messages():
-    # Mock SubscriberClient.pull with a message containing {"emailAddress": "...", "historyId": "123"}
-    # Verify returns list of PubSubNotification(email=..., history_id="123")
-    # Verify acks the messages
-```
-
-- Implement `PubSubSubscriber` class wrapping `google.cloud.pubsub_v1.SubscriberClient`.
-- `pull(timeout) -> List[PubSubNotification]`.
-- Commit.
-
-**Test 3b: `pull` returns empty on timeout**
-
-```python
-def test_pull_returns_empty_on_timeout():
-    # Mock pull with no messages (timeout)
-    # Verify returns empty list
-```
-
-- Handle timeout gracefully (return `[]`).
-- Commit.
-
-##### Step 4: Replace sleep loop with Pub/Sub pull + history sync
-
-**Test 4a: `process_notification` classifies new inbox messages**
-
-```python
-def test_process_notification_classifies_new_message():
-    # Given: history shows a new message added to INBOX
-    # When: process_notification is called
-    # Then: message is classified and labeled (or added to skip)
-```
-
-- Extract classification logic from `_check_inbox` into a `classify_message(mid)` function.
-- Implement `process_notification(history_id)`: calls `get_history`, filters for relevant events, classifies new messages.
-- Commit.
-
-**Test 4b: `process_notification` ignores messages already with user labels**
-
-```python
-def test_process_notification_skips_already_labeled():
-    # Given: history shows a message added to INBOX that already has a user label
-    # When: process_notification is called
-    # Then: message is not classified
-```
-
-- Same "already labeled" check as current code.
-- Commit.
-
-**Test 4c: Main loop integrates Pub/Sub pull with history processing**
-
-```python
-def test_main_loop_pulls_and_processes():
-    # Given: PubSubSubscriber returns a notification with historyId
-    # When: one iteration of the loop runs
-    # Then: process_notification is called with that historyId
-```
-
-- Wire up: `pull()` → extract historyId → `process_notification()`.
-- Track `last_history_id` (updated after each successful process).
-- Add `--mode=pubsub|poll` flag (keep poll as fallback).
-- Commit.
-
-##### Step 5: Handle watch renewal
-
-**Test 5a: Watch is called on startup**
-
-```python
-def test_startup_calls_watch():
-    # Given: classifier starts up
-    # When: initialization completes
-    # Then: client.watch() was called with the configured topic
-    # And: returned historyId is stored as starting point
-```
-
-- Call `watch()` during startup, store `history_id` and `expiration`.
-- Commit.
-
-**Test 5b: Watch is renewed before expiration**
-
-```python
-def test_watch_renewed_before_expiry():
-    # Given: watch expiration is within 1 hour
-    # When: loop iteration starts
-    # Then: watch() is called again to renew
-```
-
-- Before each pull, check if `expiration - now < 1 hour`. If so, re-watch.
-- Commit.
-
-**Test 5c: Watch renewal after HistoryExpiredError**
-
-```python
-def test_expired_history_triggers_full_sync():
-    # Given: get_history raises HistoryExpiredError
-    # When: process_notification handles the error
-    # Then: falls back to full inbox scan (like current classify)
-    # And: re-watches to get a fresh historyId
-```
-
-- Catch `HistoryExpiredError`, do a full inbox check, re-watch.
-- Commit.
-
-##### Step 6: React to label changes
-
-**Test 6a: Label added → message added to training**
-
-```python
-def test_label_added_updates_training():
-    # Given: history shows labelsAdded with a user label on a message
-    # When: process_notification handles it
-    # Then: message is fetched, embedded, and added to training index
-    # And: message is removed from skip pool (if present)
-```
-
-- On `labelsAdded`: fetch message, add to training DB, re-embed, update in-memory index.
-- Remove from skip DB if present.
-- Commit.
-
-**Test 6b: Label removed → message moved to skip pool**
-
-```python
-def test_label_removed_moves_to_skip():
-    # Given: history shows labelsRemoved with a user label, message now has no user labels
-    # When: process_notification handles it
-    # Then: message is removed from training DB
-    # And: message is added to skip pool
-    # And: in-memory training index is updated
-```
-
-- On `labelsRemoved`: remove from training DB, add to skip DB, update in-memory index.
-- Commit.
-
-**Test 6c: Label moved → training updated (not skip)**
-
-```python
-def test_label_moved_updates_training_only():
-    # Given: history shows labelsRemoved "Tech" + labelsAdded "Travel" on same message
-    # When: process_notification handles both events
-    # Then: message moves from "Tech" to "Travel" in training DB
-    # And: message is NOT added to skip pool
-    # And: in-memory index is updated
-```
-
-- When both add+remove happen for the same message in one history batch, treat as a move.
-- Commit.
-
-**Test 6d: Excluded labels are ignored in history events**
-
-```python
-def test_excluded_label_changes_ignored():
-    # Given: history shows labelsAdded with an excluded label (e.g., XLC)
-    # When: process_notification handles it
-    # Then: no training update occurs
-```
-
-- Filter out excluded labels from history event processing.
-- Commit.
-
-##### Step 7: Remove manual fetch requirement
-
-No new tests — this is the natural outcome of steps 4-6 working together. Update `make help` to reflect that `fetch-training` and `fetch-inbox` are only needed for initial bootstrap or recovery.
 
 ---
 
@@ -880,9 +660,9 @@ No new tests — this is the natural outcome of steps 4-6 working together. Upda
 - NumPy
 - BeautifulSoup4 (HTML parsing)
 - google-api-python-client + google-auth
+- google-cloud-pubsub (push notifications)
 - SQLite (local cache)
 - pytest (testing)
-- Docker (Phase 3 only)
 
 ---
 
