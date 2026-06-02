@@ -13,6 +13,7 @@ dependencies = [
     "beautifulsoup4",
     "google-api-python-client",
     "google-auth-oauthlib",
+    "google-cloud-pubsub",
     "sentence-transformers",
 ]
 
