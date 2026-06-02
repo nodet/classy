@@ -636,7 +636,6 @@ This eliminates the need for manual `make fetch-training` / `make fetch-inbox` d
 
 #### Known limitations
 
-- In-memory training index is NOT updated after label changes (would require re-embedding). The on-disk DBs are updated; restart picks up changes. Full incremental re-indexing is a future enhancement.
 - Pub/Sub pull still needs a running process on the laptop.
 
 #### Usage
