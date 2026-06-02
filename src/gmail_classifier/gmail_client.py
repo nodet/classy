@@ -126,13 +126,15 @@ class GmailClient:
     def watch(self, topic_name: str) -> Tuple[str, int]:
         """Register for push notifications via Gmail Watch API.
 
+        No labelIds filter — get notifications for all mailbox changes
+        (new messages, label adds/removes on any message, etc.).
+
         Returns (history_id, expiration_ms).
         """
         result = self._service.users().watch(
             userId="me",
             body={
                 "topicName": topic_name,
-                "labelIds": ["INBOX"],
             },
         ).execute()
         return result["historyId"], int(result["expiration"])

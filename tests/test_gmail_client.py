@@ -273,6 +273,5 @@ def test_watch_returns_history_id_and_expiration():
         userId="me",
         body={
             "topicName": "projects/myproj/topics/gmail-notifications",
-            "labelIds": ["INBOX"],
         },
     )
