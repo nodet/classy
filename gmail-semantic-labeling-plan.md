@@ -702,6 +702,10 @@ Cloud Run alternative: flip to a push subscription (Pub/Sub POSTs to Cloud Run).
 
 Not viable. ARM (Marvell Armada 370), 512MB RAM, no Docker. Too underpowered for the embedding model.
 
+#### Measured memory usage
+
+On macOS (Apple Silicon), the Python process uses **~120MB RSS** at peak (right after classification). This includes the all-MiniLM-L6-v2 model (~90MB), Python runtime, numpy, and ~3800 training embeddings. When idle, macOS pages it down to ~30MB. The GCP e2-micro (1GB) should be comfortable.
+
 #### Recommendation
 
 Try **GCP e2-micro** first (free, same project as Pub/Sub). If 1GB RAM is too tight, upgrade to e2-small ($13/month) or switch to AWS Lightsail ($5/month). Both run Docker with restart policies and capture stdout logs.
