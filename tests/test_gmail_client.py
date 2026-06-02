@@ -1,6 +1,9 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from gmail_classifier.gmail_client import GmailClient
+from gmail_classifier.models import HistoryExpiredError
 
 
 def test_list_user_labels():
@@ -131,3 +134,145 @@ def test_get_message_labels():
     client = GmailClient(service)
     labels = client.get_message_labels("msg1")
     assert labels == ["INBOX", "UNREAD", "Label_1"]
+
+
+# --- history.list tests ---
+
+
+def test_get_history_returns_messages_added():
+    service = MagicMock()
+    service.users().history().list.return_value.execute.return_value = {
+        "history": [
+            {
+                "id": "100",
+                "messagesAdded": [
+                    {"message": {"id": "msg1", "labelIds": ["INBOX", "UNREAD"]}}
+                ],
+            }
+        ],
+        "historyId": "101",
+    }
+    client = GmailClient(service)
+    events = client.get_history("99")
+    assert len(events) == 1
+    assert events[0].type == "messagesAdded"
+    assert events[0].message_id == "msg1"
+    assert events[0].label_ids == ["INBOX", "UNREAD"]
+
+
+def test_get_history_returns_labels_added():
+    service = MagicMock()
+    service.users().history().list.return_value.execute.return_value = {
+        "history": [
+            {
+                "id": "100",
+                "labelsAdded": [
+                    {"message": {"id": "msg2", "labelIds": ["Label_1"]},
+                     "labelIds": ["Label_1"]}
+                ],
+            }
+        ],
+        "historyId": "101",
+    }
+    client = GmailClient(service)
+    events = client.get_history("99")
+    assert len(events) == 1
+    assert events[0].type == "labelsAdded"
+    assert events[0].message_id == "msg2"
+    assert events[0].label_ids == ["Label_1"]
+
+
+def test_get_history_returns_labels_removed():
+    service = MagicMock()
+    service.users().history().list.return_value.execute.return_value = {
+        "history": [
+            {
+                "id": "100",
+                "labelsRemoved": [
+                    {"message": {"id": "msg3", "labelIds": ["INBOX"]},
+                     "labelIds": ["Label_2"]}
+                ],
+            }
+        ],
+        "historyId": "101",
+    }
+    client = GmailClient(service)
+    events = client.get_history("99")
+    assert len(events) == 1
+    assert events[0].type == "labelsRemoved"
+    assert events[0].message_id == "msg3"
+    assert events[0].label_ids == ["Label_2"]
+
+
+def test_get_history_paginates():
+    service = MagicMock()
+    service.users().history().list.return_value.execute.side_effect = [
+        {
+            "history": [
+                {"id": "100", "messagesAdded": [
+                    {"message": {"id": "msg1", "labelIds": ["INBOX"]}}
+                ]}
+            ],
+            "historyId": "101",
+            "nextPageToken": "token1",
+        },
+        {
+            "history": [
+                {"id": "101", "messagesAdded": [
+                    {"message": {"id": "msg2", "labelIds": ["INBOX"]}}
+                ]}
+            ],
+            "historyId": "102",
+        },
+    ]
+    client = GmailClient(service)
+    events = client.get_history("99")
+    assert len(events) == 2
+    assert events[0].message_id == "msg1"
+    assert events[1].message_id == "msg2"
+
+
+def test_get_history_raises_on_expired_id():
+    from googleapiclient.errors import HttpError
+
+    service = MagicMock()
+    resp = MagicMock()
+    resp.status = 404
+    service.users().history().list.return_value.execute.side_effect = HttpError(
+        resp=resp, content=b"Not Found"
+    )
+    client = GmailClient(service)
+    with pytest.raises(HistoryExpiredError):
+        client.get_history("1")
+
+
+def test_get_history_empty():
+    service = MagicMock()
+    service.users().history().list.return_value.execute.return_value = {
+        "historyId": "100",
+    }
+    client = GmailClient(service)
+    events = client.get_history("99")
+    assert events == []
+
+
+# --- watch tests ---
+
+
+def test_watch_returns_history_id_and_expiration():
+    service = MagicMock()
+    service.users().watch.return_value.execute.return_value = {
+        "historyId": "12345",
+        "expiration": "1734567890000",
+    }
+    client = GmailClient(service)
+    history_id, expiration = client.watch("projects/myproj/topics/gmail-notifications")
+    assert history_id == "12345"
+    assert expiration == 1734567890000
+    service.users().watch.assert_called_once_with(
+        userId="me",
+        body={
+            "topicName": "projects/myproj/topics/gmail-notifications",
+            "labelIds": ["INBOX"],
+        },
+    )

@@ -1,5 +1,7 @@
 from typing import List, Tuple
 
+from gmail_classifier.models import HistoryEvent, HistoryExpiredError
+
 
 class GmailClient:
     """Thin wrapper around the Gmail API service object."""
@@ -70,3 +72,67 @@ class GmailClient:
             userId="me", id=message_id, format="minimal"
         ).execute()
         return result.get("labelIds", [])
+
+    def get_history(self, start_history_id: str) -> List[HistoryEvent]:
+        """Get mailbox changes since the given history ID.
+
+        Returns a list of HistoryEvents for messagesAdded, labelsAdded,
+        and labelsRemoved. Raises HistoryExpiredError if the history ID
+        is too old.
+        """
+        from googleapiclient.errors import HttpError
+
+        events = []
+        page_token = None
+        while True:
+            kwargs = {"userId": "me", "startHistoryId": start_history_id}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            try:
+                response = self._service.users().history().list(**kwargs).execute()
+            except HttpError as e:
+                if e.resp.status == 404:
+                    raise HistoryExpiredError(
+                        f"History ID {start_history_id} is too old"
+                    ) from e
+                raise
+
+            for record in response.get("history", []):
+                for added in record.get("messagesAdded", []):
+                    msg = added["message"]
+                    events.append(HistoryEvent(
+                        type="messagesAdded",
+                        message_id=msg["id"],
+                        label_ids=msg.get("labelIds", []),
+                    ))
+                for added in record.get("labelsAdded", []):
+                    events.append(HistoryEvent(
+                        type="labelsAdded",
+                        message_id=added["message"]["id"],
+                        label_ids=added.get("labelIds", []),
+                    ))
+                for removed in record.get("labelsRemoved", []):
+                    events.append(HistoryEvent(
+                        type="labelsRemoved",
+                        message_id=removed["message"]["id"],
+                        label_ids=removed.get("labelIds", []),
+                    ))
+
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return events
+
+    def watch(self, topic_name: str) -> Tuple[str, int]:
+        """Register for push notifications via Gmail Watch API.
+
+        Returns (history_id, expiration_ms).
+        """
+        result = self._service.users().watch(
+            userId="me",
+            body={
+                "topicName": topic_name,
+                "labelIds": ["INBOX"],
+            },
+        ).execute()
+        return result["historyId"], int(result["expiration"])
