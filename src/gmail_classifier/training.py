@@ -7,15 +7,16 @@ from gmail_classifier.models import Message
 from gmail_classifier.preprocessing import build_text_representation, preprocess_email_body
 
 
-def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str]]:
+def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[str]]:
     """Convert messages to text representations and extract labels.
 
-    Returns (texts, labels) where each text is the full representation
-    ready for embedding, and each label is the first label of the message.
-    Messages with no labels are skipped.
+    Returns (texts, labels, ids) where each text is the full representation
+    ready for embedding, each label is the first label of the message,
+    and each id is the message ID. Messages with no labels are skipped.
     """
     texts = []
     labels = []
+    ids = []
     for msg in messages:
         if not msg.labels:
             continue
@@ -29,20 +30,21 @@ def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str]]:
         )
         texts.append(text)
         labels.append(msg.labels[0])
-    return texts, labels
+        ids.append(msg.id)
+    return texts, labels, ids
 
 
 def build_training_data(
     messages: List[Message],
     embedder: Embedder | None = None,
-) -> Tuple[np.ndarray, List[str]]:
-    """Build training embeddings and labels from messages.
+) -> Tuple[np.ndarray, List[str], List[str]]:
+    """Build training embeddings, labels, and IDs from messages.
 
-    Returns (embeddings, labels) where embeddings has shape (n, dim)
-    and labels is a list of n label strings.
+    Returns (embeddings, labels, ids) where embeddings has shape (n, dim),
+    labels is a list of n label strings, and ids is a list of message IDs.
     """
     if embedder is None:
         embedder = Embedder()
-    texts, labels = prepare_texts(messages)
+    texts, labels, ids = prepare_texts(messages)
     embeddings = embedder.embed_batch(texts)
-    return embeddings, labels
+    return embeddings, labels, ids

@@ -2,9 +2,11 @@
 from unittest.mock import MagicMock
 import numpy as np
 
+from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.models import HistoryEvent, Message
 from gmail_classifier.storage import MessageStore
+from gmail_classifier.training_index import TrainingIndex
 
 
 def _make_raw_message(msg_id, subject="Test", label_ids=None):
@@ -177,6 +179,95 @@ def test_excluded_label_changes_ignored(tmp_path):
     client.get_message.assert_not_called()
     assert training_store.load_all() == []
     assert skip_store.load_all() == []
+
+    training_store.close()
+    skip_store.close()
+
+
+# --- Tests for in-memory index updates ---
+
+
+def test_label_added_updates_in_memory_index(tmp_path):
+    """When a label is added and index is provided, index gets updated."""
+    events = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_1"])
+
+    training_store = MessageStore(str(tmp_path / "training.db"))
+    skip_store = MessageStore(str(tmp_path / "skip.db"))
+
+    # Start with an empty index (just one dummy entry)
+    index = TrainingIndex(
+        np.random.randn(1, 384).astype(np.float32),
+        ["dummy"],
+        ["dummy_id"],
+    )
+
+    embedder = MagicMock()
+    embedder.embed.return_value = np.ones(384, dtype=np.float32)
+
+    process_label_changes(
+        events=events,
+        client=client,
+        training_store=training_store,
+        skip_store=skip_store,
+        label_id_to_name={"Label_1": "Tech"},
+        user_label_ids={"Label_1"},
+        excluded_labels=set(),
+        index=index,
+        embedder=embedder,
+    )
+
+    assert len(index) == 2
+    assert "msg1" in index
+    idx = index._id_to_idx["msg1"]
+    assert index.labels[idx] == "Tech"
+
+    training_store.close()
+    skip_store.close()
+
+
+def test_label_removed_updates_in_memory_index_to_skip(tmp_path):
+    """When a label is removed and no labels left, index entry becomes __skip__."""
+    events = [
+        HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["INBOX"])
+
+    training_store = MessageStore(str(tmp_path / "training.db"))
+    skip_store = MessageStore(str(tmp_path / "skip.db"))
+    training_store.save_message(
+        Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
+    )
+
+    # Index has msg1 as Tech
+    embeddings = np.random.randn(2, 384).astype(np.float32)
+    index = TrainingIndex(embeddings, ["Tech", "Travel"], ["msg1", "msg2"])
+
+    embedder = MagicMock()
+    embedder.embed.return_value = np.ones(384, dtype=np.float32)
+
+    process_label_changes(
+        events=events,
+        client=client,
+        training_store=training_store,
+        skip_store=skip_store,
+        label_id_to_name={"Label_1": "Tech"},
+        user_label_ids={"Label_1"},
+        excluded_labels=set(),
+        index=index,
+        embedder=embedder,
+    )
+
+    # msg1 should now be __skip__ in the index
+    assert "msg1" in index
+    idx = index._id_to_idx["msg1"]
+    assert index.labels[idx] == SKIP_LABEL
 
     training_store.close()
     skip_store.close()

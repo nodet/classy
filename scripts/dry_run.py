@@ -78,7 +78,7 @@ def main():
     # Build training index
     print("Embedding training data...")
     embedder = Embedder()
-    train_embeddings, train_labels = build_training_data(all_train_messages, embedder=embedder)
+    train_embeddings, train_labels, _ = build_training_data(all_train_messages, embedder=embedder)
     print(f"  {train_embeddings.shape[0]} embeddings, {train_embeddings.shape[1]} dimensions")
 
     # Load inbox messages (same DB as skip — we classify them to see what would happen)
