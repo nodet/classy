@@ -22,6 +22,7 @@ from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.gmail_parser import parse_gmail_message
 from gmail_classifier.history_processor import process_history_events
+from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.models import HistoryExpiredError
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
 from gmail_classifier.storage import MessageStore
@@ -130,9 +131,12 @@ def main():
     label_name_to_id = {name: lid for lid, name in user_labels}
     user_label_ids = {lid for lid, name in user_labels}
 
+    label_id_to_name = {lid: name for name, lid in label_name_to_id.items()}
+
     if args.mode == "pubsub":
         _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
-                         label_name_to_id, user_label_ids, excluded, skip_ids)
+                         label_name_to_id, label_id_to_name, user_label_ids,
+                         excluded, skip_ids)
     else:
         _run_poll_mode(args, client, embedder, train_embeddings, train_labels,
                        label_name_to_id, user_label_ids, excluded, skip_ids)
@@ -153,7 +157,8 @@ def _run_poll_mode(args, client, embedder, train_embeddings, train_labels,
 
 
 def _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
-                     label_name_to_id, user_label_ids, excluded, skip_ids):
+                     label_name_to_id, label_id_to_name, user_label_ids,
+                     excluded, skip_ids):
     """Wait for Pub/Sub notifications and process via history API."""
     from gmail_classifier.pubsub import PubSubSubscriber
 
@@ -200,7 +205,21 @@ def _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
             continue
 
         if events:
-            # Process new messages
+            # Process label changes (update training/skip DBs)
+            training_store = MessageStore(args.training_db)
+            skip_store = MessageStore(args.skip_db)
+
+            process_label_changes(
+                events=events,
+                client=client,
+                training_store=training_store,
+                skip_store=skip_store,
+                label_id_to_name=label_id_to_name,
+                user_label_ids=user_label_ids,
+                excluded_labels=excluded,
+            )
+
+            # Process new inbox messages
             results = process_history_events(
                 events=events,
                 client=client,
@@ -215,8 +234,7 @@ def _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
                 dry_run=args.dry_run,
             )
 
-            # Print results
-            skip_store = MessageStore(args.skip_db)
+            # Print and persist results
             for r in results:
                 sender = r["sender"]
                 subject = r["subject"]
@@ -229,6 +247,8 @@ def _run_pubsub_mode(args, client, embedder, train_embeddings, train_labels,
                         msg = r["message"]
                         msg.labels = []
                         skip_store.save_message(msg)
+
+            training_store.close()
             skip_store.close()
         else:
             print(".", end="", flush=True)
