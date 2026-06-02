@@ -616,9 +616,9 @@ The classifier process pulls from the subscription (blocking, instant delivery).
 
 When the user manually labels or unlabels a message:
 
-- **Label added**: fetch the message, add to training DB under that label.
-- **Label removed**: remove from training DB for that label.
-- **Label moved** (remove A + add B): update training DB accordingly.
+- **Label added**: fetch the message, add to training DB under that label. Remove from skip pool (if present).
+- **Label removed**: remove from training DB for that label. Add to skip pool (message is now an unlabeled inbox message that shouldn't be labeled).
+- **Label moved** (remove A + add B): remove from training under A, add under B. Not a skip example (it still has a label).
 - **Incremental re-index**: re-embed only affected messages, update the in-memory training index.
 
 This eliminates the need for manual `make fetch-training` / `make fetch-inbox`.
@@ -631,15 +631,244 @@ This eliminates the need for manual `make fetch-training` / `make fetch-inbox`.
 - Pub/Sub pull still needs a running process; not truly serverless.
 - Need service account credentials or user OAuth for Pub/Sub access.
 
-#### Incremental implementation steps
+#### Incremental implementation steps (TDD)
 
-1. Add `google-cloud-pubsub` dependency.
-2. Add `history.list()` support to `GmailClient`.
-3. Create a setup script for the one-time GCP/Pub/Sub configuration.
-4. Replace the sleep loop with Pub/Sub pull + history sync.
-5. Handle watch renewal (every 7 days).
-6. React to label changes (auto-update training/skip data in memory).
-7. Remove the need for `make fetch-training` / `make fetch-inbox` in normal operation.
+##### Step 1: Add `google-cloud-pubsub` dependency
+
+No tests needed — just dependency management.
+
+- Add `google-cloud-pubsub` to `pyproject.toml` under dependencies.
+- Run `uv sync` to verify installation.
+- Commit.
+
+##### Step 2: Add `history.list()` support to `GmailClient`
+
+**Test 2a: `get_history` returns added messages**
+
+```python
+def test_get_history_returns_messages_added():
+    # Mock history.list response with messagesAdded
+    # Verify returns list of HistoryEvent(type="messageAdded", message_id=..., label_ids=[...])
+```
+
+- Implement `GmailClient.get_history(start_history_id) -> List[HistoryEvent]`.
+- `HistoryEvent` dataclass: `type` (messageAdded/labelsAdded/labelsRemoved), `message_id`, `label_ids`.
+- Commit.
+
+**Test 2b: `get_history` returns label changes**
+
+```python
+def test_get_history_returns_labels_added():
+    # Mock history with labelsAdded entries
+    # Verify returns HistoryEvent(type="labelsAdded", message_id=..., label_ids=[added_ids])
+
+def test_get_history_returns_labels_removed():
+    # Mock history with labelsRemoved entries
+    # Verify returns HistoryEvent(type="labelsRemoved", message_id=..., label_ids=[removed_ids])
+```
+
+- Extend parsing to handle `labelsAdded` and `labelsRemoved` history records.
+- Commit.
+
+**Test 2c: `get_history` handles pagination**
+
+```python
+def test_get_history_paginates():
+    # Mock two pages of history results
+    # Verify all events from both pages are returned
+```
+
+- Add `nextPageToken` handling in the loop.
+- Commit.
+
+**Test 2d: `get_history` raises on expired history ID**
+
+```python
+def test_get_history_raises_on_expired_id():
+    # Mock 404 response
+    # Verify raises HistoryExpiredError
+```
+
+- Define `HistoryExpiredError`. Raise when API returns 404.
+- Commit.
+
+**Test 2e: `watch()` registers notifications**
+
+```python
+def test_watch_returns_history_id_and_expiration():
+    # Mock users.watch response: {"historyId": "12345", "expiration": "1234567890000"}
+    # Verify returns (history_id, expiration_ms)
+```
+
+- Implement `GmailClient.watch(topic_name) -> Tuple[str, int]`.
+- Commit.
+
+##### Step 3: Pub/Sub subscriber wrapper
+
+**Test 3a: `PubSubSubscriber.pull` returns messages**
+
+```python
+def test_pull_returns_decoded_messages():
+    # Mock SubscriberClient.pull with a message containing {"emailAddress": "...", "historyId": "123"}
+    # Verify returns list of PubSubNotification(email=..., history_id="123")
+    # Verify acks the messages
+```
+
+- Implement `PubSubSubscriber` class wrapping `google.cloud.pubsub_v1.SubscriberClient`.
+- `pull(timeout) -> List[PubSubNotification]`.
+- Commit.
+
+**Test 3b: `pull` returns empty on timeout**
+
+```python
+def test_pull_returns_empty_on_timeout():
+    # Mock pull with no messages (timeout)
+    # Verify returns empty list
+```
+
+- Handle timeout gracefully (return `[]`).
+- Commit.
+
+##### Step 4: Replace sleep loop with Pub/Sub pull + history sync
+
+**Test 4a: `process_notification` classifies new inbox messages**
+
+```python
+def test_process_notification_classifies_new_message():
+    # Given: history shows a new message added to INBOX
+    # When: process_notification is called
+    # Then: message is classified and labeled (or added to skip)
+```
+
+- Extract classification logic from `_check_inbox` into a `classify_message(mid)` function.
+- Implement `process_notification(history_id)`: calls `get_history`, filters for relevant events, classifies new messages.
+- Commit.
+
+**Test 4b: `process_notification` ignores messages already with user labels**
+
+```python
+def test_process_notification_skips_already_labeled():
+    # Given: history shows a message added to INBOX that already has a user label
+    # When: process_notification is called
+    # Then: message is not classified
+```
+
+- Same "already labeled" check as current code.
+- Commit.
+
+**Test 4c: Main loop integrates Pub/Sub pull with history processing**
+
+```python
+def test_main_loop_pulls_and_processes():
+    # Given: PubSubSubscriber returns a notification with historyId
+    # When: one iteration of the loop runs
+    # Then: process_notification is called with that historyId
+```
+
+- Wire up: `pull()` → extract historyId → `process_notification()`.
+- Track `last_history_id` (updated after each successful process).
+- Add `--mode=pubsub|poll` flag (keep poll as fallback).
+- Commit.
+
+##### Step 5: Handle watch renewal
+
+**Test 5a: Watch is called on startup**
+
+```python
+def test_startup_calls_watch():
+    # Given: classifier starts up
+    # When: initialization completes
+    # Then: client.watch() was called with the configured topic
+    # And: returned historyId is stored as starting point
+```
+
+- Call `watch()` during startup, store `history_id` and `expiration`.
+- Commit.
+
+**Test 5b: Watch is renewed before expiration**
+
+```python
+def test_watch_renewed_before_expiry():
+    # Given: watch expiration is within 1 hour
+    # When: loop iteration starts
+    # Then: watch() is called again to renew
+```
+
+- Before each pull, check if `expiration - now < 1 hour`. If so, re-watch.
+- Commit.
+
+**Test 5c: Watch renewal after HistoryExpiredError**
+
+```python
+def test_expired_history_triggers_full_sync():
+    # Given: get_history raises HistoryExpiredError
+    # When: process_notification handles the error
+    # Then: falls back to full inbox scan (like current classify)
+    # And: re-watches to get a fresh historyId
+```
+
+- Catch `HistoryExpiredError`, do a full inbox check, re-watch.
+- Commit.
+
+##### Step 6: React to label changes
+
+**Test 6a: Label added → message added to training**
+
+```python
+def test_label_added_updates_training():
+    # Given: history shows labelsAdded with a user label on a message
+    # When: process_notification handles it
+    # Then: message is fetched, embedded, and added to training index
+    # And: message is removed from skip pool (if present)
+```
+
+- On `labelsAdded`: fetch message, add to training DB, re-embed, update in-memory index.
+- Remove from skip DB if present.
+- Commit.
+
+**Test 6b: Label removed → message moved to skip pool**
+
+```python
+def test_label_removed_moves_to_skip():
+    # Given: history shows labelsRemoved with a user label, message now has no user labels
+    # When: process_notification handles it
+    # Then: message is removed from training DB
+    # And: message is added to skip pool
+    # And: in-memory training index is updated
+```
+
+- On `labelsRemoved`: remove from training DB, add to skip DB, update in-memory index.
+- Commit.
+
+**Test 6c: Label moved → training updated (not skip)**
+
+```python
+def test_label_moved_updates_training_only():
+    # Given: history shows labelsRemoved "Tech" + labelsAdded "Travel" on same message
+    # When: process_notification handles both events
+    # Then: message moves from "Tech" to "Travel" in training DB
+    # And: message is NOT added to skip pool
+    # And: in-memory index is updated
+```
+
+- When both add+remove happen for the same message in one history batch, treat as a move.
+- Commit.
+
+**Test 6d: Excluded labels are ignored in history events**
+
+```python
+def test_excluded_label_changes_ignored():
+    # Given: history shows labelsAdded with an excluded label (e.g., XLC)
+    # When: process_notification handles it
+    # Then: no training update occurs
+```
+
+- Filter out excluded labels from history event processing.
+- Commit.
+
+##### Step 7: Remove manual fetch requirement
+
+No new tests — this is the natural outcome of steps 4-6 working together. Update `make help` to reflect that `fetch-training` and `fetch-inbox` are only needed for initial bootstrap or recovery.
 
 ---
 
