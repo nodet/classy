@@ -212,6 +212,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
             continue
 
         if events:
+            print()  # newline after any dots
             # Process label changes (update training/skip DBs + in-memory index)
             training_store = MessageStore(args.training_db)
             skip_store = MessageStore(args.skip_db)
