@@ -173,6 +173,9 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     if args.once:
         return
 
+    # Track messages labeled by the classifier itself (to ignore echoed events)
+    self_labeled = set()
+
     subscriber = PubSubSubscriber(
         subscription_path=PUBSUB_SUBSCRIPTION, credentials=credentials
     )
@@ -220,6 +223,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 index=index,
                 embedder=embedder,
                 registry=registry,
+                ignore_ids=self_labeled,
             )
             for src, dst, count in movements:
                 print(f"{now()} {count} {'email' if count == 1 else 'emails'} moved from {src} to {dst}")
@@ -247,6 +251,8 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 if r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
                     action_str = "LABEL" if r["action"] == Action.LABEL else "REVIEW"
                     print(f"{now()} [{action_str}] {r['label']:20s} {r['confidence']:5.1%}  {sender} — {subject}")
+                    if r.get("applied"):
+                        self_labeled.add(r["message_id"])
                 else:
                     print(f"{now()} [SKIP]  {r['confidence']:5.1%}  {sender} — {subject}")
                     if not args.dry_run:

@@ -24,6 +24,7 @@ def process_label_changes(
     index: Optional[TrainingIndex] = None,
     embedder: Optional[Embedder] = None,
     registry: Optional[LabelRegistry] = None,
+    ignore_ids: Optional[Set[str]] = None,
 ) -> List[Tuple[str, str, int]]:
     """Process labelsAdded and labelsRemoved events.
 
@@ -78,6 +79,14 @@ def process_label_changes(
             affected[mid]["added"].update(relevant_labels)
         else:
             affected[mid]["removed"].update(relevant_labels)
+
+    # Skip messages labeled by the classifier itself (echoed events)
+    if ignore_ids:
+        for mid in list(affected.keys()):
+            if mid in ignore_ids:
+                del affected[mid]
+                # Allow future user corrections on this message
+                ignore_ids.discard(mid)
 
     # Track movements: (source, destination) -> count
     movements = defaultdict(int)
