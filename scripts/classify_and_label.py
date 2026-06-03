@@ -166,15 +166,15 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     history_id, expiration = client.watch(PUBSUB_TOPIC)
     print(f"  Watch active, historyId={history_id}")
 
+    # Track messages labeled by the classifier itself (to ignore echoed events)
+    self_labeled = set()
+
     # Do an initial inbox check to catch anything missed
     print("Initial inbox check...")
-    _check_inbox(args, client, embedder, index, registry, skip_ids)
+    _check_inbox(args, client, embedder, index, registry, skip_ids, self_labeled)
 
     if args.once:
         return
-
-    # Track messages labeled by the classifier itself (to ignore echoed events)
-    self_labeled = set()
 
     subscriber = PubSubSubscriber(
         subscription_path=PUBSUB_SUBSCRIPTION, credentials=credentials
@@ -209,7 +209,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 events = client.get_history(history_id)
             except HistoryExpiredError:
                 print(f"{now()} History expired, falling back to inbox poll")
-                _check_inbox(args, client, embedder, index, registry, skip_ids)
+                _check_inbox(args, client, embedder, index, registry, skip_ids, self_labeled)
                 # Re-watch to get fresh historyId
                 history_id, expiration = client.watch(PUBSUB_TOPIC)
                 continue
@@ -300,7 +300,8 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 raise
 
 
-def _check_inbox(args, client, embedder, index, registry, skip_ids):
+def _check_inbox(args, client, embedder, index, registry, skip_ids,
+                 self_labeled=None):
     """Check inbox and classify new messages (poll mode)."""
     inbox_ids = client.list_message_ids(label_id="INBOX", max_results=args.max_messages)
     new_ids = [mid for mid in inbox_ids if mid not in skip_ids]
@@ -346,6 +347,8 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids):
 
             if not args.dry_run:
                 client.apply_label(mid, label_id, archive=True)
+                if self_labeled is not None:
+                    self_labeled.add(mid)
         else:
             print(f"{now()} [SKIP]  {result.confidence:5.1%}  {sender} — {msg.subject}")
             if not args.dry_run:
