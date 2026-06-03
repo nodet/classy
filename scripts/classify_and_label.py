@@ -362,4 +362,8 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids,
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{datetime.now().strftime('%H:%M:%S')} Stopped.")
+        sys.exit(0)
