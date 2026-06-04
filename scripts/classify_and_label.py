@@ -185,22 +185,25 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
 
     while True:
         try:
+            # If in retry mode, wait before retrying
+            if backoff:
+                time.sleep(backoff)
+
             # Renew watch if expiring within 1 hour
             now_ms = int(time.time() * 1000)
             if expiration - now_ms < 3600_000:
                 history_id_new, expiration = client.watch(PUBSUB_TOPIC)
                 print(f"{now()} Watch renewed")
 
-            # Pull notifications (blocks up to 60s)
-            notifications = subscriber.pull(timeout=60)
+            # Pull notifications (shorter timeout when retrying)
+            pull_timeout = 10 if backoff else 60
+            notifications = subscriber.pull(timeout=pull_timeout)
 
             if not notifications:
+                if backoff:
+                    backoff = min(backoff * 2, 300)
+                    print(f"{now()} Retrying in {backoff}s...")
                 continue
-
-            # Connection is working — reset backoff if we were retrying
-            if backoff:
-                print(f"{now()} Connection restored")
-                backoff = 0
 
             # Use the most recent historyId from notifications
             max_history = max(n.history_id for n in notifications)
@@ -213,6 +216,11 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 # Re-watch to get fresh historyId
                 history_id, expiration = client.watch(PUBSUB_TOPIC)
                 continue
+
+            # If we got here, connection is fully working
+            if backoff:
+                print(f"{now()} Connection restored")
+                backoff = 0
 
             if events:
                 # Process label changes (update training/skip DBs + in-memory index)
@@ -285,7 +293,6 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
             else:
                 backoff = min(backoff * 2, 300)
             print(f"{now()} Retrying in {backoff}s...")
-            time.sleep(backoff)
         except Exception as e:
             # Catch gRPC/API errors from Pub/Sub (ServiceUnavailable, etc.)
             if "unavailable" in str(e).lower() or "503" in str(e):
@@ -295,7 +302,6 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 else:
                     backoff = min(backoff * 2, 300)
                 print(f"{now()} Retrying in {backoff}s...")
-                time.sleep(backoff)
             else:
                 raise
 
