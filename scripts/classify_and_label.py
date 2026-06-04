@@ -182,6 +182,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     print(f"\nReady (pubsub mode). Waiting for notifications...\n")
 
     backoff = 0  # 0 means not in retry mode
+    dots_printed = False
 
     while True:
         try:
@@ -259,7 +260,9 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
 
                 # Print results (only if there's something to report)
                 if movements or results:
-                    print()  # newline after any dots
+                    if dots_printed:
+                        print()  # newline after dots
+                        dots_printed = False
                 for src, dst, count in movements:
                     print(f"{now()} {count} {'email' if count == 1 else 'emails'} moved from {src} to {dst}")
                 for r in results:
@@ -281,6 +284,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 skip_store.close()
             else:
                 print(".", end="", flush=True)
+                dots_printed = True
 
             # Advance history pointer
             history_id = max_history
