@@ -175,7 +175,7 @@ case "${1:-}" in
     ;;
 
   logs)
-    tail -F "$LOG"
+    tail -n 20 -F "$LOG"
     ;;
 
   truncate-log)
