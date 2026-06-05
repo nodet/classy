@@ -1,3 +1,5 @@
+import base64
+from email.mime.text import MIMEText
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -275,3 +277,22 @@ def test_watch_returns_history_id_and_expiration():
             "topicName": "projects/myproj/topics/gmail-notifications",
         },
     )
+
+
+# --- send_message tests ---
+
+
+def test_send_message():
+    service = MagicMock()
+    client = GmailClient(service)
+    client.send_message("user@example.com", "Test Subject", "Hello body")
+
+    call_args = service.users().messages().send.call_args
+    assert call_args[1]["userId"] == "me"
+    raw = call_args[1]["body"]["raw"]
+    # Decode and verify the MIME message
+    decoded = base64.urlsafe_b64decode(raw).decode()
+    assert "To: user@example.com" in decoded
+    assert "Subject: Test Subject" in decoded
+    assert "Hello body" in decoded
+    service.users().messages().send.return_value.execute.assert_called_once()

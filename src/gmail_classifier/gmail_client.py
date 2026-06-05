@@ -1,3 +1,5 @@
+import base64
+from email.mime.text import MIMEText
 from typing import List, Tuple
 
 from gmail_classifier.models import HistoryEvent, HistoryExpiredError
@@ -138,3 +140,13 @@ class GmailClient:
             },
         ).execute()
         return result["historyId"], int(result["expiration"])
+
+    def send_message(self, to: str, subject: str, body: str):
+        """Send a plain-text email via the Gmail API."""
+        msg = MIMEText(body)
+        msg["to"] = to
+        msg["subject"] = subject
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        self._service.users().messages().send(
+            userId="me", body={"raw": raw}
+        ).execute()
