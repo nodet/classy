@@ -77,13 +77,24 @@ Deploy to a free-tier e2-micro VM for always-on operation without keeping a lapt
    gcloud config set project classy-498012
    ```
 
-4. Enable Compute Engine API (first time only):
+4. Ensure billing is enabled (required even for free-tier resources):
+
+   ```bash
+   gcloud billing accounts list
+   gcloud billing projects link classy-498012 --billing-account=<BILLING_ACCOUNT_ID>
+   ```
+
+   If you don't have a billing account, create one at the
+   [GCP billing console](https://console.cloud.google.com/billing)
+   (credit card required, but e2-micro in us-central1 is free).
+
+5. Enable Compute Engine API (first time only):
 
    ```bash
    gcloud services enable compute.googleapis.com
    ```
 
-5. Verify:
+6. Verify:
 
    ```bash
    gcloud config list
