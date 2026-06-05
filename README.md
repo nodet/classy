@@ -52,3 +52,57 @@ Semantic auto-labeling for Gmail using KNN on email embeddings.
 
 For detailed launchd configuration, see [mac_uv_launchd_service_plan.md](mac_uv_launchd_service_plan.md).
 For GCP/Gmail API setup, see [docs/gmail-setup.md](docs/gmail-setup.md).
+
+## GCP deployment (always-on)
+
+Deploy to a free-tier e2-micro VM for always-on operation without keeping a laptop open.
+
+### Prerequisites: install and configure gcloud CLI
+
+1. Install the Google Cloud CLI:
+
+   ```bash
+   brew install --cask google-cloud-sdk
+   ```
+
+2. Authenticate:
+
+   ```bash
+   gcloud auth login
+   ```
+
+3. Set the project:
+
+   ```bash
+   gcloud config set project classy-498012
+   ```
+
+4. Enable Compute Engine API (first time only):
+
+   ```bash
+   gcloud services enable compute.googleapis.com
+   ```
+
+5. Verify:
+
+   ```bash
+   gcloud config list
+   ```
+
+### Deploy
+
+```bash
+make gcp-create    # 1. Create the VM
+make gcp-deploy    # 2. Deploy code, data, credentials, install deps
+make gcp-start     # 3. Start the service
+make gcp-status    # 4. Check status
+make gcp-logs      # 5. Tail logs (Ctrl+C to stop)
+make gcp-ssh       # 6. SSH into VM (for debugging)
+make gcp-destroy   # 7. Destroy VM (when no longer needed)
+```
+
+### Updating
+
+After code changes, just run `make gcp-deploy` -- it syncs code, skips unchanged data files, and restarts the service automatically.
+
+After retraining (`make fetch-training` on Mac), `make gcp-deploy` detects the size change and uploads the new database.

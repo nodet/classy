@@ -1,5 +1,6 @@
 .PHONY: help setup test quick clean fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub \
-       service-install service-uninstall service-start service-stop service-status service-logs
+       service-install service-uninstall service-start service-stop service-status service-logs \
+       gcp-create gcp-deploy gcp-destroy gcp-start gcp-stop gcp-restart gcp-status gcp-logs gcp-ssh
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -67,3 +68,36 @@ service-status: ## Show launchd service status
 
 service-logs: ## Tail the service log
 	@"$$HOME/bin/gmail-classifierctl" logs
+
+# --- GCP Deployment (e2-micro VM) ---
+
+GCP_PROJECT  := classy-498012
+GCP_INSTANCE := gmail-classifier
+GCP_ZONE     := us-central1-a
+
+gcp-create: ## Create GCP e2-micro VM
+	@scripts/gcp-create.sh
+
+gcp-deploy: ## Deploy code, data, and credentials to GCP VM
+	@scripts/gcp-deploy.sh
+
+gcp-destroy: ## Delete the GCP VM (interactive confirmation)
+	@scripts/gcp-destroy.sh
+
+gcp-start: ## Start the classifier service on GCP
+	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl start gmail-classifier"
+
+gcp-stop: ## Stop the classifier service on GCP
+	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl stop gmail-classifier"
+
+gcp-restart: ## Restart the classifier service on GCP
+	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl restart gmail-classifier"
+
+gcp-status: ## Show service status on GCP
+	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl status gmail-classifier"
+
+gcp-logs: ## Tail service logs on GCP (last 20 + follow)
+	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo journalctl -u gmail-classifier -n 20 -f"
+
+gcp-ssh: ## Open SSH session to the GCP VM
+	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE)
