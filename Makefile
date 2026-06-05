@@ -1,4 +1,5 @@
-.PHONY: help setup test quick clean fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub
+.PHONY: help setup test quick clean fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub \
+       service-install service-uninstall service-start service-stop service-status service-logs
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -46,3 +47,23 @@ watch-pubsub: ## Run classifier with Pub/Sub push notifications
 clean: ## Remove build artifacts and virtual environment
 	rm -rf .venv __pycache__ src/*.egg-info
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+# --- Service (macOS launchd) ---
+
+service-install: ## Install macOS launchd service (does not auto-start)
+	@scripts/service-install.sh
+
+service-uninstall: ## Uninstall macOS launchd service
+	@scripts/service-uninstall.sh
+
+service-start: ## Start the launchd service
+	@"$$HOME/bin/gmail-classifierctl" start
+
+service-stop: ## Stop the launchd service
+	@"$$HOME/bin/gmail-classifierctl" stop
+
+service-status: ## Show launchd service status
+	@"$$HOME/bin/gmail-classifierctl" status
+
+service-logs: ## Tail the service log
+	@"$$HOME/bin/gmail-classifierctl" logs
