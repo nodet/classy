@@ -279,12 +279,11 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                     sender = r["sender"]
                     subject = r["subject"]
                     if r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
-                        action_str = "LABEL" if r["action"] == Action.LABEL else "REVIEW"
-                        print(truncate(f"{now()} [{action_str}] {r['label']:20s} {r['confidence']:6.1%}  {sender} — {subject}"))
+                        print(truncate(f"{now()} {r['label']:20s} {r['confidence']:6.1%}  {sender} — {subject}"))
                         if r.get("applied"):
                             self_labeled.add(r["message_id"])
                     else:
-                        print(truncate(f"{now()} [SKIP]  {'':20s} {r['confidence']:6.1%}  {sender} — {subject}"))
+                        print(truncate(f"{now()} {'':20s} {r['confidence']:6.1%}  {sender} — {subject}"))
                         if not args.dry_run:
                             msg = r["message"]
                             msg.labels = []
@@ -362,15 +361,14 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids,
                 print(f"{now()} WARNING: label '{result.label}' not found in Gmail, skipping")
                 continue
 
-            action_str = "LABEL" if result.action == Action.LABEL else "REVIEW"
-            print(truncate(f"{now()} [{action_str}] {result.label:20s} {result.confidence:6.1%}  {sender} — {msg.subject}"))
+            print(truncate(f"{now()} {result.label:20s} {result.confidence:6.1%}  {sender} — {msg.subject}"))
 
             if not args.dry_run:
                 client.apply_label(mid, label_id, archive=True)
                 if self_labeled is not None:
                     self_labeled.add(mid)
         else:
-            print(truncate(f"{now()} [SKIP]  {'':20s} {result.confidence:6.1%}  {sender} — {msg.subject}"))
+            print(truncate(f"{now()} {'':20s} {result.confidence:6.1%}  {sender} — {msg.subject}"))
             if not args.dry_run:
                 msg.labels = []
                 skip_store.save_message(msg)
