@@ -9,6 +9,7 @@ Modes:
   pubsub: wait for Gmail push notifications via Pub/Sub
 """
 import argparse
+import signal
 import sys
 import time
 from datetime import datetime
@@ -382,9 +383,14 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids,
     skip_store.close()
 
 
+def _sigterm_handler(signum, frame):
+    raise SystemExit(0)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
         main()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         print(f"\n{datetime.now().strftime('%H:%M:%S')} Stopped.")
         sys.exit(0)
