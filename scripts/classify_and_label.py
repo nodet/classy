@@ -387,6 +387,22 @@ def _sigterm_handler(signum, frame):
     raise SystemExit(0)
 
 
+def _send_crash_alert(exc):
+    """Attempt to email ourselves a crash notification."""
+    import traceback
+    from gmail_classifier.auth import get_gmail_service
+    from gmail_classifier.gmail_client import GmailClient
+
+    service = get_gmail_service(Path("credentials"))
+    client = GmailClient(service)
+    body = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    client.send_message(
+        to="me",
+        subject="gmail-classifier crashed",
+        body=body,
+    )
+
+
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
@@ -394,3 +410,9 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         print(f"\n{datetime.now().strftime('%H:%M:%S')} Stopped.")
         sys.exit(0)
+    except Exception as e:
+        try:
+            _send_crash_alert(e)
+        except Exception:
+            pass  # don't mask the original error
+        raise
