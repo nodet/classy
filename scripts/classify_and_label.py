@@ -280,11 +280,11 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                     subject = r["subject"]
                     if r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
                         action_str = "LABEL" if r["action"] == Action.LABEL else "REVIEW"
-                        print(truncate(f"{now()} [{action_str}] {r['label']:20s} {r['confidence']:5.1%}  {sender} — {subject}"))
+                        print(truncate(f"{now()} [{action_str}] {r['label']:20s} {r['confidence']:6.1%}  {sender} — {subject}"))
                         if r.get("applied"):
                             self_labeled.add(r["message_id"])
                     else:
-                        print(truncate(f"{now()} [SKIP]  {r['confidence']:5.1%}  {sender} — {subject}"))
+                        print(truncate(f"{now()} [SKIP]  {'':20s} {r['confidence']:6.1%}  {sender} — {subject}"))
                         if not args.dry_run:
                             msg = r["message"]
                             msg.labels = []
@@ -363,14 +363,14 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids,
                 continue
 
             action_str = "LABEL" if result.action == Action.LABEL else "REVIEW"
-            print(truncate(f"{now()} [{action_str}] {result.label:20s} {result.confidence:5.1%}  {sender} — {msg.subject}"))
+            print(truncate(f"{now()} [{action_str}] {result.label:20s} {result.confidence:6.1%}  {sender} — {msg.subject}"))
 
             if not args.dry_run:
                 client.apply_label(mid, label_id, archive=True)
                 if self_labeled is not None:
                     self_labeled.add(mid)
         else:
-            print(truncate(f"{now()} [SKIP]  {result.confidence:5.1%}  {sender} — {msg.subject}"))
+            print(truncate(f"{now()} [SKIP]  {'':20s} {result.confidence:6.1%}  {sender} — {msg.subject}"))
             if not args.dry_run:
                 msg.labels = []
                 skip_store.save_message(msg)
