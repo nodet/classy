@@ -57,6 +57,16 @@ cd "\$PROJECT_DIR"
 
 exec >> "\$LOG" 2>&1
 
+# Detect crash loop: if last start was <60s ago, notify
+last_start=\$(grep -o '\[[^]]*\] starting' "\$LOG" | tail -1 | tr -d '[]' | sed 's/ starting//')
+if [[ -n "\$last_start" ]]; then
+    last_epoch=\$(/bin/date -j -f "%Y-%m-%dT%H:%M:%SZ" "\$last_start" "+%s" 2>/dev/null || echo 0)
+    now_epoch=\$(/bin/date "+%s")
+    if (( now_epoch - last_epoch < 60 )); then
+        osascript -e 'display notification "Service is crash-looping. Check: gmail-classifierctl logs" with title "gmail-classifier"'
+    fi
+fi
+
 echo "[\$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')] starting \${LABEL}"
 
 exec "\$UV" run --locked -- python -u scripts/classify_and_label.py --mode pubsub --exclude-labels $EXCLUDE_LABELS
