@@ -119,6 +119,9 @@ sync_file() {
 
 sync_file "data/training.db" "$INSTALL_DIR/data/training.db"
 sync_file "data/inbox_sample.db" "$INSTALL_DIR/data/inbox_sample.db"
+if [[ -s "data/embeddings.db" ]]; then
+    sync_file "data/embeddings.db" "$INSTALL_DIR/data/embeddings.db"
+fi
 
 # --- Sync credentials ---
 

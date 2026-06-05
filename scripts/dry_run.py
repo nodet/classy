@@ -9,6 +9,7 @@ import sys
 import numpy as np
 
 from gmail_classifier.classifier import classify, Action, SKIP_LABEL
+from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
 from gmail_classifier.storage import MessageStore
@@ -75,10 +76,16 @@ def main():
     # Combine training + skip for building index
     all_train_messages = train_messages + skip_messages
 
-    # Build training index
+    # Build training index (with embedding cache)
+    from pathlib import Path
+    cache_path = Path(args.training_db).parent / "embeddings.db"
+    cache = EmbeddingCache(str(cache_path))
     print("Embedding training data...")
     embedder = Embedder()
-    train_embeddings, train_labels, _ = build_training_data(all_train_messages, embedder=embedder)
+    train_embeddings, train_labels, _ = build_training_data(
+        all_train_messages, embedder=embedder, cache=cache,
+    )
+    cache.close()
     print(f"  {train_embeddings.shape[0]} embeddings, {train_embeddings.shape[1]} dimensions")
 
     # Load inbox messages (same DB as skip — we classify them to see what would happen)

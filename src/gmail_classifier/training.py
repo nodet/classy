@@ -1,7 +1,8 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
+from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.models import Message
 from gmail_classifier.preprocessing import build_text_representation, preprocess_email_body
@@ -37,14 +38,43 @@ def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[s
 def build_training_data(
     messages: List[Message],
     embedder: Embedder | None = None,
+    cache: Optional[EmbeddingCache] = None,
 ) -> Tuple[np.ndarray, List[str], List[str]]:
     """Build training embeddings, labels, and IDs from messages.
 
     Returns (embeddings, labels, ids) where embeddings has shape (n, dim),
     labels is a list of n label strings, and ids is a list of message IDs.
+
+    If cache is provided, cached embeddings are used for known IDs and
+    newly computed embeddings are stored back into the cache.
     """
     if embedder is None:
         embedder = Embedder()
     texts, labels, ids = prepare_texts(messages)
-    embeddings = embedder.embed_batch(texts)
+
+    if cache is None:
+        embeddings = embedder.embed_batch(texts)
+        return embeddings, labels, ids
+
+    # Look up cached embeddings
+    cached = cache.get_batch(ids)
+    miss_indices = [i for i, mid in enumerate(ids) if mid not in cached]
+
+    if miss_indices:
+        miss_texts = [texts[i] for i in miss_indices]
+        miss_embeddings = embedder.embed_batch(miss_texts)
+        # Store new embeddings in cache
+        miss_ids = [ids[i] for i in miss_indices]
+        cache.put_batch(miss_ids, miss_embeddings)
+
+    # Assemble full embeddings array in order
+    dim = next(iter(cached.values())).shape[0] if cached else miss_embeddings.shape[1]
+    embeddings = np.empty((len(ids), dim), dtype=np.float32)
+    miss_pos = {idx: pos for pos, idx in enumerate(miss_indices)}
+    for i, mid in enumerate(ids):
+        if mid in cached:
+            embeddings[i] = cached[mid]
+        else:
+            embeddings[i] = miss_embeddings[miss_pos[i]]
+
     return embeddings, labels, ids

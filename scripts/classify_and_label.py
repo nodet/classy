@@ -19,6 +19,7 @@ import numpy as np
 
 from gmail_classifier.auth import get_credentials, get_gmail_service
 from gmail_classifier.classifier import classify, Action, SKIP_LABEL
+from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.gmail_parser import parse_gmail_message
@@ -126,11 +127,16 @@ def main():
             m.labels = [SKIP_LABEL]
         print(f"  {len(skip_messages)} skip examples")
 
-    # Build training index
+    # Build training index (with embedding cache for fast startup)
     all_train_messages = train_messages + skip_messages
+    cache_path = Path(args.training_db).parent / "embeddings.db"
+    cache = EmbeddingCache(str(cache_path))
     print("Embedding training data...")
     embedder = Embedder()
-    train_embeddings, train_labels, train_ids = build_training_data(all_train_messages, embedder=embedder)
+    train_embeddings, train_labels, train_ids = build_training_data(
+        all_train_messages, embedder=embedder, cache=cache,
+    )
+    cache.close()
     print(f"  {train_embeddings.shape[0]} embeddings, {train_embeddings.shape[1]} dimensions")
 
     # Connect to Gmail

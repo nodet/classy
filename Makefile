@@ -1,4 +1,4 @@
-.PHONY: help setup test quick clean fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub \
+.PHONY: help setup test quick clean fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub embed \
        service-install service-uninstall service-start service-stop service-status service-logs \
        gcp-create gcp-deploy gcp-destroy gcp-start gcp-stop gcp-restart gcp-status gcp-logs gcp-ssh
 
@@ -44,6 +44,9 @@ watch: ## Run classifier in a loop every 5 minutes (poll mode)
 
 watch-pubsub: ## Run classifier with Pub/Sub push notifications
 	uv run python scripts/classify_and_label.py --mode pubsub --exclude-labels XLC XLE XLCap
+
+embed: ## Pre-compute embedding cache (for fast startup on GCP)
+	uv run python scripts/build_embeddings.py --exclude-labels XLC XLE XLCap
 
 clean: ## Remove build artifacts and virtual environment
 	rm -rf .venv __pycache__ src/*.egg-info
