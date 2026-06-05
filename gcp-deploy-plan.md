@@ -162,12 +162,29 @@ make gcp-deploy    # detects size change, uploads new db, restarts
 
 ## 6. Update README
 
-Add a "GCP deployment" section to `/workspace/README.md` after the macOS service section:
+Add a "GCP deployment" section to `/workspace/README.md` after the macOS service section. Include explicit gcloud CLI setup instructions:
 
-```
+```markdown
 ## GCP deployment (always-on)
 
-Requires `gcloud` CLI configured with project `classy-498012`.
+### Prerequisites: install and configure gcloud CLI
+
+1. Install the Google Cloud CLI:
+   brew install --cask google-cloud-sdk
+
+2. Authenticate:
+   gcloud auth login
+
+3. Set the project:
+   gcloud config set project classy-498012
+
+4. Enable Compute Engine API (first time only):
+   gcloud services enable compute.googleapis.com
+
+5. Verify:
+   gcloud config list
+
+### Deploy
 
 1. Create the VM:        make gcp-create
 2. Deploy everything:    make gcp-deploy
