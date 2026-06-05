@@ -18,6 +18,8 @@ class LabelRegistry:
         self.name_to_id: Dict[str, str] = {name: lid for lid, name in user_labels}
         self.id_to_name: Dict[str, str] = {lid: name for lid, name in user_labels}
         self.user_label_ids: Set[str] = {lid for lid, _ in user_labels}
+        names = [n for n in self.name_to_id if n not in self._excluded]
+        self.max_label_width: int = max((len(n) for n in names), default=0)
 
     def is_known(self, label_id: str) -> bool:
         return label_id in self.id_to_name

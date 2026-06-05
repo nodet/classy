@@ -108,3 +108,24 @@ def test_ensure_known_returns_false_if_still_unknown():
     result = registry.ensure_known("L99")
     assert result is False
     assert client.list_user_labels.call_count == 2
+
+
+def test_max_label_width():
+    """max_label_width is the length of the longest non-excluded label."""
+    client = _make_client([("L1", "Tech"), ("L2", "Technologie"), ("L3", "XLC")])
+    registry = LabelRegistry(client, excluded={"XLC"})
+
+    assert registry.max_label_width == len("Technologie")
+
+
+def test_max_label_width_updates_on_refresh():
+    """max_label_width updates when a longer label is discovered."""
+    client = _make_client([("L1", "Tech")])
+    registry = LabelRegistry(client, excluded=set())
+
+    assert registry.max_label_width == 4
+
+    client.list_user_labels.return_value = [("L1", "Tech"), ("L2", "Conferences")]
+    registry.refresh()
+
+    assert registry.max_label_width == len("Conferences")
