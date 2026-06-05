@@ -58,7 +58,7 @@ cd "\$PROJECT_DIR"
 exec >> "\$LOG" 2>&1
 
 # Detect crash loop: if last start was <60s ago, notify
-last_start=\$(grep -o '\[[^]]*\] starting' "\$LOG" | tail -1 | tr -d '[]' | sed 's/ starting//')
+last_start=\$(grep -o '\[[^]]*\] starting' "\$LOG" | tail -1 | tr -d '[]' | sed 's/ starting//') || true
 if [[ -n "\$last_start" ]]; then
     last_epoch=\$(/bin/date -j -f "%Y-%m-%dT%H:%M:%SZ" "\$last_start" "+%s" 2>/dev/null || echo 0)
     now_epoch=\$(/bin/date "+%s")
