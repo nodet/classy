@@ -137,6 +137,7 @@ def main():
         all_train_messages, embedder=embedder, cache=cache,
     )
     cache.close()
+    del all_train_messages, train_messages, skip_messages
     print(f"  {train_embeddings.shape[0]} embeddings, {train_embeddings.shape[1]} dimensions")
 
     # Connect to Gmail
