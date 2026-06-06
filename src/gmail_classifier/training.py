@@ -1,3 +1,4 @@
+import time
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -8,6 +9,10 @@ from gmail_classifier.models import Message
 from gmail_classifier.preprocessing import build_text_representation, preprocess_email_body
 
 
+def _trace(msg: str):
+    print(f"  [trace] {time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
 def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[str]]:
     """Convert messages to text representations and extract labels.
 
@@ -15,6 +20,8 @@ def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[s
     ready for embedding, each label is the first label of the message,
     and each id is the message ID. Messages with no labels are skipped.
     """
+    _trace(f"prepare_texts: enter ({len(messages)} messages)")
+    t0 = time.monotonic()
     texts = []
     labels = []
     ids = []
@@ -32,6 +39,7 @@ def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[s
         texts.append(text)
         labels.append(msg.labels[0])
         ids.append(msg.id)
+    _trace(f"prepare_texts: exit ({len(texts)} texts, {time.monotonic() - t0:.2f}s)")
     return texts, labels, ids
 
 
@@ -48,26 +56,49 @@ def build_training_data(
     If cache is provided, cached embeddings are used for known IDs and
     newly computed embeddings are stored back into the cache.
     """
+    _trace(f"build_training_data: enter ({len(messages)} messages, cache={'yes' if cache else 'no'})")
+    t0 = time.monotonic()
+
     if embedder is None:
+        _trace("build_training_data: creating Embedder...")
+        t_emb = time.monotonic()
         embedder = Embedder()
+        _trace(f"build_training_data: Embedder created ({time.monotonic() - t_emb:.2f}s)")
+
     texts, labels, ids = prepare_texts(messages)
 
     if cache is None:
+        _trace(f"build_training_data: embed_batch ({len(texts)} texts, no cache)...")
+        t_emb = time.monotonic()
         embeddings = embedder.embed_batch(texts)
+        _trace(f"build_training_data: embed_batch done ({time.monotonic() - t_emb:.2f}s)")
+        _trace(f"build_training_data: exit ({time.monotonic() - t0:.2f}s total)")
         return embeddings, labels, ids
 
     # Look up cached embeddings
+    _trace(f"build_training_data: cache.get_batch ({len(ids)} ids)...")
+    t_cache = time.monotonic()
     cached = cache.get_batch(ids)
+    _trace(f"build_training_data: cache hits={len(cached)}, misses={len(ids) - len(cached)} ({time.monotonic() - t_cache:.2f}s)")
+
     miss_indices = [i for i, mid in enumerate(ids) if mid not in cached]
 
     if miss_indices:
         miss_texts = [texts[i] for i in miss_indices]
+        _trace(f"build_training_data: embed_batch ({len(miss_texts)} uncached texts)...")
+        t_emb = time.monotonic()
         miss_embeddings = embedder.embed_batch(miss_texts)
+        _trace(f"build_training_data: embed_batch done ({time.monotonic() - t_emb:.2f}s)")
         # Store new embeddings in cache
         miss_ids = [ids[i] for i in miss_indices]
+        _trace(f"build_training_data: cache.put_batch ({len(miss_ids)} vectors)...")
+        t_put = time.monotonic()
         cache.put_batch(miss_ids, miss_embeddings)
+        _trace(f"build_training_data: cache.put_batch done ({time.monotonic() - t_put:.2f}s)")
 
     # Assemble full embeddings array in order
+    _trace(f"build_training_data: assembling {len(ids)} vectors...")
+    t_asm = time.monotonic()
     dim = next(iter(cached.values())).shape[0] if cached else miss_embeddings.shape[1]
     embeddings = np.empty((len(ids), dim), dtype=np.float32)
     miss_pos = {idx: pos for pos, idx in enumerate(miss_indices)}
@@ -76,5 +107,7 @@ def build_training_data(
             embeddings[i] = cached[mid]
         else:
             embeddings[i] = miss_embeddings[miss_pos[i]]
+    _trace(f"build_training_data: assembly done ({time.monotonic() - t_asm:.2f}s)")
 
+    _trace(f"build_training_data: exit ({time.monotonic() - t0:.2f}s total)")
     return embeddings, labels, ids
