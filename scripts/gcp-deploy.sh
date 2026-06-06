@@ -185,16 +185,6 @@ UNIT"
 
 vm_run "sudo systemctl daemon-reload && sudo systemctl enable gmail-classifier"
 
-# --- Start or restart ---
-
-if [[ "$FIRST_DEPLOY" == "true" ]]; then
-    echo ""
-    echo "First deploy complete."
-    echo "Start the service with: make gcp-start"
-else
-    echo "Restarting service..."
-    vm_run "sudo systemctl restart gmail-classifier"
-    echo ""
-    echo "Deploy complete. Service restarted."
-    echo "Check status with: make gcp-status"
-fi
+echo ""
+echo "Deploy complete."
+echo "Start/restart the service with: make gcp-start"
