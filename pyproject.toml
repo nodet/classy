@@ -14,7 +14,7 @@ dependencies = [
     "google-api-python-client",
     "google-auth-oauthlib",
     "google-cloud-pubsub",
-    "sentence-transformers",
+    "fastembed",
 ]
 
 [project.optional-dependencies]

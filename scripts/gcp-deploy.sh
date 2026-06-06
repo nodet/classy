@@ -144,8 +144,8 @@ vm_run "sudo -u $SERVICE_USER -H bash -c 'cd $INSTALL_DIR && \$HOME/.local/bin/u
 # --- Pre-warm model (first deploy only) ---
 
 if [[ "$FIRST_DEPLOY" == "true" ]]; then
-    echo "Pre-warming sentence-transformers model (this may take a minute)..."
-    vm_run "sudo -u $SERVICE_USER -H bash -c 'cd $INSTALL_DIR && \$HOME/.local/bin/uv run python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer(\\\"all-MiniLM-L6-v2\\\")\"'"
+    echo "Pre-warming FastEmbed model (this may take a minute)..."
+    vm_run "sudo -u $SERVICE_USER -H bash -c 'cd $INSTALL_DIR && \$HOME/.local/bin/uv run python -c \"from fastembed import TextEmbedding; TextEmbedding(\\\"sentence-transformers/all-MiniLM-L6-v2\\\")\"'"
 fi
 
 # --- Install systemd unit ---
