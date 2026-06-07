@@ -171,7 +171,11 @@ case "${1:-}" in
     ;;
 
   status)
-    launchctl print "$TARGET"
+    if is_loaded; then
+      launchctl print "$TARGET"
+    else
+      echo "Service is stopped."
+    fi
     ;;
 
   logs)
