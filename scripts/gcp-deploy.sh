@@ -77,6 +77,7 @@ fi
 echo "Syncing code..."
 TARBALL="/tmp/gmail-classifier-code.tar.gz"
 tar czf "$TARBALL" \
+    --no-mac-metadata \
     --exclude='.git' \
     --exclude='__pycache__' \
     --exclude='.venv' \
