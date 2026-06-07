@@ -117,3 +117,9 @@ make gcp-destroy   # 7. Destroy VM (when no longer needed)
 After code changes, just run `make gcp-deploy` -- it syncs code, skips unchanged data files, and restarts the service automatically.
 
 After retraining (`make fetch-training` on Mac), `make gcp-deploy` detects the size change and uploads the new database.
+
+### Debugging
+
+[Google Cloud console](https://console.cloud.google.com/compute/instancesDetail/zones/us-central1-a/instances/gmail-classifier?project=classy-498012)
+Access to the log: ``sudo journalctl -u gmail-classifier -f``
+
