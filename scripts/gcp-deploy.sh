@@ -65,6 +65,13 @@ if ! vm_run "id $SERVICE_USER" &>/dev/null; then
     echo "VM setup complete."
 fi
 
+# --- Stop service if running ---
+
+if [[ "$FIRST_DEPLOY" == "false" ]]; then
+    echo "Stopping service..."
+    vm_run "sudo systemctl stop gmail-classifier 2>/dev/null || true"
+fi
+
 # --- Sync code ---
 
 echo "Syncing code..."
