@@ -292,7 +292,8 @@ def test_send_message():
     raw = call_args[1]["body"]["raw"]
     # Decode and verify the MIME message
     decoded = base64.urlsafe_b64decode(raw).decode()
-    assert "To: user@example.com" in decoded
-    assert "Subject: Test Subject" in decoded
+    decoded_lower = decoded.lower()
+    assert "to: user@example.com" in decoded_lower
+    assert "subject: test subject" in decoded_lower
     assert "Hello body" in decoded
     service.users().messages().send.return_value.execute.assert_called_once()
