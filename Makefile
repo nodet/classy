@@ -1,6 +1,6 @@
 .PHONY: help setup test quick clean fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub embed \
        service-install service-uninstall service-start service-stop service-status service-logs \
-       gcp-create gcp-deploy gcp-destroy gcp-start gcp-stop gcp-restart gcp-status gcp-logs gcp-ssh
+       gcp-create gcp-slim gcp-deploy gcp-destroy gcp-start gcp-stop gcp-restart gcp-status gcp-logs gcp-ssh
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -80,6 +80,9 @@ GCP_ZONE     := us-central1-a
 
 gcp-create: ## Create GCP e2-micro VM
 	@scripts/gcp-create.sh
+
+gcp-slim: ## Disable non-essential GCP agents to free RAM/CPU
+	@scripts/gcp-slim.sh
 
 gcp-deploy: ## Deploy code, data, and credentials to GCP VM
 	@scripts/gcp-deploy.sh
