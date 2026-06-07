@@ -156,6 +156,8 @@ vm_run "sudo tee /etc/systemd/system/gmail-classifier.service > /dev/null << 'UN
 Description=Gmail Semantic Auto-Labeling Classifier
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -167,8 +169,6 @@ Environment=HOME=/opt/gmail-classifier
 ExecStart=/opt/gmail-classifier/.local/bin/uv run --locked -- python -u scripts/classify_and_label.py --mode pubsub --exclude-labels XLC XLE XLCap
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
 KillSignal=SIGTERM
 TimeoutStopSec=30
 NoNewPrivileges=yes
