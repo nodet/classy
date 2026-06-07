@@ -125,11 +125,39 @@ sync_file() {
     fi
 }
 
+sync_if_newer() {
+    local local_path="$1"
+    local remote_path="$2"
+    local filename
+    filename=$(basename "$local_path")
+
+    local local_mtime
+    if [[ "$(uname)" == "Darwin" ]]; then
+        local_mtime=$(stat -f%m "$local_path")
+    else
+        local_mtime=$(stat -c%Y "$local_path")
+    fi
+
+    local remote_mtime
+    remote_mtime=$(vm_run "stat -c%Y $remote_path 2>/dev/null || echo 0")
+
+    if [[ "$local_mtime" -gt "$remote_mtime" ]]; then
+        echo "  $filename: local is newer, uploading..."
+        vm_scp "$local_path" "/tmp/$filename"
+        vm_run "sudo mv /tmp/$filename $remote_path && sudo chown $SERVICE_USER:$SERVICE_USER $remote_path"
+    else
+        echo "  $filename: VM copy is newer or same, skipping."
+    fi
+}
+
 sync_file "data/training.db" "$INSTALL_DIR/data/training.db"
-sync_file "data/inbox_sample.db" "$INSTALL_DIR/data/inbox_sample.db"
 if [[ -s "data/embeddings.db" ]]; then
     sync_file "data/embeddings.db" "$INSTALL_DIR/data/embeddings.db"
 fi
+
+# inbox_sample.db is mutated at runtime (skip pool grows as messages are seen).
+# Only upload if local copy is newer than the VM's.
+sync_if_newer "data/inbox_sample.db" "$INSTALL_DIR/data/inbox_sample.db"
 
 # --- Sync credentials ---
 
