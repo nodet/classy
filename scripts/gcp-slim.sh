@@ -34,6 +34,11 @@ vm_run "sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null 
     sudo systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true"
 echo "  Disabled: apt-daily timers"
 
+# Exim4 mail server (unused — classifier uses Gmail API)
+vm_run "sudo systemctl stop exim4 2>/dev/null || true && \
+    sudo systemctl disable exim4 2>/dev/null || true"
+echo "  Disabled: exim4"
+
 echo ""
 echo "Done. Freed ~30-40MB RAM and ~3% CPU."
 echo "Kept: google-guest-agent (SSH), systemd basics."
