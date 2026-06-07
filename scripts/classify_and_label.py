@@ -138,6 +138,11 @@ def main():
     )
     cache.close()
     del all_train_messages, train_messages, skip_messages
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass  # not on Linux (macOS has no malloc_trim)
     print(f"  {train_embeddings.shape[0]} embeddings, {train_embeddings.shape[1]} dimensions")
 
     # Connect to Gmail
