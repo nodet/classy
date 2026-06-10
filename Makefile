@@ -1,4 +1,4 @@
-.PHONY: help setup test quick clean fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub embed \
+.PHONY: help setup test quick clean reauth fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub embed \
        service-install service-uninstall service-start service-stop service-status service-logs \
        gcp-create gcp-slim gcp-deploy gcp-destroy gcp-start gcp-stop gcp-restart gcp-status gcp-logs gcp-ssh
 
@@ -23,6 +23,10 @@ test: ## Run all tests
 
 quick: ## Run fast tests only (skip ML model loading)
 	uv run pytest -m "not slow"
+
+reauth: ## Re-authenticate with Gmail (opens browser for OAuth consent)
+	rm -f credentials/token.json
+	uv run python -c "from gmail_classifier.auth import get_credentials; get_credentials()"
 
 fetch-training: ## Fetch labeled messages from Gmail (see docs/gmail-setup.md)
 	uv run python scripts/fetch_training_data.py
