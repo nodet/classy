@@ -51,6 +51,82 @@ Semantic auto-labeling for Gmail using KNN on email embeddings.
 For detailed launchd configuration, see [mac_uv_launchd_service_plan.md](mac_uv_launchd_service_plan.md).
 For GCP/Gmail API setup, see [docs/gmail-setup.md](docs/gmail-setup.md).
 
+## How it works
+
+The classifier never reads rules you write. It learns purely by example from
+the emails you have already labeled, by comparing a new email to past ones and
+copying the label of its closest matches. Three ideas make that work.
+
+### 1. Embeddings — turning an email into a vector
+
+An **embedding** is a fixed-length list of numbers (a vector) that captures the
+*meaning* of a piece of text, produced by a machine-learning model. The key
+property: texts that mean similar things get vectors that point in similar
+directions, even when they share no words. "Your flight is confirmed" and "Booking
+reference for your trip" land near each other; a tech newsletter lands far away.
+
+This project uses **`all-MiniLM-L6-v2`**, a small sentence-embedding model from the
+[sentence-transformers](https://www.sbert.net/) family, run locally via
+[FastEmbed](https://github.com/qdrant/fastembed) (so no text is sent to any
+external API). It maps each email to a **384-dimensional, unit-length vector**.
+It is small (~90 MB), fast on CPU, and good enough for short texts like emails —
+which is why it runs comfortably on a free-tier VM.
+
+Before embedding, each email is reduced to one text string
+(`preprocessing.py`): the sender, the subject, and a cleaned body (HTML
+stripped, quoted replies / forwarded blocks / signatures removed, truncated to
+~400 words), plus the mailing-list id if present. That string — not the raw
+HTML — is what gets embedded.
+
+### 2. KNN — classifying by nearest neighbors
+
+Classification uses **k-nearest-neighbors (KNN)**, which has no separate
+"training" step in the usual sense: the model *is* the set of past examples.
+To classify a new email:
+
+1. Embed it into a vector.
+2. Find the **k = 5** most similar labeled emails, where similarity is
+   **cosine similarity** (the angle between two vectors — 1.0 means identical
+   direction, 0.0 means unrelated). Unit-length vectors make this just a dot
+   product.
+3. Each of those 5 neighbors votes for its own label, weighted by how similar
+   it is. Summing the weights per label gives a score per label.
+4. **Confidence** = winning label's score ÷ total score (0–1). High confidence
+   means the neighbors agree strongly.
+
+A label is only eligible to win if it has at least **5 training examples**, so a
+single oddball email can't create a category.
+
+### 3. Confidence thresholds and the skip pool
+
+The confidence decides what actually happens (`classifier.py`):
+
+| Confidence | Action |
+|---|---|
+| ≥ 0.80 | apply the label and archive the email |
+| < 0.80 | do nothing (leave it unlabeled in the inbox) |
+
+There is a finer internal distinction at **0.95**: predictions in the
+0.80–0.95 band are tagged `LABEL_WITH_REVIEW` rather than `LABEL`. The live
+service treats both the same — it applies and archives either way — so in normal
+operation there is nothing to review. The split only surfaces in `make dry-run`,
+which groups its output into "sure" (≥0.95), "review" (0.80–0.95), and "low"
+(<0.80) so you can eyeball where the borderline calls fall before trusting them.
+
+To stop the classifier from labeling mail that *should* just stay in the inbox,
+a sample of inbox messages is loaded as negative examples under a special
+`__skip__` label. These vote like any other neighbor; if `__skip__` wins, or
+even just dilutes the confidence below threshold, the email is left alone. This
+is why the README talks about a "skip pool" alongside the training data.
+
+### Learning continuously
+
+Because the model is just the example set, it adapts the moment you correct it.
+When you move a message to a label (or out of one), the service re-embeds it and
+updates its in-memory index immediately — the next similar email benefits right
+away, with no retraining step. Gmail labels are the single source of truth; the
+local databases are just a cache of those examples and their vectors.
+
 ## Configuration
 
 Tunable settings live in `config.toml` at the repo root — edit it directly, no
