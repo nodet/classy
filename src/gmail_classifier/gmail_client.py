@@ -1,6 +1,6 @@
 import base64
 from email.mime.text import MIMEText
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from gmail_classifier.models import HistoryEvent, HistoryExpiredError
 
@@ -75,16 +75,23 @@ class GmailClient:
         ).execute()
         return result.get("labelIds", [])
 
-    def get_history(self, start_history_id: str) -> List[HistoryEvent]:
+    def get_history(self, start_history_id: str) -> Tuple[List[HistoryEvent], Optional[str]]:
         """Get mailbox changes since the given history ID.
 
-        Returns a list of HistoryEvents for messagesAdded, labelsAdded,
-        and labelsRemoved. Raises HistoryExpiredError if the history ID
-        is too old.
+        Returns ``(events, latest_history_id)`` where ``events`` is the list
+        of HistoryEvents for messagesAdded, labelsAdded, and labelsRemoved,
+        and ``latest_history_id`` is the response's own top-level
+        ``historyId`` -- the value Google intends as the next
+        ``startHistoryId``. Advancing the caller's pointer to this (rather
+        than to a Pub/Sub notification's id, which is on a different clock)
+        prevents re-fetching and reprocessing records we already handled.
+
+        Raises HistoryExpiredError if the history ID is too old.
         """
         from googleapiclient.errors import HttpError
 
         events = []
+        latest_history_id = None
         page_token = None
         while True:
             kwargs = {"userId": "me", "startHistoryId": start_history_id}
@@ -120,10 +127,13 @@ class GmailClient:
                         label_ids=removed.get("labelIds", []),
                     ))
 
+            # The last page's historyId is the high-water mark to resume from.
+            latest_history_id = response.get("historyId", latest_history_id)
+
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
-        return events
+        return events, latest_history_id
 
     def watch(self, topic_name: str) -> Tuple[str, int]:
         """Register for push notifications via Gmail Watch API.

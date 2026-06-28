@@ -65,7 +65,7 @@ class LoopDeps:
     """
     make_subscriber: Callable[[], object]       # fresh subscriber (new channel)
     watch: Callable[[], tuple]                   # -> (history_id, expiration_ms)
-    get_history: Callable[[str], list]           # may raise HistoryExpiredError
+    get_history: Callable[[str], tuple]          # -> (events, latest_history_id); may raise HistoryExpiredError
     check_inbox: Callable[[], None]              # full inbox poll (fallback)
     process_events: Callable[[list], None]       # handle events (and heartbeat)
     log: Callable[..., None]                     # status line emitter
@@ -123,11 +123,11 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         if not notifications:
             return LoopState(history_id, expiration, backoff, subscriber)
 
-        # Use the most recent historyId from notifications.
+        # Fallback pointer if the history response carries no id of its own.
         max_history = max(n.history_id for n in notifications)
 
         try:
-            events = deps.get_history(history_id)
+            events, latest_history_id = deps.get_history(history_id)
         except HistoryExpiredError:
             deps.log("History expired, falling back to inbox poll")
             deps.check_inbox()
@@ -139,8 +139,13 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         # per-message output, and the idle heartbeat (and owns dots_printed).
         deps.process_events(events)
 
-        # Advance history pointer.
-        history_id = max_history
+        # Advance the pointer to the history response's own historyId -- the
+        # value Google intends as the next startHistoryId. Advancing to a
+        # notification's id instead can land before a record we just
+        # processed, causing get_history to replay it (duplicate "Moved"
+        # reports + double index.add). Fall back to the notification id only
+        # if the response carried none.
+        history_id = latest_history_id or max_history
         return LoopState(history_id, expiration, backoff, subscriber)
 
     except Exception as e:

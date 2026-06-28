@@ -56,11 +56,14 @@ class FakeClient:
     """Records watch()/get_history() calls; returns scripted values."""
 
     def __init__(self, watch_id="999", watch_expiration=10**18,
-                 history_result=None, history_exc=None):
+                 history_result=None, history_exc=None, history_latest=None):
         self.watch_id = watch_id
         self.watch_expiration = watch_expiration
         self.history_result = history_result if history_result is not None else []
         self.history_exc = history_exc
+        # The response's own historyId. None -> loop falls back to the
+        # notification id (mirrors a real response that omitted it).
+        self.history_latest = history_latest
         self.watch_calls = 0
         self.get_history_calls = []
 
@@ -72,7 +75,7 @@ class FakeClient:
         self.get_history_calls.append(history_id)
         if self.history_exc is not None:
             raise self.history_exc
-        return self.history_result
+        return self.history_result, self.history_latest
 
 
 def make_deps(client, subscriber_factory, **overrides):
@@ -346,4 +349,22 @@ def test_events_forwarded_to_process_events():
     state = run_iteration(state, deps)
 
     assert processed == [events]
+    # No response historyId -> fall back to the notification id.
     assert state.history_id == "200"
+
+
+def test_pointer_advances_to_response_history_id():
+    """When get_history returns its own historyId, the pointer advances to
+    that -- not the notification id -- so already-processed records aren't
+    re-fetched and reprocessed (the duplicate "Moved" bug)."""
+    client = FakeClient(history_result=[object()], history_latest="555")
+    # Notification id is LOWER than the response's high-water mark; advancing
+    # to it would replay records between 200 and 555 on the next pull.
+    sub = FakeSubscriber(actions=[[Notification("200")]])
+    deps, _ = make_deps(client, lambda: sub)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    state = run_iteration(state, deps)
+
+    assert state.history_id == "555"

@@ -155,11 +155,12 @@ def test_get_history_returns_messages_added():
         "historyId": "101",
     }
     client = GmailClient(service)
-    events = client.get_history("99")
+    events, latest = client.get_history("99")
     assert len(events) == 1
     assert events[0].type == "messagesAdded"
     assert events[0].message_id == "msg1"
     assert events[0].label_ids == ["INBOX", "UNREAD"]
+    assert latest == "101"
 
 
 def test_get_history_returns_labels_added():
@@ -177,11 +178,12 @@ def test_get_history_returns_labels_added():
         "historyId": "101",
     }
     client = GmailClient(service)
-    events = client.get_history("99")
+    events, latest = client.get_history("99")
     assert len(events) == 1
     assert events[0].type == "labelsAdded"
     assert events[0].message_id == "msg2"
     assert events[0].label_ids == ["Label_1"]
+    assert latest == "101"
 
 
 def test_get_history_returns_labels_removed():
@@ -199,11 +201,12 @@ def test_get_history_returns_labels_removed():
         "historyId": "101",
     }
     client = GmailClient(service)
-    events = client.get_history("99")
+    events, latest = client.get_history("99")
     assert len(events) == 1
     assert events[0].type == "labelsRemoved"
     assert events[0].message_id == "msg3"
     assert events[0].label_ids == ["Label_2"]
+    assert latest == "101"
 
 
 def test_get_history_paginates():
@@ -228,10 +231,11 @@ def test_get_history_paginates():
         },
     ]
     client = GmailClient(service)
-    events = client.get_history("99")
+    events, latest = client.get_history("99")
     assert len(events) == 2
     assert events[0].message_id == "msg1"
     assert events[1].message_id == "msg2"
+    assert latest == "102"  # high-water mark = last page's historyId
 
 
 def test_get_history_raises_on_expired_id():
@@ -254,8 +258,9 @@ def test_get_history_empty():
         "historyId": "100",
     }
     client = GmailClient(service)
-    events = client.get_history("99")
+    events, latest = client.get_history("99")
     assert events == []
+    assert latest == "100"
 
 
 # --- watch tests ---
