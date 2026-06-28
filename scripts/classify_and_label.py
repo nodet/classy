@@ -378,6 +378,11 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids,
 
 
 def _sigterm_handler(signum, frame):
+    # One-shot: restore default disposition so a second SIGTERM arriving during
+    # interpreter teardown (threading._shutdown joining slow grpc threads)
+    # terminates the process normally instead of raising SystemExit into
+    # shutdown code, which prints an "Exception ignored" traceback.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     raise SystemExit(0)
 
 
