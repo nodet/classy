@@ -18,16 +18,13 @@ from pathlib import Path
 import numpy as np
 
 from gmail_classifier.auth import get_credentials, get_gmail_service
-from gmail_classifier.classifier import classify, Action, SKIP_LABEL
+from gmail_classifier.classifier import Action, SKIP_LABEL
 from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
-from gmail_classifier.gmail_parser import parse_gmail_message
 from gmail_classifier.history_processor import process_history_events
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
-from gmail_classifier.models import HistoryExpiredError
-from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
 from gmail_classifier.storage import MessageStore
 from gmail_classifier.training import build_training_data
 from gmail_classifier.training_index import TrainingIndex
@@ -311,63 +308,43 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
 def _check_inbox(args, client, embedder, index, registry, skip_ids,
                  self_labeled=None):
     """Check inbox and classify new messages (poll mode)."""
-    inbox_ids = client.list_message_ids(label_id="INBOX", max_results=args.max_messages)
-    new_ids = [mid for mid in inbox_ids if mid not in skip_ids]
+    from gmail_classifier.inbox_check import process_inbox
 
-    if not new_ids:
+    # Peek at whether there's anything new before opening the store, so the
+    # idle case stays a cheap "." heartbeat with no DB handle.
+    inbox_ids = client.list_message_ids(label_id="INBOX", max_results=args.max_messages)
+    if not any(mid not in skip_ids for mid in inbox_ids):
         print(".", end="", flush=True)
         return
 
     print()  # newline after any dots
     skip_store = MessageStore(args.skip_db)
-
-    for mid in new_ids:
-        raw = client.get_message(mid)
-
-        # Check if it already has a user label
-        msg_label_ids = raw.get("labelIds", [])
-        if any(lid in registry.user_label_ids for lid in msg_label_ids):
-            continue
-
-        # Parse and classify
-        msg = parse_gmail_message(raw)
-        body = preprocess_email_body(msg.body_html)
-        text = build_text_representation(
-            from_name=msg.from_name,
-            from_address=msg.from_address,
-            subject=msg.subject,
-            body=body,
-            list_id=msg.list_id,
+    try:
+        results = process_inbox(
+            client=client,
+            embedder=embedder,
+            index=index,
+            registry=registry,
+            skip_ids=skip_ids,
+            skip_store=skip_store,
+            k=args.k,
+            max_messages=args.max_messages,
+            dry_run=args.dry_run,
+            self_labeled=self_labeled,
+            inbox_ids=inbox_ids,
         )
-        query_embedding = embedder.embed(text)
-        result = classify(query_embedding, index.embeddings, index.labels, k=args.k)
+    finally:
+        skip_store.close()
 
-        sender = msg.from_name or msg.from_address
-
-        if result.action == Action.LABEL or result.action == Action.LABEL_WITH_REVIEW:
-            label_id = registry.get_id(result.label)
-            if not label_id:
-                print(f"{now()} WARNING: label '{result.label}' not found in Gmail, skipping")
-                continue
-
-            w = registry.max_label_width
-            print(truncate(f"{now()} {result.label:{w}s}  {result.confidence:6.1%}  {sender} — {msg.subject}"))
-
-            if not args.dry_run:
-                client.apply_label(mid, label_id, archive=True)
-                if self_labeled is not None:
-                    self_labeled.add(mid)
+    w = registry.max_label_width
+    for r in results:
+        sender = r["sender"]
+        if r.get("warning"):
+            print(f"{now()} WARNING: label '{r['label']}' not found in Gmail, skipping")
+        elif r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
+            print(truncate(f"{now()} {r['label']:{w}s}  {r['confidence']:6.1%}  {sender} — {r['subject']}"))
         else:
-            w = registry.max_label_width
-            print(truncate(f"{now()} {'':{w}s}  {result.confidence:6.1%}  {sender} — {msg.subject}"))
-            if not args.dry_run:
-                msg.labels = []
-                skip_store.save_message(msg)
-
-        # Remember this message so we don't re-process it
-        skip_ids.add(mid)
-
-    skip_store.close()
+            print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {r['subject']}"))
 
 
 def _sigterm_handler(signum, frame):

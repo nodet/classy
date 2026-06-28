@@ -3,12 +3,22 @@
 Status: proposed (2026-06-28). Motivated by a near-regression in the pub/sub
 reconnect fix (commit `0c4ec97`) that no test would have caught.
 
-**Progress:** Tier 1 DONE (2026-06-28) — extracted
-`src/gmail_classifier/pubsub_loop.py` (`run_iteration`, `next_backoff`,
-`is_network_error`, `LoopState`, `LoopDeps`); `_run_pubsub_mode` is now a thin
-wrapper; 14 tests in `tests/test_pubsub_loop.py` (all 8 planned cases). The
-backlog guard was confirmed by bug-injection (advancing history_id on recovery
-makes it fail). Full suite: 180 passing. Tiers 2-3 still pending.
+**Progress:**
+
+- Tier 1 DONE (2026-06-28, commit `ad1b199`) — extracted
+  `src/gmail_classifier/pubsub_loop.py` (`run_iteration`, `next_backoff`,
+  `is_network_error`, `LoopState`, `LoopDeps`); `_run_pubsub_mode` is now a
+  thin wrapper; 14 tests in `tests/test_pubsub_loop.py` (all 8 planned cases).
+  The backlog guard was confirmed by bug-injection (advancing history_id on
+  recovery makes it fail).
+- Tier 2 DONE (2026-06-28) — extracted `process_inbox` into
+  `src/gmail_classifier/inbox_check.py`; `_check_inbox` is now a thin wrapper
+  (owns MessageStore lifecycle + printing). 7 tests in
+  `tests/test_inbox_check.py` (label/apply, already-labeled skip, NO_LABEL
+  skip-store save, dry-run, missing-label warning, skip_ids filtering,
+  supplied-inbox_ids). Removed now-dead imports from the script. Full suite:
+  187 passing.
+- Tier 3 still pending.
 
 ## Background / problem
 
