@@ -260,6 +260,7 @@ def _process_events(events, args, client, embedder, index, registry,
     # Hand back the heap a heavy message (big HTML parse + embed) just grew,
     # so RSS falls back to idle instead of ratcheting to the worst-case peak.
     trim_memory()
+    log_mem("after events batch")
 
 
 def _run_pubsub_mode(args, client, credentials, embedder, index,
@@ -373,6 +374,7 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids,
     # Heavy parse+embed work just ran; return the heap to the OS (see
     # _process_events).
     trim_memory()
+    log_mem("after inbox batch")
 
 
 def _sigterm_handler(signum, frame):
