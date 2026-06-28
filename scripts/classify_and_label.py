@@ -179,10 +179,84 @@ def _run_poll_mode(args, client, embedder, index,
         time.sleep(args.interval)
 
 
+def _process_events(events, args, client, embedder, index, registry,
+                    skip_ids, self_labeled, dots):
+    """Handle a batch of history events: label changes, classification, output.
+
+    ``dots`` is a single-element list used as a mutable flag tracking whether
+    an idle "." heartbeat was the last thing printed (so we can emit a newline
+    before real output).
+    """
+    if not events:
+        print(".", end="", flush=True)
+        dots[0] = True
+        return
+
+    # Process label changes (update training/skip DBs + in-memory index)
+    training_store = MessageStore(args.training_db)
+    skip_store = MessageStore(args.skip_db)
+
+    movements = process_label_changes(
+        events=events,
+        client=client,
+        training_store=training_store,
+        skip_store=skip_store,
+        label_id_to_name=registry.id_to_name,
+        user_label_ids=registry.user_label_ids,
+        excluded_labels=set(),
+        index=index,
+        embedder=embedder,
+        registry=registry,
+        ignore_ids=self_labeled,
+    )
+
+    # Process new inbox messages
+    results = process_history_events(
+        events=events,
+        client=client,
+        embedder=embedder,
+        train_embeddings=index.embeddings,
+        train_labels=index.labels,
+        label_name_to_id=registry.name_to_id,
+        user_label_ids=registry.user_label_ids,
+        excluded_labels=registry._excluded,
+        skip_ids=skip_ids,
+        k=args.k,
+        dry_run=args.dry_run,
+        registry=registry,
+    )
+
+    # Print results (only if there's something to report)
+    if movements or results:
+        if dots[0]:
+            print()  # newline after dots
+            dots[0] = False
+    for src, dst, count in movements:
+        print(f"{now()} {count} {'email' if count == 1 else 'emails'} moved from {src} to {dst}")
+    for r in results:
+        sender = r["sender"]
+        subject = r["subject"]
+        w = registry.max_label_width
+        if r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
+            print(truncate(f"{now()} {r['label']:{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
+            if r.get("applied"):
+                self_labeled.add(r["message_id"])
+        else:
+            print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
+            if not args.dry_run:
+                msg = r["message"]
+                msg.labels = []
+                skip_store.save_message(msg)
+
+    training_store.close()
+    skip_store.close()
+
+
 def _run_pubsub_mode(args, client, credentials, embedder, index,
                      registry, skip_ids):
     """Wait for Pub/Sub notifications and process via history API."""
     from gmail_classifier.pubsub import PubSubSubscriber
+    from gmail_classifier.pubsub_loop import LoopState, LoopDeps, run_iteration
 
     # Register for notifications
     print("Registering Gmail watch...")
@@ -199,156 +273,39 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     if args.once:
         return
 
-    subscriber = PubSubSubscriber(
-        subscription_path=PUBSUB_SUBSCRIPTION, credentials=credentials
-    )
-    print(f"\nReady (pubsub mode). Waiting for notifications...\n")
-
-    backoff = 0  # 0 means not in retry mode
-    dots_printed = False
-
     def _make_subscriber():
         return PubSubSubscriber(
             subscription_path=PUBSUB_SUBSCRIPTION, credentials=credentials
         )
 
+    print(f"\nReady (pubsub mode). Waiting for notifications...\n")
+
+    dots = [False]  # mutable heartbeat flag shared with _process_events
+
+    def _log(message, lead_newline=False):
+        prefix = "\n" if lead_newline else ""
+        print(f"{prefix}{now()} {message}")
+
+    deps = LoopDeps(
+        make_subscriber=_make_subscriber,
+        watch=lambda: client.watch(PUBSUB_TOPIC),
+        get_history=client.get_history,
+        check_inbox=lambda: _check_inbox(
+            args, client, embedder, index, registry, skip_ids, self_labeled),
+        process_events=lambda events: _process_events(
+            events, args, client, embedder, index, registry,
+            skip_ids, self_labeled, dots),
+        log=_log,
+    )
+
+    state = LoopState(
+        history_id=history_id,
+        expiration=expiration,
+        backoff=0,
+        subscriber=_make_subscriber(),
+    )
     while True:
-        try:
-            # If in retry mode, wait before retrying
-            if backoff:
-                time.sleep(backoff)
-                # Recreate subscriber to get a fresh gRPC channel, closing
-                # the old one so retries don't leak sockets/threads.
-                old_subscriber = subscriber
-                subscriber = _make_subscriber()
-                try:
-                    old_subscriber.close()
-                except Exception:
-                    pass
-
-            # Renew watch if expiring within 1 hour (skip while disconnected)
-            if not backoff:
-                now_ms = int(time.time() * 1000)
-                if expiration - now_ms < 3600_000:
-                    history_id_new, expiration = client.watch(PUBSUB_TOPIC)
-                    print(f"{now()} Watch renewed")
-
-            # Pull notifications (shorter timeout when retrying)
-            pull_timeout = 10 if backoff else 60
-            notifications = subscriber.pull(timeout=pull_timeout)
-
-            # A successful pull — even one that returns no messages — proves
-            # the connection is healthy again. Exit backoff immediately rather
-            # than waiting for mail to arrive.
-            if backoff:
-                print(f"{now()} Connection restored")
-                backoff = 0
-                # Renew watch in case it expired while disconnected. Keep the
-                # old history_id so the backlog accumulated during the outage
-                # still gets processed by get_history below.
-                history_id_new, expiration = client.watch(PUBSUB_TOPIC)
-                print(f"{now()} Watch renewed")
-
-            if not notifications:
-                continue
-
-            # Use the most recent historyId from notifications
-            max_history = max(n.history_id for n in notifications)
-
-            try:
-                events = client.get_history(history_id)
-            except HistoryExpiredError:
-                print(f"{now()} History expired, falling back to inbox poll")
-                _check_inbox(args, client, embedder, index, registry, skip_ids, self_labeled)
-                # Re-watch to get fresh historyId
-                history_id, expiration = client.watch(PUBSUB_TOPIC)
-                continue
-
-            if events:
-                # Process label changes (update training/skip DBs + in-memory index)
-                training_store = MessageStore(args.training_db)
-                skip_store = MessageStore(args.skip_db)
-
-                movements = process_label_changes(
-                    events=events,
-                    client=client,
-                    training_store=training_store,
-                    skip_store=skip_store,
-                    label_id_to_name=registry.id_to_name,
-                    user_label_ids=registry.user_label_ids,
-                    excluded_labels=set(),
-                    index=index,
-                    embedder=embedder,
-                    registry=registry,
-                    ignore_ids=self_labeled,
-                )
-
-                # Process new inbox messages
-                results = process_history_events(
-                    events=events,
-                    client=client,
-                    embedder=embedder,
-                    train_embeddings=index.embeddings,
-                    train_labels=index.labels,
-                    label_name_to_id=registry.name_to_id,
-                    user_label_ids=registry.user_label_ids,
-                    excluded_labels=registry._excluded,
-                    skip_ids=skip_ids,
-                    k=args.k,
-                    dry_run=args.dry_run,
-                    registry=registry,
-                )
-
-                # Print results (only if there's something to report)
-                if movements or results:
-                    if dots_printed:
-                        print()  # newline after dots
-                        dots_printed = False
-                for src, dst, count in movements:
-                    print(f"{now()} {count} {'email' if count == 1 else 'emails'} moved from {src} to {dst}")
-                for r in results:
-                    sender = r["sender"]
-                    subject = r["subject"]
-                    w = registry.max_label_width
-                    if r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
-                        print(truncate(f"{now()} {r['label']:{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
-                        if r.get("applied"):
-                            self_labeled.add(r["message_id"])
-                    else:
-                        print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
-                        if not args.dry_run:
-                            msg = r["message"]
-                            msg.labels = []
-                            skip_store.save_message(msg)
-
-                training_store.close()
-                skip_store.close()
-            else:
-                print(".", end="", flush=True)
-                dots_printed = True
-
-            # Advance history pointer
-            history_id = max_history
-
-        except (OSError, ConnectionError) as e:
-            # Network errors: DNS failure, connection reset, etc.
-            if not backoff:
-                print(f"\n{now()} Connection lost: {e}")
-                backoff = 5
-            else:
-                backoff = min(backoff * 2, 60)
-            print(f"{now()} Retrying in {backoff}s...")
-        except Exception as e:
-            # Catch gRPC/API errors from Pub/Sub (ServiceUnavailable, etc.)
-            if "unavailable" in str(e).lower() or "503" in str(e):
-                if not backoff:
-                    print(f"\n{now()} Connection lost: {e}")
-                    backoff = 5
-                else:
-                    backoff = min(backoff * 2, 60)
-                print(f"{now()} Retrying in {backoff}s...")
-            else:
-                raise
+        state = run_iteration(state, deps)
 
 
 def _check_inbox(args, client, embedder, index, registry, skip_ids,
