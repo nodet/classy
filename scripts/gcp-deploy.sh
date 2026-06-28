@@ -78,6 +78,7 @@ echo "Syncing code..."
 TARBALL="/tmp/gmail-classifier-code.tar.gz"
 tar czf "$TARBALL" \
     --no-mac-metadata \
+    --no-xattrs \
     --exclude='.git' \
     --exclude='__pycache__' \
     --exclude='.venv' \
@@ -91,7 +92,7 @@ vm_scp "$TARBALL" "/tmp/gmail-classifier-code.tar.gz"
 rm -f "$TARBALL"
 
 vm_run "sudo mkdir -p $INSTALL_DIR && \
-    sudo tar xzf /tmp/gmail-classifier-code.tar.gz -C $INSTALL_DIR && \
+    sudo tar xzf /tmp/gmail-classifier-code.tar.gz --warning=no-unknown-keyword -C $INSTALL_DIR && \
     sudo mkdir -p $INSTALL_DIR/data $INSTALL_DIR/credentials $INSTALL_DIR/.cache && \
     sudo chown -R $SERVICE_USER:$SERVICE_USER $INSTALL_DIR && \
     rm -f /tmp/gmail-classifier-code.tar.gz"
