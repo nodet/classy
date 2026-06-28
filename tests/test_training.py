@@ -105,6 +105,28 @@ def test_build_training_data_uses_cache(tmp_path):
     assert labels == ["Tech", "Travel"]
 
 
+def test_build_training_data_skips_text_prep_for_cache_hits(tmp_path):
+    """Cache hits must not have their body parsed — that BeautifulSoup work
+    is the startup cost we defer to misses only."""
+    messages = [
+        _make_message("1", "Hello", "a@b.com", body_html="<p>hi</p>", label="Tech"),
+        _make_message("2", "World", "c@d.com", body_html="<p>yo</p>", label="Travel"),
+    ]
+
+    cache = EmbeddingCache(str(tmp_path / "embeddings.db"))
+    cache.put("1", np.random.randn(384).astype(np.float32))  # hit
+    # "2" is a miss
+
+    mock_embedder = MagicMock()
+    mock_embedder.embed_batch.return_value = np.random.randn(1, 384).astype(np.float32)
+
+    with patch("gmail_classifier.training._message_text", wraps=lambda m: "x") as mt:
+        build_training_data(messages, embedder=mock_embedder, cache=cache)
+
+    prepped_ids = {call.args[0].id for call in mt.call_args_list}
+    assert prepped_ids == {"2"}  # only the miss was text-prepped
+
+
 def test_build_training_data_cache_partial_miss(tmp_path):
     """build_training_data embeds only uncached messages and stores them."""
     messages = [

@@ -13,6 +13,18 @@ def _trace(msg: str):
     print(f"  [trace] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
+def _message_text(msg: Message) -> str:
+    """Full text representation of a message, ready for embedding."""
+    body = preprocess_email_body(msg.body_html)
+    return build_text_representation(
+        from_name=msg.from_name,
+        from_address=msg.from_address,
+        subject=msg.subject,
+        body=body,
+        list_id=msg.list_id,
+    )
+
+
 def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[str]]:
     """Convert messages to text representations and extract labels.
 
@@ -28,15 +40,7 @@ def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[s
     for msg in messages:
         if not msg.labels:
             continue
-        body = preprocess_email_body(msg.body_html)
-        text = build_text_representation(
-            from_name=msg.from_name,
-            from_address=msg.from_address,
-            subject=msg.subject,
-            body=body,
-            list_id=msg.list_id,
-        )
-        texts.append(text)
+        texts.append(_message_text(msg))
         labels.append(msg.labels[0])
         ids.append(msg.id)
     _trace(f"prepare_texts: exit ({len(texts)} texts, {time.monotonic() - t0:.2f}s)")
@@ -65,15 +69,20 @@ def build_training_data(
         embedder = Embedder()
         _trace(f"build_training_data: Embedder created ({time.monotonic() - t_emb:.2f}s)")
 
-    texts, labels, ids = prepare_texts(messages)
-
     if cache is None:
+        texts, labels, ids = prepare_texts(messages)
         _trace(f"build_training_data: embed_batch ({len(texts)} texts, no cache)...")
         t_emb = time.monotonic()
         embeddings = embedder.embed_batch(texts)
         _trace(f"build_training_data: embed_batch done ({time.monotonic() - t_emb:.2f}s)")
         _trace(f"build_training_data: exit ({time.monotonic() - t0:.2f}s total)")
         return embeddings, labels, ids
+
+    # Labels and ids are cheap; the expensive BeautifulSoup text prep is
+    # deferred until we know which messages actually missed the cache.
+    labeled = [m for m in messages if m.labels]
+    labels = [m.labels[0] for m in labeled]
+    ids = [m.id for m in labeled]
 
     # Look up cached embeddings
     _trace(f"build_training_data: cache.get_batch ({len(ids)} ids)...")
@@ -84,7 +93,10 @@ def build_training_data(
     miss_indices = [i for i, mid in enumerate(ids) if mid not in cached]
 
     if miss_indices:
-        miss_texts = [texts[i] for i in miss_indices]
+        _trace(f"build_training_data: prepare_texts for {len(miss_indices)} misses...")
+        t_prep = time.monotonic()
+        miss_texts = [_message_text(labeled[i]) for i in miss_indices]
+        _trace(f"build_training_data: prepare_texts done ({time.monotonic() - t_prep:.2f}s)")
         _trace(f"build_training_data: embed_batch ({len(miss_texts)} uncached texts)...")
         t_emb = time.monotonic()
         miss_embeddings = embedder.embed_batch(miss_texts)
