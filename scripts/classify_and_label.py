@@ -38,7 +38,12 @@ MAX_LINE = 130
 
 
 def now():
-    return datetime.now().strftime("%H:%M:%S")
+    """Timestamp prefix for log lines, with live RSS so we can watch
+    memory track per-message processing over time."""
+    from gmail_classifier.memory import rss_mb
+    rss = rss_mb()
+    mem = f"{rss:5.0f}MB" if rss is not None else "  n/a"
+    return f"{datetime.now().strftime('%H:%M:%S')} {mem}"
 
 
 def truncate(line):

@@ -46,6 +46,15 @@ def _current_rss_mb() -> float | None:
         return None
 
 
+def rss_mb() -> float | None:
+    """Current (not peak) RSS in MiB, or None if unavailable.
+
+    Thin public wrapper over the platform probe, for callers that want to
+    prefix log lines with live memory rather than print a full checkpoint.
+    """
+    return _current_rss_mb()
+
+
 def log_mem(stage: str) -> None:
     """Print an RSS checkpoint for ``stage`` in the [trace] format.
 
