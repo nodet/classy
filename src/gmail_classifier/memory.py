@@ -71,13 +71,24 @@ def trim_memory() -> None:
         pass
 
 
-def log_mem(stage: str) -> None:
-    """Print an RSS checkpoint for ``stage`` in the [trace] format.
+def log_prefix() -> str:
+    """The ``HH:MM:SS <rss>MB`` prefix shared by per-message log lines and
+    ``[mem]`` checkpoints, so memory lines align with mail activity in the log.
 
-    Shows current RSS where available (Linux) plus the process peak, so a
-    drop after del/malloc_trim is visible (current falls; peak does not).
+    The leading value is *current* RSS (right-aligned in 5 cols, like the
+    per-message lines), or ``  n/a`` where unavailable.
     """
-    current = _current_rss_mb()
-    cur = f"{current:.1f} MB" if current is not None else "n/a"
-    print(f"  [mem] {time.strftime('%H:%M:%S')} {stage}: {cur} RSS "
-          f"({_max_rss_mb():.1f} MB peak)", flush=True)
+    rss = _current_rss_mb()
+    mem = f"{rss:5.0f}MB" if rss is not None else "  n/a"
+    return f"{time.strftime('%H:%M:%S')} {mem}"
+
+
+def log_mem(stage: str) -> None:
+    """Print an RSS checkpoint for ``stage``, formatted like the per-message
+    log lines for a uniform log.
+
+    The leading number is current RSS; the peak follows so a drop after
+    del/malloc_trim stays visible (current falls; peak does not).
+    """
+    print(f"{log_prefix()} [mem] {stage} ({_max_rss_mb():.0f}MB peak)",
+          flush=True)
