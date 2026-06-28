@@ -254,10 +254,16 @@ def _process_events(events, args, client, embedder, index, registry,
     training_store.close()
     skip_store.close()
 
-    # Hand back the heap a heavy message (big HTML parse + embed) just grew,
-    # so RSS falls back to idle instead of ratcheting to the worst-case peak.
-    trim_memory()
-    log_mem("after events batch")
+    # Only reclaim + report when the batch did real work. Echoed events (e.g.
+    # Gmail re-notifying us about a label we just applied) reach here with
+    # nothing to show; logging then would print a bare [mem] line with no
+    # preceding result -- a confusing duplicate.
+    if movements or results:
+        # Hand back the heap a heavy message (big HTML parse + embed) just
+        # grew, so RSS falls back to idle instead of ratcheting to the
+        # worst-case peak.
+        trim_memory()
+        log_mem("after events batch")
 
 
 def _run_pubsub_mode(args, client, credentials, embedder, index,
