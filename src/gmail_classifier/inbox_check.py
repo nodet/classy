@@ -13,6 +13,7 @@ from gmail_classifier.gmail_parser import parse_gmail_message
 from gmail_classifier.preprocessing import (
     preprocess_email_body,
     build_text_representation,
+    html_cap_note,
 )
 
 
@@ -59,6 +60,9 @@ def process_inbox(
 
         # Parse and classify.
         msg = parse_gmail_message(raw)
+        cap_note = html_cap_note(msg.body_html)
+        if cap_note:
+            print(f"  [cap] {mid}: {cap_note}", flush=True)
         body = preprocess_email_body(msg.body_html)
         text = build_text_representation(
             from_name=msg.from_name,

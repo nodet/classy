@@ -1,12 +1,50 @@
 import re
+from typing import Optional
 
 from bs4 import BeautifulSoup
 
+# Cap the HTML handed to BeautifulSoup. Real readable text in an email is small;
+# anything past this is overwhelmingly inline base64 images, tracking pixels, and
+# CSS -- all of which get_text() discards anyway. Parsing the *full* HTML builds a
+# tag tree many times the byte size in RAM (a few MB of inline images -> hundreds
+# of MB transient), so we cut before the parse, not after (truncate() runs on the
+# extracted text, far too late to bound the parse peak). The body is truncated to
+# ~400 words downstream regardless, so this cap costs no real text.
+MAX_HTML_CHARS = 200_000
+
+
+def html_cap_note(html: str) -> Optional[str]:
+    """If ``html`` would be reduced before parsing, return a short
+    ``before->after`` note for logging; otherwise None. Pure (no I/O), so the
+    per-message paths can decide whether to print it without coupling
+    preprocessing to logging. Mirrors the reduction strip_html applies.
+    """
+    if not html:
+        return None
+    original = len(html)
+    reduced = min(len(_strip_data_uris(html)), MAX_HTML_CHARS)
+    if reduced >= original:
+        return None
+    return f"html {original // 1024}KB -> {reduced // 1024}KB before parse"
+
+
+def _strip_data_uris(html: str) -> str:
+    """Drop inline ``data:`` URIs (base64 images) -- they carry no text but can
+    be megabytes each, dominating the parse cost. Cheap regex, pre-parse."""
+    return re.sub(r"data:[^;]+;base64,[A-Za-z0-9+/=]+", "", html)
+
 
 def strip_html(html: str) -> str:
-    """Extract visible text from HTML, stripping all tags and style/script content."""
+    """Extract visible text from HTML, stripping all tags and style/script content.
+
+    Inline base64 images are removed and the input is capped at MAX_HTML_CHARS
+    *before* parsing, to bound the transient memory of the BeautifulSoup tree.
+    """
     if not html:
         return ""
+    html = _strip_data_uris(html)
+    if len(html) > MAX_HTML_CHARS:
+        html = html[:MAX_HTML_CHARS]
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["style", "script", "head"]):
         tag.decompose()

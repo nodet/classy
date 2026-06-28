@@ -1,4 +1,6 @@
 from gmail_classifier.preprocessing import (
+    MAX_HTML_CHARS,
+    html_cap_note,
     preprocess_email_body,
     remove_forwarded,
     remove_quoted_replies,
@@ -18,6 +20,51 @@ def test_strip_html_preserves_plain_text():
 
 def test_strip_html_handles_empty():
     assert strip_html("") == ""
+
+
+def test_strip_html_drops_inline_data_uris():
+    """Inline base64 images carry no text and are removed before parsing."""
+    html = (
+        '<p>Hello</p>'
+        '<img src="data:image/png;base64,'
+        + "A" * 50_000
+        + '">'
+        '<p>world</p>'
+    )
+    result = strip_html(html)
+    assert "Hello" in result
+    assert "world" in result
+    assert "AAAA" not in result
+
+
+def test_strip_html_caps_oversized_input_before_parse():
+    """A huge body is truncated before BeautifulSoup, bounding the parse peak.
+    The leading visible text still survives."""
+    html = "<p>Lead text.</p>" + ("<span>x</span>" * 200_000)
+    # Sanity: this input exceeds the cap.
+    assert len(html) > MAX_HTML_CHARS
+    result = strip_html(html)
+    assert "Lead text." in result
+
+
+def test_html_cap_note_none_for_small_html():
+    assert html_cap_note("<p>tiny</p>") is None
+    assert html_cap_note("") is None
+
+
+def test_html_cap_note_reports_data_uri_reduction():
+    html = '<img src="data:image/png;base64,' + "A" * 100_000 + '">'
+    note = html_cap_note(html)
+    assert note is not None
+    assert "->" in note
+
+
+def test_html_cap_note_reports_length_cap():
+    html = "<span>x</span>" * 200_000
+    assert len(html) > MAX_HTML_CHARS
+    note = html_cap_note(html)
+    assert note is not None
+    assert "before parse" in note
 
 
 def test_strip_html_extracts_from_full_email_html():
