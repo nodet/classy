@@ -18,7 +18,10 @@ reconnect fix (commit `0c4ec97`) that no test would have caught.
   skip-store save, dry-run, missing-label warning, skip_ids filtering,
   supplied-inbox_ids). Removed now-dead imports from the script. Full suite:
   187 passing.
-- Tier 3 still pending.
+- Tier 3 DONE (2026-06-28) — no refactor needed. Discovered
+  `label_registry.py` was already well-tested (11 tests), so 3a collapsed to 1
+  edge-case test; added 3 `auth.get_credentials` branch tests in new
+  `tests/test_auth.py`. 4 new tests total (not 9). Full suite: 191 passing.
 
 ## Background / problem
 
@@ -148,22 +151,50 @@ fallback). Extract its body to an importable function taking injected
 
 ## Tier 3 — fill module gaps (no refactor needed)
 
-- **`auth.py` (0 tests).** With `tmp_path` + mocked `Credentials`/`build`:
-  loads existing valid token; refreshes an expired token with refresh_token;
-  raises `FileNotFoundError` when neither token nor client secret exists.
-  Don't exercise the interactive browser flow.
-- **`label_registry.py` (no dedicated file; only used incidentally).**
-  `ensure_known()` returns True without refresh when id known; refreshes once
-  and returns True when newly present; returns False when still unknown.
-  `max_label_width` excludes excluded labels; `is_excluded`/`get_id`/
-  `get_name` basics.
-- **`_send_crash_alert` (`classify_and_label.py:420`).** Extract to importable
-  helper; assert it formats the traceback and calls `client.send_message`, and
-  that a failure inside it is swallowed (doesn't mask the original exception —
-  the `__main__` guard's `except Exception: pass`).
-- **`dry_run.py` core.** If feasible after Tier 2 extraction, reuse the shared
-  classify step so dry-run is covered transitively; otherwise skip (low value,
-  read-only script).
+Scoped down after review: the goal is to pin genuine logic, not to chase
+coverage. Several candidates were rejected as glue (testing them only asserts a
+mock was called).
+
+**Correction (2026-06-28):** the original sketch claimed `label_registry.py`
+had no tests. That was wrong — `tests/test_label_registry.py` already had 11
+tests covering `max_label_width` exclusion, all three `ensure_known` branches,
+and the `is_excluded` unknown-id guard. So 3a collapsed to a single missing
+edge case. Real net for Tier 3: **4 new tests, not 9.**
+
+### 3a. `label_registry.py` — DONE (1 new test; the rest already existed)
+
+Already covered by the pre-existing file. Only gap added:
+
+1. `max_label_width` is 0 when everything is excluded (the `default=0` guard —
+   must not crash on an empty non-excluded set).
+   (`test_max_label_width_zero_when_all_excluded`)
+
+### 3b. `auth.py::get_credentials` — DONE (3 branches, new `tests/test_auth.py`)
+
+Branch *selection* is ours and regressable. Uses `tmp_path` for the credentials
+dir; patches `auth.Credentials.from_authorized_user_file` and `auth.Request`.
+
+1. Valid stored token present → returned as-is; `refresh()` NOT called; token
+   file NOT rewritten. (`test_valid_token_reused_without_refresh_or_rewrite`)
+2. Expired token WITH a refresh_token → `creds.refresh(Request())` called and
+   the refreshed token written back to `tmp_path/token.json`.
+   (`test_expired_token_is_refreshed_and_resaved`)
+3. No token file AND no `client_secret.json` → raises `FileNotFoundError`.
+   (`test_missing_token_and_secret_raises`)
+
+### Rejected (documented so we don't reconsider on a whim)
+
+- **`auth.get_gmail_service`** — one-line `build("gmail","v1",...)` wrapper;
+  a test only asserts the mock was called. Glue, skip.
+- **`get_credentials` interactive browser flow** (`run_local_server`) — can't /
+  shouldn't unit-test.
+- **`_send_crash_alert` (function body)** — glue: build service, format
+  traceback, call `send_message`. Skip.
+- **`__main__` crash-alert masking contract** (a crash-alert failure must not
+  mask the original exception, lines 377-382) — genuinely valuable but lives in
+  `__main__`, so it needs a subprocess test like `test_sigterm`. Low frequency;
+  leaning skip. Revisit only if the crash-alert path changes.
+- **`dry_run.py`** — read-only script; low value. Skip.
 
 ## Out of scope
 
@@ -178,7 +209,8 @@ fallback). Extract its body to an importable function taking injected
 2. Add `tests/test_pubsub_loop.py` (cases 1–8). **Land case 1 first** — it is
    the regression guard that justifies this whole plan.
 3. Tier-2 extraction + `_check_inbox` tests.
-4. Tier-3 gap-fill (auth, label_registry, crash alert).
+4. Tier-3 gap-fill — `label_registry` (~6) then `auth.get_credentials` (3); no
+   refactor needed (both already importable).
 
 ## Verification
 

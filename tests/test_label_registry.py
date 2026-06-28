@@ -118,6 +118,14 @@ def test_max_label_width():
     assert registry.max_label_width == len("Technologie")
 
 
+def test_max_label_width_zero_when_all_excluded():
+    """The default=0 guard: an empty non-excluded set must not crash."""
+    client = _make_client([("L1", "XLC")])
+    registry = LabelRegistry(client, excluded={"XLC"})
+
+    assert registry.max_label_width == 0
+
+
 def test_max_label_width_updates_on_refresh():
     """max_label_width updates when a longer label is discovered."""
     client = _make_client([("L1", "Tech")])
