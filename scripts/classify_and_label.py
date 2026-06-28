@@ -217,8 +217,14 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
             # If in retry mode, wait before retrying
             if backoff:
                 time.sleep(backoff)
-                # Recreate subscriber to get a fresh gRPC channel
+                # Recreate subscriber to get a fresh gRPC channel, closing
+                # the old one so retries don't leak sockets/threads.
+                old_subscriber = subscriber
                 subscriber = _make_subscriber()
+                try:
+                    old_subscriber.close()
+                except Exception:
+                    pass
 
             # Renew watch if expiring within 1 hour (skip while disconnected)
             if not backoff:
@@ -231,10 +237,19 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
             pull_timeout = 10 if backoff else 60
             notifications = subscriber.pull(timeout=pull_timeout)
 
+            # A successful pull — even one that returns no messages — proves
+            # the connection is healthy again. Exit backoff immediately rather
+            # than waiting for mail to arrive.
+            if backoff:
+                print(f"{now()} Connection restored")
+                backoff = 0
+                # Renew watch in case it expired while disconnected. Keep the
+                # old history_id so the backlog accumulated during the outage
+                # still gets processed by get_history below.
+                history_id_new, expiration = client.watch(PUBSUB_TOPIC)
+                print(f"{now()} Watch renewed")
+
             if not notifications:
-                if backoff:
-                    backoff = min(backoff * 2, 60)
-                    print(f"{now()} Retrying in {backoff}s...")
                 continue
 
             # Use the most recent historyId from notifications
@@ -248,14 +263,6 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                 # Re-watch to get fresh historyId
                 history_id, expiration = client.watch(PUBSUB_TOPIC)
                 continue
-
-            # If we got here, connection is fully working
-            if backoff:
-                print(f"{now()} Connection restored")
-                backoff = 0
-                # Renew watch in case it expired while disconnected
-                history_id_new, expiration = client.watch(PUBSUB_TOPIC)
-                print(f"{now()} Watch renewed")
 
             if events:
                 # Process label changes (update training/skip DBs + in-memory index)

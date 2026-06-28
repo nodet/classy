@@ -44,6 +44,18 @@ def test_pull_returns_empty_on_no_messages():
     mock_client.acknowledge.assert_not_called()
 
 
+def test_close_closes_underlying_client():
+    mock_client = MagicMock()
+
+    subscriber = PubSubSubscriber(
+        subscription_path="projects/classy-498012/subscriptions/gmail-notifications-sub",
+        client=mock_client,
+    )
+    subscriber.close()
+
+    mock_client.close.assert_called_once()
+
+
 def test_pull_returns_empty_on_timeout():
     from google.api_core.exceptions import DeadlineExceeded
 

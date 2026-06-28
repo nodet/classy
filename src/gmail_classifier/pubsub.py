@@ -58,3 +58,7 @@ class PubSubSubscriber:
         )
 
         return notifications
+
+    def close(self) -> None:
+        """Close the underlying gRPC channel and release its resources."""
+        self._client.close()
