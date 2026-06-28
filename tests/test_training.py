@@ -159,3 +159,30 @@ def test_build_training_data_cache_partial_miss(tmp_path):
     # Verify new embeddings were stored in cache
     assert cache.get("2") is not None
     assert cache.get("3") is not None
+
+
+def test_build_training_data_duplicate_id_not_counted_as_miss(tmp_path):
+    """A message in both the training and skip stores appears twice in the
+    input. If it's cached, it must not be embedded -- the miss count is driven
+    by positions whose id is absent, not by len(ids) - len(cached), which a
+    duplicate would inflate."""
+    messages = [
+        _make_message("1", "Hello", "a@b.com", label="Tech"),
+        _make_message("1", "Hello", "a@b.com", label="__skip__"),  # same id, dup
+        _make_message("2", "World", "c@d.com", label="Travel"),
+    ]
+
+    cache = EmbeddingCache(str(tmp_path / "embeddings.db"))
+    cache.put("1", np.random.randn(384).astype(np.float32))
+    cache.put("2", np.random.randn(384).astype(np.float32))
+
+    mock_embedder = MagicMock()
+    embeddings, labels, ids = build_training_data(
+        messages, embedder=mock_embedder, cache=cache)
+
+    # Both unique ids are cached, so nothing is embedded despite the duplicate.
+    mock_embedder.embed.assert_not_called()
+    mock_embedder.embed_batch.assert_not_called()
+    # The duplicate row is preserved in output (one per input message).
+    assert ids == ["1", "1", "2"]
+    assert embeddings.shape == (3, 384)

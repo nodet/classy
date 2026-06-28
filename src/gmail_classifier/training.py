@@ -88,9 +88,17 @@ def build_training_data(
     _trace(f"build_training_data: cache.get_batch ({len(ids)} ids)...")
     t_cache = time.monotonic()
     cached = cache.get_batch(ids)
-    _trace(f"build_training_data: cache hits={len(cached)}, misses={len(ids) - len(cached)} ({time.monotonic() - t_cache:.2f}s)")
 
+    # Count misses from positions, not len(ids) - len(cached): a message in
+    # both the training and skip stores appears twice in `ids`, while `cached`
+    # is keyed by unique id, so the subtraction would over-report. `to embed`
+    # below is the true count of messages we must embed.
     miss_indices = [i for i, mid in enumerate(ids) if mid not in cached]
+    n_dupes = len(ids) - len(set(ids))
+    dup_note = f", {n_dupes} duplicate ids" if n_dupes else ""
+    _trace(f"build_training_data: cache hits={len(cached)}, "
+           f"to embed={len(miss_indices)}{dup_note} "
+           f"({time.monotonic() - t_cache:.2f}s)")
 
     if miss_indices:
         # Embed misses one at a time -- the same path live mail follows
