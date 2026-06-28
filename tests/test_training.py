@@ -118,7 +118,7 @@ def test_build_training_data_skips_text_prep_for_cache_hits(tmp_path):
     # "2" is a miss
 
     mock_embedder = MagicMock()
-    mock_embedder.embed_batch.return_value = np.random.randn(1, 384).astype(np.float32)
+    mock_embedder.embed.return_value = np.random.randn(384).astype(np.float32)
 
     with patch("gmail_classifier.training._message_text", wraps=lambda m: "x") as mt:
         build_training_data(messages, embedder=mock_embedder, cache=cache)
@@ -139,19 +139,18 @@ def test_build_training_data_cache_partial_miss(tmp_path):
     vec1 = np.random.randn(384).astype(np.float32)
     cache.put("1", vec1)
 
-    # Mock embedder returns known vectors for the 2 misses
+    # Mock embedder returns a known vector per miss, one call each
     mock_embedder = MagicMock()
     miss_vecs = np.random.randn(2, 384).astype(np.float32)
-    mock_embedder.embed_batch.return_value = miss_vecs
+    mock_embedder.embed.side_effect = list(miss_vecs)
 
     embeddings, labels, ids = build_training_data(messages, embedder=mock_embedder, cache=cache)
 
-    # Only uncached messages should be embedded
-    mock_embedder.embed_batch.assert_called_once()
-    call_texts = mock_embedder.embed_batch.call_args[0][0]
-    assert len(call_texts) == 2
+    # Only the 2 uncached messages should be embedded, one at a time
+    assert mock_embedder.embed.call_count == 2
+    mock_embedder.embed_batch.assert_not_called()
 
-    # Verify output
+    # Verify output, in original order
     assert embeddings.shape == (3, 384)
     np.testing.assert_allclose(embeddings[0], vec1, atol=1e-7)
     np.testing.assert_allclose(embeddings[1], miss_vecs[0], atol=1e-7)

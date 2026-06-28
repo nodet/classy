@@ -93,32 +93,27 @@ def build_training_data(
     miss_indices = [i for i, mid in enumerate(ids) if mid not in cached]
 
     if miss_indices:
-        _trace(f"build_training_data: prepare_texts for {len(miss_indices)} misses...")
-        t_prep = time.monotonic()
-        miss_texts = [_message_text(labeled[i]) for i in miss_indices]
-        _trace(f"build_training_data: prepare_texts done ({time.monotonic() - t_prep:.2f}s)")
-        _trace(f"build_training_data: embed_batch ({len(miss_texts)} uncached texts)...")
+        # Embed misses one at a time -- the same path live mail follows
+        # (inbox_check / history_processor call embedder.embed per message),
+        # so startup never builds a large transient batch. Each vector is
+        # prepped, embedded, and cached individually; a crash mid-startup
+        # leaves completed work in the cache.
+        _trace(f"build_training_data: embedding {len(miss_indices)} misses one at a time...")
         t_emb = time.monotonic()
-        miss_embeddings = embedder.embed_batch(miss_texts)
-        _trace(f"build_training_data: embed_batch done ({time.monotonic() - t_emb:.2f}s)")
-        # Store new embeddings in cache
-        miss_ids = [ids[i] for i in miss_indices]
-        _trace(f"build_training_data: cache.put_batch ({len(miss_ids)} vectors)...")
-        t_put = time.monotonic()
-        cache.put_batch(miss_ids, miss_embeddings)
-        _trace(f"build_training_data: cache.put_batch done ({time.monotonic() - t_put:.2f}s)")
+        for i in miss_indices:
+            mid = ids[i]
+            vector = embedder.embed(_message_text(labeled[i]))
+            cache.put(mid, vector)
+            cached[mid] = vector
+        _trace(f"build_training_data: embedded {len(miss_indices)} misses ({time.monotonic() - t_emb:.2f}s)")
 
-    # Assemble full embeddings array in order
+    # Assemble full embeddings array in order (all vectors now in `cached`)
     _trace(f"build_training_data: assembling {len(ids)} vectors...")
     t_asm = time.monotonic()
-    dim = next(iter(cached.values())).shape[0] if cached else miss_embeddings.shape[1]
+    dim = next(iter(cached.values())).shape[0]
     embeddings = np.empty((len(ids), dim), dtype=np.float32)
-    miss_pos = {idx: pos for pos, idx in enumerate(miss_indices)}
     for i, mid in enumerate(ids):
-        if mid in cached:
-            embeddings[i] = cached[mid]
-        else:
-            embeddings[i] = miss_embeddings[miss_pos[i]]
+        embeddings[i] = cached[mid]
     _trace(f"build_training_data: assembly done ({time.monotonic() - t_asm:.2f}s)")
 
     _trace(f"build_training_data: exit ({time.monotonic() - t0:.2f}s total)")
