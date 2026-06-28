@@ -1,5 +1,5 @@
 .PHONY: help setup test quick clean reauth fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub embed \
-       service-install service-uninstall service-start service-stop service-status service-logs \
+       service-install service-uninstall service-start service-stop service-restart service-status service-logs \
        gcp-create gcp-slim gcp-deploy gcp-destroy gcp-start gcp-stop gcp-restart gcp-status gcp-logs gcp-ssh
 
 help: ## Show this help
@@ -69,6 +69,9 @@ service-start: ## Start the launchd service
 
 service-stop: ## Stop the launchd service
 	@"$$HOME/bin/gmail-classifierctl" stop
+
+service-restart: ## Restart the launchd service (atomic; avoids stop+start race)
+	@"$$HOME/bin/gmail-classifierctl" restart
 
 service-status: ## Show launchd service status
 	@"$$HOME/bin/gmail-classifierctl" status
