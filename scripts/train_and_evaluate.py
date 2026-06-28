@@ -4,6 +4,7 @@ import argparse
 import sys
 from collections import Counter
 
+from gmail_classifier.config import excluded_labels
 from gmail_classifier.evaluate import run_evaluation
 from gmail_classifier.evaluation import per_label_precision
 from gmail_classifier.storage import MessageStore
@@ -20,10 +21,6 @@ def main():
     parser.add_argument(
         "--k", type=int, default=5,
         help="Number of neighbors for KNN (default: 5)",
-    )
-    parser.add_argument(
-        "--exclude-labels", nargs="*", default=[],
-        help="Labels to exclude from evaluation (e.g. --exclude-labels XLC XLE XLCap)",
     )
     parser.add_argument(
         "--skip-db", default="data/inbox_sample.db",
@@ -44,9 +41,9 @@ def main():
         print("No messages found in the database.")
         sys.exit(1)
 
-    # Exclude labels if requested
-    if args.exclude_labels:
-        excluded = set(args.exclude_labels)
+    # Exclude labels configured in config.toml
+    excluded = set(excluded_labels())
+    if excluded:
         messages = [m for m in messages if m.labels and m.labels[0] not in excluded]
         print(f"Excluded labels: {', '.join(sorted(excluded))}")
         print()

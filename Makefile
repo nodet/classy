@@ -29,7 +29,7 @@ reauth: ## Re-authenticate with Gmail (opens browser for OAuth consent)
 	uv run python -c "from gmail_classifier.auth import get_credentials; get_credentials()"
 
 fetch-training: ## Fetch labeled messages from Gmail (see docs/gmail-setup.md)
-	uv run python scripts/fetch_training_data.py --exclude-labels XLC XLE XLCap
+	uv run python scripts/fetch_training_data.py
 
 fetch-inbox: ## Fetch recent inbox messages for dry-run classification
 	uv run python scripts/fetch_inbox.py
@@ -38,19 +38,19 @@ evaluate: ## Run cross-validation evaluation on stored messages
 	uv run python scripts/train_and_evaluate.py
 
 dry-run: ## Classify inbox messages without modifying Gmail
-	uv run python scripts/dry_run.py --exclude-labels XLC XLE XLCap
+	uv run python scripts/dry_run.py
 
 classify: ## Classify new inbox messages and apply labels (once)
-	uv run python scripts/classify_and_label.py --once --exclude-labels XLC XLE XLCap
+	uv run python scripts/classify_and_label.py --once
 
 watch: ## Run classifier in a loop every 5 minutes (poll mode)
-	uv run python scripts/classify_and_label.py --exclude-labels XLC XLE XLCap
+	uv run python scripts/classify_and_label.py
 
 watch-pubsub: ## Run classifier with Pub/Sub push notifications
-	uv run python scripts/classify_and_label.py --mode pubsub --exclude-labels XLC XLE XLCap
+	uv run python scripts/classify_and_label.py --mode pubsub
 
 embed: ## Pre-compute embedding cache (for fast startup on GCP)
-	uv run python scripts/build_embeddings.py --exclude-labels XLC XLE XLCap
+	uv run python scripts/build_embeddings.py
 
 clean: ## Remove build artifacts and virtual environment
 	rm -rf .venv __pycache__ src/*.egg-info

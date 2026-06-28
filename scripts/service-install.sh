@@ -31,7 +31,6 @@ RUNNER="$HOME/bin/gmail-classifier-runner"
 CTL="$HOME/bin/gmail-classifierctl"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/$LABEL.log"
-EXCLUDE_LABELS="XLC XLE XLCap"
 
 mkdir -p "$HOME/bin" "$HOME/Library/LaunchAgents"
 
@@ -69,7 +68,7 @@ fi
 
 echo "[\$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')] starting \${LABEL}"
 
-exec "\$UV" run --locked -- python -u scripts/classify_and_label.py --mode pubsub --exclude-labels $EXCLUDE_LABELS
+exec "\$UV" run --locked -- python -u scripts/classify_and_label.py --mode pubsub
 EOF
 chmod +x "$RUNNER"
 

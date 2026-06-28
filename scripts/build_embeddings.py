@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from gmail_classifier.classifier import SKIP_LABEL
+from gmail_classifier.config import excluded_labels
 from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.storage import MessageStore
@@ -29,10 +30,6 @@ def main():
         "--cache-db", default="data/embeddings.db",
         help="Path to embedding cache output",
     )
-    parser.add_argument(
-        "--exclude-labels", nargs="*", default=[],
-        help="Labels to exclude from training",
-    )
     args = parser.parse_args()
 
     # Load training messages
@@ -45,7 +42,7 @@ def main():
         print("No training messages found.")
         sys.exit(1)
 
-    excluded = set(args.exclude_labels)
+    excluded = set(excluded_labels())
     if excluded:
         train_messages = [m for m in train_messages if m.labels and m.labels[0] not in excluded]
         print(f"  Excluded labels: {', '.join(sorted(excluded))}")

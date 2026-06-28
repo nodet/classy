@@ -9,6 +9,7 @@ import sys
 import numpy as np
 
 from gmail_classifier.classifier import classify, Action, SKIP_LABEL
+from gmail_classifier.config import excluded_labels
 from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
@@ -33,10 +34,6 @@ def main():
         help="Number of neighbors for KNN (default: 5)",
     )
     parser.add_argument(
-        "--exclude-labels", nargs="*", default=[],
-        help="Labels to exclude from predictions (e.g. --exclude-labels XLC XLE XLCap)",
-    )
-    parser.add_argument(
         "--skip-db", default="",
         help="Path to inbox/skip message store (messages used as negative examples)",
     )
@@ -52,8 +49,8 @@ def main():
         print("No training messages found.")
         sys.exit(1)
 
-    # Exclude labels if requested
-    excluded = set(args.exclude_labels)
+    # Exclude labels configured in config.toml
+    excluded = set(excluded_labels())
     if excluded:
         train_messages = [m for m in train_messages if m.labels and m.labels[0] not in excluded]
         print(f"  Excluded labels: {', '.join(sorted(excluded))}")

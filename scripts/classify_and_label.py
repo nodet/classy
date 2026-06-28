@@ -19,6 +19,7 @@ import numpy as np
 
 from gmail_classifier.auth import get_credentials, get_gmail_service
 from gmail_classifier.classifier import Action, SKIP_LABEL
+from gmail_classifier.config import excluded_labels
 from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
@@ -74,10 +75,6 @@ def main():
         help="Number of neighbors for KNN (default: 5)",
     )
     parser.add_argument(
-        "--exclude-labels", nargs="*", default=[],
-        help="Labels to exclude from predictions",
-    )
-    parser.add_argument(
         "--dry-run", action="store_true",
         help="Show what would be done without modifying Gmail",
     )
@@ -113,7 +110,7 @@ def main():
         sys.exit(1)
 
     # Exclude labels
-    excluded = set(args.exclude_labels)
+    excluded = set(excluded_labels())
     if excluded:
         train_messages = [m for m in train_messages if m.labels and m.labels[0] not in excluded]
         print(f"  Excluded labels: {', '.join(sorted(excluded))}")

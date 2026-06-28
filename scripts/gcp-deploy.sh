@@ -202,7 +202,7 @@ Group=gmail-classifier
 WorkingDirectory=/opt/gmail-classifier
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/opt/gmail-classifier
-ExecStart=/opt/gmail-classifier/.local/bin/uv run --locked -- python -u scripts/classify_and_label.py --mode pubsub --exclude-labels XLC XLE XLCap
+ExecStart=/opt/gmail-classifier/.local/bin/uv run --locked -- python -u scripts/classify_and_label.py --mode pubsub
 Restart=on-failure
 RestartSec=10
 KillSignal=SIGTERM

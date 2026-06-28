@@ -25,6 +25,10 @@ Semantic auto-labeling for Gmail using KNN on email embeddings.
    make fetch-inbox       # downloads inbox as skip examples
    ```
 
+   By default this excludes the labels listed in `config.toml` — edit that
+   first if there are labels you don't want auto-applied (see
+   [Configuration](#configuration)).
+
 4. **Verify it works interactively**
 
    ```bash
@@ -46,6 +50,23 @@ Semantic auto-labeling for Gmail using KNN on email embeddings.
 
 For detailed launchd configuration, see [mac_uv_launchd_service_plan.md](mac_uv_launchd_service_plan.md).
 For GCP/Gmail API setup, see [docs/gmail-setup.md](docs/gmail-setup.md).
+
+## Configuration
+
+Tunable settings live in `config.toml` at the repo root — edit it directly, no
+code or Makefile changes needed.
+
+```toml
+[labels]
+# Gmail label names to exclude everywhere: never fetched, never trained on,
+# never auto-applied. Replace with your own labels, or leave empty to
+# classify into every user label.
+excluded = ["XLC", "XLE", "XLCap"]
+```
+
+Every command reads exclusions from this file — change the list here to change
+what gets fetched, trained on, and auto-applied everywhere, including the macOS
+and GCP services.
 
 ## GCP deployment (always-on)
 

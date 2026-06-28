@@ -1,0 +1,11 @@
+# gmail-classifier configuration
+#
+# Edit this file to tune behavior without touching code or the Makefile.
+# Every script reads its defaults from here; the matching command-line flag
+# (e.g. --exclude-labels) still overrides for one-off runs.
+
+[labels]
+# Gmail label *names* to exclude everywhere: never fetched, never trained on,
+# never auto-applied. A new user should replace these with their own labels
+# (or leave the list empty to classify into every user label).
+excluded = ["XLC", "XLE", "XLCap"]
