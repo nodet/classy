@@ -18,36 +18,30 @@ Semantic auto-labeling for Gmail using KNN on email embeddings.
    - Place `client_secret.json` in `credentials/`
    - Create Pub/Sub topic + subscription (see [docs/gmail-setup.md](docs/gmail-setup.md))
 
-3. **Authenticate**
+3. **Fetch training data** (the first run also triggers the OAuth flow)
 
    ```bash
-   make fetch-training    # triggers OAuth flow on first run
-   ```
-
-4. **Fetch training data**
-
-   ```bash
-   make fetch-training    # downloads labeled emails
+   make fetch-training    # downloads labeled emails (opens browser on first run)
    make fetch-inbox       # downloads inbox as skip examples
    ```
 
-5. **Verify it works interactively**
+4. **Verify it works interactively**
 
    ```bash
    make watch-pubsub      # Ctrl+C to stop
    ```
 
-6. **Install as macOS service**
+5. **Install as macOS service**
 
    ```bash
    make service-install   # generates runner, plist, control script
    ```
 
-7. **Start the service**
+6. **Start the service**
 
    ```bash
-   gmail-classifierctl start
-   gmail-classifierctl logs   # watch output
+   make service-start
+   make service-logs      # watch output
    ```
 
 For detailed launchd configuration, see [mac_uv_launchd_service_plan.md](mac_uv_launchd_service_plan.md).
@@ -103,25 +97,50 @@ Deploy to a free-tier e2-micro VM for always-on operation without keeping a lapt
 ### Deploy
 
 ```bash
-make gcp-create    # 1. Create the VM
-make gcp-deploy    # 2. Deploy code, data, credentials, install deps
-make gcp-start     # 3. Start the service
-make gcp-status    # 4. Check status
-make gcp-logs      # 5. Tail logs (Ctrl+C to stop)
-make gcp-ssh       # 6. SSH into VM (for debugging)
-make gcp-destroy   # 7. Destroy VM (when no longer needed)
+make embed         # 1. Build the embedding cache locally (avoids OOM on the VM)
+make gcp-create    # 2. Create the VM
+make gcp-deploy    # 3. Deploy code, data, credentials, install deps
+make gcp-start     # 4. Start the service
+make gcp-status    # 5. Check status
+make gcp-logs      # 6. Tail logs (Ctrl+C to stop)
+make gcp-ssh       # 7. SSH into VM (for debugging)
+make gcp-destroy   # 8. Destroy VM (when no longer needed)
 ```
+
+`make gcp-deploy` stops the service before syncing and does **not** restart it;
+run `make gcp-start` afterwards (already step 4 above). To restart an
+already-deployed service without redeploying, use `make gcp-restart`.
 
 ### Updating
 
-After code changes, just run `make gcp-deploy` -- it syncs code, skips unchanged data files, and restarts the service automatically.
+After code changes, run `make gcp-deploy` then `make gcp-start`. Deploy stops the
+service (to avoid corrupting the SQLite files mid-sync), syncs code, skips
+unchanged data files, and installs dependencies, but leaves the service stopped --
+you must start it again with `make gcp-start`.
 
-After retraining (`make fetch-training` on Mac), `make gcp-deploy` detects the size change and uploads the new database.
+After retraining on the Mac (`make fetch-training` / `make fetch-inbox`), rebuild
+the embedding cache with `make embed` before deploying, otherwise the VM has to
+embed the newly-fetched messages at startup and can run out of memory.
+`make gcp-deploy` detects changed databases by size/mtime and uploads them.
 
 ### Debugging
 
 [Google Cloud console](https://console.cloud.google.com/compute/instancesDetail/zones/us-central1-a/instances/gmail-classifier?project=classy-498012)
-Access to the log: ``sudo journalctl -u gmail-classifier -f``
+Access to the log: ``sudo journalctl -u gmail-classifier -f`` (or `make gcp-logs`).
+
+The service logs `[mem]` RSS checkpoints at each startup stage and after each
+processed batch, and prefixes every per-message line with current RSS, so memory
+behavior is visible directly in the log. Expected steady-state is ~220 MB on the
+e2-micro; startup briefly peaks higher (transient, returned to the OS by
+`malloc_trim`).
+
+#### Historical: I/O thrashing (resolved)
+
+The VM was once pinned at 79-99% I/O wait. This was traced *not* to swapping
+(`si/so = 0`) but to ~600 MB held resident causing kernel memory pressure and
+constant disk reads. Fixed by excluding unused labels, deferring text prep to
+cache misses, embedding one message at a time, and trimming the heap after each
+batch. Kept here as a diagnostic example of reading `vmstat` on this VM:
 
 ```text
 $ vmstat 2
