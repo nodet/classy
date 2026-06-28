@@ -88,13 +88,93 @@ carry a user label. (The reverse is correct and unchanged: an INBOX message with
 user label is a skip example.) This is the same guard the immediate two-store fix applies
 at load time; the bootstrap applies it at the source so the conflict never reaches the
 `labels` table.
-3. Either path → existing pubsub loop, unchanged.
+3. Either path → the pubsub loop. The **warm** path enters it unchanged. The **cold**
+   (bootstrap) path enters a progressive variant — see "Progressive bootstrap" below —
+   so the service is live and safe from the first second rather than after a 20-min wait.
 
 ### Resumability (matters during the slow first boot)
 
 Because each vector + label row is committed as computed, a crash at minute 15 of a 20-min
 bootstrap **resumes** (step 2 skips already-embedded ids) rather than restarting. This is
 why per-message caching (commit `fd0b6d6`) was worth doing.
+
+### Progressive bootstrap (read-only until mature)
+
+A fresh VM has no cache, so step 2 is slow (~10–20 min). Rather than block the service
+until it finishes, bootstrap **incrementally** while the pubsub loop is already live. Three
+mechanisms make this both *useful early* and *safe early*.
+
+#### Read-only until there is a cache (the hard safety boundary)
+
+The current first boot does an **initial inbox check that labels the backlog**
+(`_run_pubsub_mode` → `_check_inbox` → `apply_label`/archive). On a cache-less deploy that
+is exactly wrong: the service would wake up and archive hundreds of emails that arrived
+*before* it ever ran. Rule:
+
+> When bootstrapping (no cache yet), **everything already in Gmail is read-only.** Bootstrap
+> *reads* existing mail only to embed it into the index; it never labels or archives it.
+> Only mail that arrives *after* the service starts is eligible to be labeled.
+
+Mechanism: call `client.watch(PUBSUB_TOPIC)` **first**, before reading a single message, and
+pin the returned `historyId` as the boundary. Anything at-or-before it = existing = read-only
+forever; anything after it = new = classifiable (subject to the maturity gate below). Because
+the subscription exists from the start, notifications for genuinely-new mail **accumulate**
+during the slow bootstrap and are serviced as we go — none are lost. The labeling initial
+inbox check is **removed from the cold path** (the warm-restart fast path, which has a cache,
+keeps today's behavior).
+
+#### Round-robin ordering (so the classifier is broad, not deep, early)
+
+The naive bootstrap order is depth-first: finish label A, then B, then C. That is the worst
+order for early usefulness, because `_eligible_labels` (`classifier.py:98`) only lets a label
+win once it has **≥5 examples** — so for a long stretch the classifier can recognize A-type
+mail and is blind to everything else.
+
+Instead, **round-robin**: process one message from each label per round (and the skip pool —
+see below), committing each vector+label as computed. After R rounds every label has ~R
+examples and they all cross the eligibility line together. The memory and resumability
+properties are order-independent, so this is free; a half-finished round-robin is already a
+working *broad* classifier on the next boot.
+
+The **skip pool is loaded similarly, but front-loaded**: take ~50 inbox messages first (the
+safety mass — see the maturity gate), then round-robin across both the user labels *and* the
+inbox for the remainder.
+
+#### Two gates: read-only boundary vs. maturity
+
+These are independent and must not be conflated:
+
+- **Read-only gate** (above): existing vs. new mail. Existing is *never* labeled, no matter
+  how mature the model becomes. Permanent, per-message, decided by the pinned `historyId`.
+- **Maturity gate**: even genuinely-new mail is not labeled until the index is broad enough —
+  **≥~20 examples per user label AND the skip pool loaded**. Confidence is
+  `winning_score / total_score` with `__skip__` neighbors in the denominator
+  (`classifier.py:73,137`); without the skip mass loaded, early confidence is spuriously high
+  and the service **over-labels**. Since the live path applies *and archives* at ≥0.80
+  (`inbox_check.py:83,93`), an early mistake is a semi-irreversible action on the mailbox — so
+  the gate is conservative by design.
+
+Consequence (accepted): new mail arriving during early warmup, before the maturity gate opens,
+stays **unlabeled in the inbox** — not lost, just not acted on yet, and a natural skip/recheck
+candidate later. The correct conservative default for a brand-new service.
+
+#### Single-threaded interleave (not a background thread)
+
+Do the bootstrap *in* the pubsub loop, not a side thread. `TrainingIndex.add` reassigns
+`self.embeddings` via `np.vstack` and mutates a list + dict (`training_index.py:23-35`); a
+concurrent `classify` reading `self.embeddings` mid-`vstack` races on a half-built array, and
+two threads would share one FastEmbed model and compete for the e2-micro's single core. Instead,
+process one round-robin batch *between* `run_iteration` calls: a batch (one message per label +
+a few skip), then service any pending notification, repeat until the corpus is exhausted. This
+is single-threaded (no lock, no index race, one embedder caller) and naturally throttled (live
+mail preempts bootstrap between batches). Bootstrap finishes somewhat later in wall-clock — the
+tradeoff we already accept, since the goal is early responsiveness, not fast completion.
+
+#### First-boot summary
+
+`watch()` → pin `historyId` → load ~50 skip → round-robin labels + inbox, committing each
+vector (resumable) → once **≥20/label AND skip pool present**, begin labeling **new** mail only
+→ existing mail stays untouched forever. Single-threaded interleave in the pubsub loop.
 
 ### Live adaptation (preserve today's behavior)
 
