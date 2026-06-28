@@ -14,7 +14,7 @@ from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
 from gmail_classifier.storage import MessageStore
-from gmail_classifier.training import build_training_data
+from gmail_classifier.training import build_training_data, exclude_labeled_from_skip
 
 
 def main():
@@ -65,6 +65,9 @@ def main():
         skip_store = MessageStore(skip_db)
         skip_messages = skip_store.load_all()
         skip_store.close()
+        # Labeled wins over skip: drop skip examples that already carry a user
+        # label so they don't add a duplicate __skip__ vote (matches service).
+        skip_messages = exclude_labeled_from_skip(skip_messages, train_messages)
         # Tag them with __skip__ label
         for m in skip_messages:
             m.labels = [SKIP_LABEL]

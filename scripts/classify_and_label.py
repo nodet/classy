@@ -28,7 +28,7 @@ from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.memory import log_mem, trim_memory
 from gmail_classifier.storage import MessageStore
-from gmail_classifier.training import build_training_data
+from gmail_classifier.training import build_training_data, exclude_labeled_from_skip
 from gmail_classifier.training_index import TrainingIndex
 
 PUBSUB_TOPIC = "projects/classy-498012/topics/gmail-notifications"
@@ -124,10 +124,20 @@ def main():
         skip_store = MessageStore(args.skip_db)
         skip_messages = skip_store.load_all()
         skip_store.close()
+        # skip_ids keeps every sampled inbox id (incl. ones that are also
+        # labeled) so the live path won't re-classify an already-seen message.
         skip_ids = {m.id for m in skip_messages}
+
+        # But labeled wins over skip for *training*: drop skip examples that
+        # already carry a user label so they don't add a duplicate,
+        # contradictory __skip__ vote to the KNN (and orphan the labeled row).
+        n_before = len(skip_messages)
+        skip_messages = exclude_labeled_from_skip(skip_messages, train_messages)
+        n_dropped = n_before - len(skip_messages)
         for m in skip_messages:
             m.labels = [SKIP_LABEL]
-        print(f"  {len(skip_messages)} skip examples")
+        note = f" ({n_dropped} also labeled, kept as labeled)" if n_dropped else ""
+        print(f"  {len(skip_messages)} skip examples{note}")
     log_mem("startup: after skip DB load")
 
     # Build training index (with embedding cache for fast startup)

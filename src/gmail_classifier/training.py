@@ -25,6 +25,25 @@ def _message_text(msg: Message) -> str:
     )
 
 
+def exclude_labeled_from_skip(
+    skip_messages: List[Message], train_messages: List[Message]
+) -> List[Message]:
+    """Drop skip-pool messages that already carry a user label.
+
+    A message can hold a user label *and* still sit in the inbox (labeling
+    doesn't archive it), so it can end up in both the training and skip stores.
+    Such a message is a labeled training example, never a skip example --
+    keeping it in the skip pool would add a duplicate, contradictory
+    ``__skip__`` vote to the KNN and (via the id->index map) orphan its
+    labeled row. Labeled always wins over skip.
+
+    Returns the skip messages whose id is not in the training set, order
+    preserved. Does not mutate the inputs.
+    """
+    train_ids = {m.id for m in train_messages}
+    return [m for m in skip_messages if m.id not in train_ids]
+
+
 def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[str]]:
     """Convert messages to text representations and extract labels.
 

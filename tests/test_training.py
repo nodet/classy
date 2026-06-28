@@ -4,7 +4,11 @@ from unittest.mock import patch, MagicMock
 
 from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.models import Message
-from gmail_classifier.training import build_training_data, prepare_texts
+from gmail_classifier.training import (
+    build_training_data,
+    exclude_labeled_from_skip,
+    prepare_texts,
+)
 
 
 def _make_message(id, subject, from_addr, body_html="", label="Tech", list_id=""):
@@ -186,3 +190,51 @@ def test_build_training_data_duplicate_id_not_counted_as_miss(tmp_path):
     # The duplicate row is preserved in output (one per input message).
     assert ids == ["1", "1", "2"]
     assert embeddings.shape == (3, 384)
+
+
+def test_exclude_labeled_from_skip_drops_labeled_ids():
+    """A skip message whose id also appears in training is dropped: labeled
+    wins over skip."""
+    train = [
+        _make_message("1", "A", "a@b.com", label="Tech"),
+        _make_message("2", "B", "c@d.com", label="Travel"),
+    ]
+    skip = [
+        _make_message("1", "A", "a@b.com", label="Tech"),   # also labeled -> drop
+        _make_message("9", "Z", "z@z.com", label="Tech"),   # inbox-only -> keep
+    ]
+    result = exclude_labeled_from_skip(skip, train)
+    assert [m.id for m in result] == ["9"]
+
+
+def test_exclude_labeled_from_skip_no_overlap_is_identity():
+    train = [_make_message("1", "A", "a@b.com", label="Tech")]
+    skip = [_make_message("9", "Z", "z@z.com", label="Tech")]
+    result = exclude_labeled_from_skip(skip, train)
+    assert [m.id for m in result] == ["9"]
+    # Inputs are not mutated.
+    assert len(skip) == 1
+
+
+def test_exclude_labeled_from_skip_prevents_orphaned_index_row():
+    """After dedup, the TrainingIndex has one row per id, so a later
+    correction reaches the (single) row -- no orphaned, uncorrectable vote."""
+    from gmail_classifier.training_index import TrainingIndex
+
+    train = [_make_message("1", "A", "a@b.com", label="Tech")]
+    skip = [_make_message("1", "A", "a@b.com", label="__skip__")]  # same id
+
+    skip = exclude_labeled_from_skip(skip, train)
+    all_msgs = train + skip  # skip is now empty
+
+    embeddings = np.random.randn(len(all_msgs), 4).astype(np.float32)
+    labels = [m.labels[0] for m in all_msgs]
+    ids = [m.id for m in all_msgs]
+    index = TrainingIndex(embeddings, labels, ids)
+
+    assert len(index) == 1
+    assert index.labels == ["Tech"]
+    # A correction on id "1" updates the one row rather than an orphan.
+    index.add("1", np.random.randn(4).astype(np.float32), "Travel")
+    assert index.labels == ["Travel"]
+    assert len(index) == 1
