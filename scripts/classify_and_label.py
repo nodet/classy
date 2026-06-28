@@ -187,6 +187,10 @@ def _process_events(events, args, client, embedder, index, registry,
         dots[0] = True
         return
 
+    # RSS on entry, before any work. If this is already high, the spike came
+    # from upstream (pull / get_history) rather than from processing here.
+    rss_at_entry = rss_mb()
+
     # Process label changes (update training/skip DBs + in-memory index)
     training_store = MessageStore(args.training_db)
     skip_store = MessageStore(args.skip_db)
@@ -261,6 +265,7 @@ def _process_events(events, args, client, embedder, index, registry,
         def _fmt(x):
             return f"{x:.0f}MB" if x is not None else "n/a"
         print(f"{now()} [mem] batch: {len(events)} events, "
+              f"at entry={_fmt(rss_at_entry)}, "
               f"after label-changes={_fmt(rss_after_changes)}, "
               f"after classify={_fmt(rss_after_classify)}", flush=True)
         # Hand back the heap a heavy message (big HTML parse + embed) just

@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
+from gmail_classifier.memory import rss_mb
 from gmail_classifier.models import HistoryExpiredError
 
 INITIAL_BACKOFF = 5
@@ -106,7 +107,9 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
 
         # Pull notifications (shorter timeout when retrying).
         pull_timeout = PULL_TIMEOUT_RETRY if backoff else PULL_TIMEOUT
+        rss_before_pull = rss_mb()
         notifications = subscriber.pull(timeout=pull_timeout)
+        rss_after_pull = rss_mb()
 
         # A successful pull -- even one that returns no messages -- proves the
         # connection is healthy again. Exit backoff immediately rather than
@@ -128,6 +131,18 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
 
         try:
             events, latest_history_id = deps.get_history(history_id)
+            rss_after_history = rss_mb()
+            # Pin the upstream spike to pull vs get_history. Logged only when a
+            # step added a meaningful chunk, so quiet batches stay quiet.
+            if rss_before_pull is not None and rss_after_history is not None:
+                d_pull = (rss_after_pull or rss_before_pull) - rss_before_pull
+                d_hist = rss_after_history - (rss_after_pull or rss_before_pull)
+                if d_pull > 50 or d_hist > 50:
+                    deps.log(
+                        f"[mem] upstream: pull +{d_pull:.0f}MB, "
+                        f"get_history +{d_hist:.0f}MB "
+                        f"({len(events)} events, {len(notifications)} notifs)"
+                    )
         except HistoryExpiredError:
             deps.log("History expired, falling back to inbox poll")
             deps.check_inbox()
