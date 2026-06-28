@@ -123,3 +123,45 @@ After retraining (`make fetch-training` on Mac), `make gcp-deploy` detects the s
 [Google Cloud console](https://console.cloud.google.com/compute/instancesDetail/zones/us-central1-a/instances/gmail-classifier?project=classy-498012)
 Access to the log: ``sudo journalctl -u gmail-classifier -f``
 
+```text
+$ vmstat 2
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  5      0  64932    952  41588    0    0  1815    21  220  258  0  1 60 38  0
+ 1  6      0  64932    952  41588    0    0  4856     0  854  884  0  1  0 99  0
+ 1  7      0  64932    952  41588    0    0  4772     2  962  976  0  2  0 98  0
+ 3  7      0  64932    952  41588    0    0  4462     6  902  959  1  1  0 98  0
+ 1  9      0  64932    952  41588    0    0  4542     2  755  876  0  1  0 99  0
+ 1  6      0  64932    952  41588    0    0  4440     0  720  834  1  1  0 99  0
+ 1  6      0  64932    952  41588    0    0  5016     4  651  784  0  1  0 99  0
+ 1  6      0  64932    952  41588    0    0  4430     0  783  904  5  2  0 93  0
+ 2  5      0  64932    952  41588    0    0  4724     0  806  840 17  5  0 79  0
+ 2  5      0  64932    952  41588    0    0  5200     0  823  906  1  1  0 98  0
+ 2  6      0  64932    952  41588    0    0  4796     0  925 1031  0  1  0 99  0
+ ```
+
+- bi (blocks in): 4000-7000 KB/s — that's your ~5 MB/s constant disk read, matching the GCP console
+- wa (I/O wait): 79-99% — CPU is almost entirely idle waiting for disk
+- b (blocked processes): 5-18 — many threads blocked on I/O
+- us (user CPU): 0-5% — barely any actual computation happening
+- si/so (swap): 0/0 — no swapping (good news: it's not a RAM problem)
+- free: 64 MB — low but stable; cache is 41 MB
+
+Once the service has been stopped:
+
+```text
+$ vmstat 2
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  2      0 665060   4864 138984    0    0  1825    21  224  262  0  1 59 40  0
+ 1  1      0 665060   4864 138984    0    0  3872     0 1136 1392  4  3 39 54  0
+ 1  2      0 665060   4864 138984    0    0  3560   222 1894 2641  6  8  8 78  0
+ 1  0      0 665060   4864 138984    0    0  3688     2  901 1103  4  5 47 44  0
+ 1  0      0 665060   4864 138984    0    0     0     0  124  109  1  1 99  0  0
+ 1  0      0 665060   4864 138984    0    0     0    38   98   89  0  0 99  0  0
+ 1  0      0 665060   4864 138984    0    0    56     2  145  125  1  1 99  0  0
+ 1  0      0 665060   4864 138984    0    0    96    90  126  125  0  1 98  1  0
+ 1  0      0 665060   4864 138984    0    0     0    18  117  114  0  1 99  0  0
+ 1  0      0 665060   4864 138984    0    0     0   826  154  135  1  1 98  1  0
+ 1  0      0 665060   4864 138984    0    0     6    14  106   89  0  1 99  1  0
+ ```
