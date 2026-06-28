@@ -55,6 +55,22 @@ def rss_mb() -> float | None:
     return _current_rss_mb()
 
 
+def trim_memory() -> None:
+    """Return freed heap pages to the OS (glibc ``malloc_trim``).
+
+    glibc keeps freed pages on its free-list so our own process can reuse
+    them, but on a swapless VM it will not yield them to other processes and
+    the kernel cannot reclaim dirty anonymous pages -- so RSS ratchets to the
+    high-water mark of the costliest message. Calling this after processing
+    hands those pages back. No-op off Linux (macOS has no ``malloc_trim``).
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
+
+
 def log_mem(stage: str) -> None:
     """Print an RSS checkpoint for ``stage`` in the [trace] format.
 

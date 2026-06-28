@@ -25,7 +25,7 @@ from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.history_processor import process_history_events
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
-from gmail_classifier.memory import log_mem
+from gmail_classifier.memory import log_mem, trim_memory
 from gmail_classifier.storage import MessageStore
 from gmail_classifier.training import build_training_data
 from gmail_classifier.training_index import TrainingIndex
@@ -147,11 +147,7 @@ def main():
     cache.close()
     log_mem("startup: after build_training_data")
     del all_train_messages, train_messages, skip_messages
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except OSError:
-        pass  # not on Linux (macOS has no malloc_trim)
+    trim_memory()
     log_mem("startup: after del + malloc_trim")
     print(f"  {train_embeddings.shape[0]} embeddings, {train_embeddings.shape[1]} dimensions")
 
@@ -261,6 +257,10 @@ def _process_events(events, args, client, embedder, index, registry,
     training_store.close()
     skip_store.close()
 
+    # Hand back the heap a heavy message (big HTML parse + embed) just grew,
+    # so RSS falls back to idle instead of ratcheting to the worst-case peak.
+    trim_memory()
+
 
 def _run_pubsub_mode(args, client, credentials, embedder, index,
                      registry, skip_ids):
@@ -369,6 +369,10 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids,
             print(truncate(f"{now()} {r['label']:{w}s}  {r['confidence']:6.1%}  {sender} — {r['subject']}"))
         else:
             print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {r['subject']}"))
+
+    # Heavy parse+embed work just ran; return the heap to the OS (see
+    # _process_events).
+    trim_memory()
 
 
 def _sigterm_handler(signum, frame):
