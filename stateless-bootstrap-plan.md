@@ -66,11 +66,28 @@ embeddings; one file = one connection, atomic, trivial to reset.)
 2. If empty (fresh VM) → **bootstrap from Gmail**:
    - `list_user_labels()` minus excluded (XLC/XLE/XLCap).
    - For each label: `list_message_ids(label_id, max_results=--max-per-label)`.
-   - For the skip pool: list recent INBOX ids (current `inbox_sample` semantics).
+   - For the skip pool: list recent INBOX ids, **minus any id that already carries a
+     user label** (see "Labeled wins over skip" below).
    - For each id **not already embedded**: `get_message` → parse → `build_text_representation`
      → `embedder.embed` → `cache.put(id, vec)` + record `id→label` (or skip). Discard the
      raw message. **One at a time** — bounded memory, resumable.
    - Build `TrainingIndex` from the cache + label map.
+
+### Labeled wins over skip (the one semantic rule the single table needs)
+
+The single `labels` table keyed on `message_id` eliminates the *structural* bug we hit
+with two stores (a message could be a row in both `training.db` and `inbox_sample.db`,
+producing a duplicate KNN vote and an orphaned, uncorrectable row). But one row per id
+turns the conflict into **last-write-wins**, which is not automatically correct: a message
+can hold a user label *and* still sit in INBOX (labeling doesn't archive it), so the skip
+step would otherwise `upsert(id, '__skip__')` over a real label.
+
+Rule: **a message that carries a real user label is a labeled example, never a skip
+example.** Equivalently — when building the skip pool, exclude INBOX ids that already
+carry a user label. (The reverse is correct and unchanged: an INBOX message with *no*
+user label is a skip example.) This is the same guard the immediate two-store fix applies
+at load time; the bootstrap applies it at the source so the conflict never reaches the
+`labels` table.
 3. Either path → existing pubsub loop, unchanged.
 
 ### Resumability (matters during the slow first boot)
