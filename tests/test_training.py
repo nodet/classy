@@ -4,11 +4,23 @@ from unittest.mock import patch, MagicMock
 
 from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.models import Message
+from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.training import (
+    assemble_training_index,
     build_training_data,
     exclude_labeled_from_skip,
     prepare_texts,
 )
+
+
+class _FakeEmbedder:
+    """Deterministic embedder: a distinct unit-ish vector per id, no model load."""
+
+    def __init__(self, dim=4):
+        self.dim = dim
+
+    def embed(self, text):
+        return np.ones(self.dim, dtype=np.float32)
 
 
 def _make_message(id, subject, from_addr, body_html="", label="Tech", list_id=""):
@@ -236,5 +248,89 @@ def test_exclude_labeled_from_skip_prevents_orphaned_index_row():
     assert index.labels == ["Tech"]
     # A correction on id "1" updates the one row rather than an orphan.
     index.add("1", np.random.randn(4).astype(np.float32), "Travel")
+    assert index.labels == ["Travel"]
+    assert len(index) == 1
+
+
+def _assemble(train, skip, excluded, tmp_path):
+    cache = EmbeddingCache(str(tmp_path / "embeddings.db"))
+    try:
+        return assemble_training_index(
+            train, skip, excluded=excluded,
+            embedder=_FakeEmbedder(), cache=cache,
+        )
+    finally:
+        cache.close()
+
+
+def test_assemble_excludes_configured_labels(tmp_path):
+    """Training messages whose first label is excluded are dropped from the index."""
+    train = [
+        _make_message("1", "A", "a@b.com", label="Tech"),
+        _make_message("2", "B", "c@d.com", label="XLC"),  # excluded
+    ]
+    index, skip_ids, stats = _assemble(train, [], {"XLC"}, tmp_path)
+    assert stats.n_train == 1
+    assert index.labels == ["Tech"]
+    assert "2" not in index
+
+
+def test_assemble_skip_ids_retains_every_sampled_id(tmp_path):
+    """skip_ids keeps ALL sampled inbox ids -- including ones also labeled --
+    so the live loop won't re-classify an already-seen message, even though the
+    labeled one is dropped from the training votes."""
+    train = [_make_message("1", "A", "a@b.com", label="Tech")]
+    skip = [
+        _make_message("1", "A", "a@b.com", label="Tech"),  # also labeled
+        _make_message("9", "Z", "z@z.com", label="Tech"),  # inbox-only
+    ]
+    index, skip_ids, stats = _assemble(train, skip, set(), tmp_path)
+    assert skip_ids == {"1", "9"}
+
+
+def test_assemble_drops_labeled_from_skip_votes(tmp_path):
+    """The overlap id is kept as a labeled example (not a __skip__ vote), and
+    n_dropped reports how many were dropped."""
+    train = [_make_message("1", "A", "a@b.com", label="Tech")]
+    skip = [
+        _make_message("1", "A", "a@b.com", label="Tech"),  # dropped from skip
+        _make_message("9", "Z", "z@z.com", label="Tech"),  # kept as skip
+    ]
+    index, skip_ids, stats = _assemble(train, skip, set(), tmp_path)
+    assert stats.n_train == 1
+    assert stats.n_skip == 1
+    assert stats.n_dropped == 1
+    # id "1" carries its real label; only "9" became a __skip__ vote.
+    assert index.labels == ["Tech", SKIP_LABEL]
+
+
+def test_assemble_no_overlap_reports_zero_dropped(tmp_path):
+    train = [_make_message("1", "A", "a@b.com", label="Tech")]
+    skip = [_make_message("9", "Z", "z@z.com", label="Tech")]
+    index, skip_ids, stats = _assemble(train, skip, set(), tmp_path)
+    assert stats.n_dropped == 0
+
+
+def test_assemble_empty_skip(tmp_path):
+    """No skip store: index is the training set, skip_ids is empty."""
+    train = [
+        _make_message("1", "A", "a@b.com", label="Tech"),
+        _make_message("2", "B", "c@d.com", label="Travel"),
+    ]
+    index, skip_ids, stats = _assemble(train, [], set(), tmp_path)
+    assert stats.n_train == 2
+    assert stats.n_skip == 0
+    assert skip_ids == set()
+    assert index.labels == ["Tech", "Travel"]
+
+
+def test_assemble_index_has_one_row_per_id(tmp_path):
+    """End-to-end: after dedup, an overlapping id has a single, correctable row
+    -- no orphaned vote from a message living in both stores."""
+    train = [_make_message("1", "A", "a@b.com", label="Tech")]
+    skip = [_make_message("1", "A", "a@b.com", label="Tech")]  # same id
+    index, skip_ids, stats = _assemble(train, skip, set(), tmp_path)
+    assert len(index) == 1
+    index.add("1", np.ones(4, dtype=np.float32), "Travel")
     assert index.labels == ["Travel"]
     assert len(index) == 1

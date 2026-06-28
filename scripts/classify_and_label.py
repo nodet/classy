@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 from gmail_classifier.auth import get_credentials, get_gmail_service
-from gmail_classifier.classifier import Action, SKIP_LABEL
+from gmail_classifier.classifier import Action
 from gmail_classifier.config import excluded_labels
 from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
@@ -28,8 +28,7 @@ from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.memory import log_mem, trim_memory
 from gmail_classifier.storage import MessageStore
-from gmail_classifier.training import build_training_data, exclude_labeled_from_skip
-from gmail_classifier.training_index import TrainingIndex
+from gmail_classifier.training import assemble_training_index
 
 PUBSUB_TOPIC = "projects/classy-498012/topics/gmail-notifications"
 PUBSUB_SUBSCRIPTION = "projects/classy-498012/subscriptions/gmail-notifications-sub"
@@ -108,54 +107,40 @@ def main():
         print("No training messages found.")
         sys.exit(1)
 
-    # Exclude labels
     excluded = set(excluded_labels())
     if excluded:
-        train_messages = [m for m in train_messages if m.labels and m.labels[0] not in excluded]
         print(f"  Excluded labels: {', '.join(sorted(excluded))}")
 
-    print(f"  {len(train_messages)} training messages")
-
-    # Load skip examples
+    # Load skip examples (the inbox sample used as __skip__ negatives)
     skip_messages = []
-    skip_ids = set()
     skip_path = Path(args.skip_db)
     if skip_path.exists():
         skip_store = MessageStore(args.skip_db)
         skip_messages = skip_store.load_all()
         skip_store.close()
-        # skip_ids keeps every sampled inbox id (incl. ones that are also
-        # labeled) so the live path won't re-classify an already-seen message.
-        skip_ids = {m.id for m in skip_messages}
-
-        # But labeled wins over skip for *training*: drop skip examples that
-        # already carry a user label so they don't add a duplicate,
-        # contradictory __skip__ vote to the KNN (and orphan the labeled row).
-        n_before = len(skip_messages)
-        skip_messages = exclude_labeled_from_skip(skip_messages, train_messages)
-        n_dropped = n_before - len(skip_messages)
-        for m in skip_messages:
-            m.labels = [SKIP_LABEL]
-        note = f" ({n_dropped} also labeled, kept as labeled)" if n_dropped else ""
-        print(f"  {len(skip_messages)} skip examples{note}")
     log_mem("startup: after skip DB load")
 
-    # Build training index (with embedding cache for fast startup)
-    all_train_messages = train_messages + skip_messages
+    # Build the runtime index (config exclusion + labeled-wins-over-skip dedup +
+    # cache-backed embedding) -- the assembly logic lives in training so it is
+    # unit-testable apart from this I/O shell.
     cache_path = Path(args.training_db).parent / "embeddings.db"
     cache = EmbeddingCache(str(cache_path))
     print("Embedding training data...")
     embedder = Embedder()
     log_mem("startup: after Embedder() load")
-    train_embeddings, train_labels, train_ids = build_training_data(
-        all_train_messages, embedder=embedder, cache=cache,
+    index, skip_ids, stats = assemble_training_index(
+        train_messages, skip_messages,
+        excluded=excluded, embedder=embedder, cache=cache,
     )
     cache.close()
     log_mem("startup: after build_training_data")
-    del all_train_messages, train_messages, skip_messages
+    print(f"  {stats.n_train} training messages")
+    note = f" ({stats.n_dropped} also labeled, kept as labeled)" if stats.n_dropped else ""
+    print(f"  {stats.n_skip} skip examples{note}")
+    del train_messages, skip_messages
     trim_memory()
     log_mem("startup: after del + malloc_trim")
-    print(f"  {train_embeddings.shape[0]} embeddings, {train_embeddings.shape[1]} dimensions")
+    print(f"  {index.embeddings.shape[0]} embeddings, {index.embeddings.shape[1]} dimensions")
 
     # Connect to Gmail
     print("Authenticating...")
@@ -167,8 +152,6 @@ def main():
 
     # Build label registry (refreshes automatically on new labels)
     registry = LabelRegistry(client, excluded=excluded)
-
-    index = TrainingIndex(train_embeddings, train_labels, train_ids)
 
     if args.mode == "pubsub":
         _run_pubsub_mode(args, client, _credentials, embedder, index,
