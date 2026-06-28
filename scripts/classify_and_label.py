@@ -315,8 +315,18 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         backoff=0,
         subscriber=_make_subscriber(),
     )
-    while True:
-        state = run_iteration(state, deps)
+    try:
+        while True:
+            state = run_iteration(state, deps)
+    finally:
+        # Close the gRPC channel deterministically on shutdown (SIGTERM ->
+        # SystemExit). Otherwise its __del__ finalizer fires during interpreter
+        # teardown and races a threading lock, printing a harmless but noisy
+        # traceback.
+        try:
+            state.subscriber.close()
+        except Exception:
+            pass
 
 
 def _check_inbox(args, client, embedder, index, registry, skip_ids,
