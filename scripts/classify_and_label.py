@@ -26,7 +26,7 @@ from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.history_processor import process_history_events
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
-from gmail_classifier.memory import log_mem, trim_memory
+from gmail_classifier.memory import log_mem, rss_mb, trim_memory
 from gmail_classifier.storage import MessageStore
 from gmail_classifier.training import assemble_training_index
 
@@ -204,6 +204,9 @@ def _process_events(events, args, client, embedder, index, registry,
         registry=registry,
         ignore_ids=self_labeled,
     )
+    # RSS captured *before* the next step and before any trim, so a spike is
+    # attributed to the step that caused it (see the breakdown log below).
+    rss_after_changes = rss_mb()
 
     # Process new inbox messages
     results = process_history_events(
@@ -220,6 +223,7 @@ def _process_events(events, args, client, embedder, index, registry,
         dry_run=args.dry_run,
         registry=registry,
     )
+    rss_after_classify = rss_mb()
 
     # Print results (only if there's something to report)
     if movements or results:
@@ -251,6 +255,14 @@ def _process_events(events, args, client, embedder, index, registry,
     # nothing to show; logging then would print a bare [mem] line with no
     # preceding result -- a confusing duplicate.
     if movements or results:
+        # Per-step RSS breakdown so a spike is pinned to label-changes vs
+        # classification vs event volume, rather than guessed at. Printed
+        # before the trim (which the next line performs) so the peak is visible.
+        def _fmt(x):
+            return f"{x:.0f}MB" if x is not None else "n/a"
+        print(f"{now()} [mem] batch: {len(events)} events, "
+              f"after label-changes={_fmt(rss_after_changes)}, "
+              f"after classify={_fmt(rss_after_classify)}", flush=True)
         # Hand back the heap a heavy message (big HTML parse + embed) just
         # grew, so RSS falls back to idle instead of ratcheting to the
         # worst-case peak.
