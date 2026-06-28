@@ -29,7 +29,7 @@ reauth: ## Re-authenticate with Gmail (opens browser for OAuth consent)
 	uv run python -c "from gmail_classifier.auth import get_credentials; get_credentials()"
 
 fetch-training: ## Fetch labeled messages from Gmail (see docs/gmail-setup.md)
-	uv run python scripts/fetch_training_data.py
+	uv run python scripts/fetch_training_data.py --exclude-labels XLC XLE XLCap
 
 fetch-inbox: ## Fetch recent inbox messages for dry-run classification
 	uv run python scripts/fetch_inbox.py

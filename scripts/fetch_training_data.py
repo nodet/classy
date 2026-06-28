@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--db", default="data/training.db", help="SQLite database path")
     parser.add_argument("--credentials", default="credentials", help="Credentials directory")
     parser.add_argument("--labels", nargs="*", help="Only fetch these label names (default: all user labels)")
+    parser.add_argument("--exclude-labels", nargs="*", default=[], help="Never fetch these label names")
     parser.add_argument("--max-per-label", type=int, default=500, help="Max messages per label (default: 500, 0=all)")
     args = parser.parse_args()
 
@@ -44,6 +45,11 @@ def main():
             print(f"  Warning: labels not found: {skipped}")
     else:
         labels_to_fetch = all_labels
+
+    excluded = set(args.exclude_labels)
+    if excluded:
+        labels_to_fetch = [(lid, name) for lid, name in labels_to_fetch if name not in excluded]
+        print(f"  Excluding labels: {', '.join(sorted(excluded))}")
 
     store = MessageStore(str(db_path))
 

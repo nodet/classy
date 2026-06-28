@@ -25,6 +25,7 @@ from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.history_processor import process_history_events
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
+from gmail_classifier.memory import log_mem
 from gmail_classifier.storage import MessageStore
 from gmail_classifier.training import build_training_data
 from gmail_classifier.training_index import TrainingIndex
@@ -93,11 +94,14 @@ def main():
     )
     args = parser.parse_args()
 
+    log_mem("startup: before training DB load")
+
     # Load training data
     print("Loading training data...")
     train_store = MessageStore(args.training_db)
     train_messages = train_store.load_all()
     train_store.close()
+    log_mem("startup: after training DB load")
 
     if not train_messages:
         print("No training messages found.")
@@ -123,6 +127,7 @@ def main():
         for m in skip_messages:
             m.labels = [SKIP_LABEL]
         print(f"  {len(skip_messages)} skip examples")
+    log_mem("startup: after skip DB load")
 
     # Build training index (with embedding cache for fast startup)
     all_train_messages = train_messages + skip_messages
@@ -130,16 +135,19 @@ def main():
     cache = EmbeddingCache(str(cache_path))
     print("Embedding training data...")
     embedder = Embedder()
+    log_mem("startup: after Embedder() load")
     train_embeddings, train_labels, train_ids = build_training_data(
         all_train_messages, embedder=embedder, cache=cache,
     )
     cache.close()
+    log_mem("startup: after build_training_data")
     del all_train_messages, train_messages, skip_messages
     try:
         import ctypes
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except OSError:
         pass  # not on Linux (macOS has no malloc_trim)
+    log_mem("startup: after del + malloc_trim")
     print(f"  {train_embeddings.shape[0]} embeddings, {train_embeddings.shape[1]} dimensions")
 
     # Connect to Gmail
@@ -276,6 +284,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         )
 
     print(f"\nReady (pubsub mode). Waiting for notifications...\n")
+    log_mem("steady-state: pubsub loop ready")
 
     dots = [False]  # mutable heartbeat flag shared with _process_events
 
