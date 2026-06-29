@@ -171,6 +171,26 @@ def test_empty_pull_while_healthy_stays_healthy():
     assert client.get_history_calls == []  # nothing to fetch
 
 
+def test_idle_empty_pull_trims_memory(monkeypatch):
+    """An idle (empty) pull must trim glibc's free-list back to the OS, or RSS
+    ratchets toward the worst-case peak over a quiet stretch (no batch runs to
+    trigger the post-batch trim). Guards the swapless-VM memory fix."""
+    import gmail_classifier.pubsub_loop as loop
+
+    calls = []
+    monkeypatch.setattr(loop, "trim_memory", lambda: calls.append(1))
+
+    client = FakeClient()
+    sub = FakeSubscriber(actions=[[]])  # empty, healthy
+    deps, _ = make_deps(client, lambda: sub)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+
+    assert calls == [1], "idle empty pull should call trim_memory exactly once"
+
+
 # --------------------------------------------------------------------------
 # Case 3: old subscriber closed + new one created on retry.
 # --------------------------------------------------------------------------

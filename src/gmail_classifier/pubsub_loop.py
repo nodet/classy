@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from gmail_classifier.memory import rss_mb
+from gmail_classifier.memory import rss_mb, trim_memory
 from gmail_classifier.models import HistoryExpiredError
 
 INITIAL_BACKOFF = 5
@@ -124,6 +124,12 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
             deps.log("Watch renewed")
 
         if not notifications:
+            # Hand glibc's free-list back to the OS on idle pulls too. Each
+            # gRPC pull() allocates buffers that Python frees but glibc retains
+            # on a swapless VM; with no batch to trigger trim_memory(), RSS
+            # ratchets toward the worst-case peak (~600MB) over a quiet stretch.
+            # Trimming here keeps idle steady-state flat (~250MB).
+            trim_memory()
             return LoopState(history_id, expiration, backoff, subscriber)
 
         # Fallback pointer if the history response carries no id of its own.
