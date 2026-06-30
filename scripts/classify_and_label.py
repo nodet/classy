@@ -26,7 +26,7 @@ from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.history_processor import process_history_events
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
-from gmail_classifier.memory import log_mem, trim_memory
+from gmail_classifier.memory import trim_memory
 from gmail_classifier.storage import MessageStore
 from gmail_classifier.training import assemble_training_index
 
@@ -39,8 +39,7 @@ MAX_LINE = 130
 
 def now():
     """Timestamp prefix for log lines, with live RSS so we can watch
-    memory track per-message processing over time. Shared with the [mem]
-    checkpoints (see memory.log_prefix) so the two line up in the log."""
+    memory track per-message processing over time (see memory.log_prefix)."""
     from gmail_classifier.memory import log_prefix
     return log_prefix()
 
@@ -109,14 +108,12 @@ def main():
     args = parser.parse_args()
 
     print(f"gmail-classifier version: {deployed_version()}", flush=True)
-    log_mem("startup: before training DB load")
 
     # Load training data
     print("Loading training data...")
     train_store = MessageStore(args.training_db)
     train_messages = train_store.load_all()
     train_store.close()
-    log_mem("startup: after training DB load")
 
     if not train_messages:
         print("No training messages found.")
@@ -133,7 +130,6 @@ def main():
         skip_store = MessageStore(args.skip_db)
         skip_messages = skip_store.load_all()
         skip_store.close()
-    log_mem("startup: after skip DB load")
 
     # Build the runtime index (config exclusion + labeled-wins-over-skip dedup +
     # cache-backed embedding) -- the assembly logic lives in training so it is
@@ -142,19 +138,16 @@ def main():
     cache = EmbeddingCache(str(cache_path))
     print("Embedding training data...")
     embedder = Embedder()
-    log_mem("startup: after Embedder() load")
     index, skip_ids, stats = assemble_training_index(
         train_messages, skip_messages,
         excluded=excluded, embedder=embedder, cache=cache,
     )
     cache.close()
-    log_mem("startup: after build_training_data")
     print(f"  {stats.n_train} training messages")
     note = f" ({stats.n_dropped} also labeled, kept as labeled)" if stats.n_dropped else ""
     print(f"  {stats.n_skip} skip examples{note}")
     del train_messages, skip_messages
     trim_memory()
-    log_mem("startup: after del + malloc_trim")
     print(f"  {index.embeddings.shape[0]} embeddings, {index.embeddings.shape[1]} dimensions")
 
     # Connect to Gmail
@@ -283,7 +276,6 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         )
 
     print(f"\nReady (pubsub mode). Waiting for notifications...\n")
-    log_mem("steady-state: pubsub loop ready")
 
     def _log(message, lead_newline=False):
         prefix = "\n" if lead_newline else ""
@@ -363,7 +355,6 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids,
     # Heavy parse+embed work just ran; return the heap to the OS (see
     # _process_events).
     trim_memory()
-    log_mem("after inbox batch")
 
 
 def _sigterm_handler(signum, frame):

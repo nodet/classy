@@ -1,4 +1,3 @@
-import time
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
@@ -10,10 +9,6 @@ from gmail_classifier.embeddings import Embedder
 from gmail_classifier.models import Message
 from gmail_classifier.preprocessing import build_text_representation, preprocess_email_body
 from gmail_classifier.training_index import TrainingIndex
-
-
-def _trace(msg: str):
-    print(f"  [trace] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
 def _message_text(msg: Message) -> str:
@@ -124,8 +119,6 @@ def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[s
     ready for embedding, each label is the first label of the message,
     and each id is the message ID. Messages with no labels are skipped.
     """
-    _trace(f"prepare_texts: enter ({len(messages)} messages)")
-    t0 = time.monotonic()
     texts = []
     labels = []
     ids = []
@@ -135,7 +128,6 @@ def prepare_texts(messages: List[Message]) -> Tuple[List[str], List[str], List[s
         texts.append(_message_text(msg))
         labels.append(msg.labels[0])
         ids.append(msg.id)
-    _trace(f"prepare_texts: exit ({len(texts)} texts, {time.monotonic() - t0:.2f}s)")
     return texts, labels, ids
 
 
@@ -152,22 +144,12 @@ def build_training_data(
     If cache is provided, cached embeddings are used for known IDs and
     newly computed embeddings are stored back into the cache.
     """
-    _trace(f"build_training_data: enter ({len(messages)} messages, cache={'yes' if cache else 'no'})")
-    t0 = time.monotonic()
-
     if embedder is None:
-        _trace("build_training_data: creating Embedder...")
-        t_emb = time.monotonic()
         embedder = Embedder()
-        _trace(f"build_training_data: Embedder created ({time.monotonic() - t_emb:.2f}s)")
 
     if cache is None:
         texts, labels, ids = prepare_texts(messages)
-        _trace(f"build_training_data: embed_batch ({len(texts)} texts, no cache)...")
-        t_emb = time.monotonic()
         embeddings = embedder.embed_batch(texts)
-        _trace(f"build_training_data: embed_batch done ({time.monotonic() - t_emb:.2f}s)")
-        _trace(f"build_training_data: exit ({time.monotonic() - t0:.2f}s total)")
         return embeddings, labels, ids
 
     # Labels and ids are cheap; the expensive BeautifulSoup text prep is
@@ -177,20 +159,8 @@ def build_training_data(
     ids = [m.id for m in labeled]
 
     # Look up cached embeddings
-    _trace(f"build_training_data: cache.get_batch ({len(ids)} ids)...")
-    t_cache = time.monotonic()
     cached = cache.get_batch(ids)
-
-    # Count misses from positions, not len(ids) - len(cached): a message in
-    # both the training and skip stores appears twice in `ids`, while `cached`
-    # is keyed by unique id, so the subtraction would over-report. `to embed`
-    # below is the true count of messages we must embed.
     miss_indices = [i for i, mid in enumerate(ids) if mid not in cached]
-    n_dupes = len(ids) - len(set(ids))
-    dup_note = f", {n_dupes} duplicate ids" if n_dupes else ""
-    _trace(f"build_training_data: cache hits={len(cached)}, "
-           f"to embed={len(miss_indices)}{dup_note} "
-           f"({time.monotonic() - t_cache:.2f}s)")
 
     if miss_indices:
         # Embed misses one at a time -- the same path live mail follows
@@ -198,23 +168,16 @@ def build_training_data(
         # so startup never builds a large transient batch. Each vector is
         # prepped, embedded, and cached individually; a crash mid-startup
         # leaves completed work in the cache.
-        _trace(f"build_training_data: embedding {len(miss_indices)} misses one at a time...")
-        t_emb = time.monotonic()
         for i in miss_indices:
             mid = ids[i]
             vector = embedder.embed(_message_text(labeled[i]))
             cache.put(mid, vector)
             cached[mid] = vector
-        _trace(f"build_training_data: embedded {len(miss_indices)} misses ({time.monotonic() - t_emb:.2f}s)")
 
     # Assemble full embeddings array in order (all vectors now in `cached`)
-    _trace(f"build_training_data: assembling {len(ids)} vectors...")
-    t_asm = time.monotonic()
     dim = next(iter(cached.values())).shape[0]
     embeddings = np.empty((len(ids), dim), dtype=np.float32)
     for i, mid in enumerate(ids):
         embeddings[i] = cached[mid]
-    _trace(f"build_training_data: assembly done ({time.monotonic() - t_asm:.2f}s)")
 
-    _trace(f"build_training_data: exit ({time.monotonic() - t0:.2f}s total)")
     return embeddings, labels, ids

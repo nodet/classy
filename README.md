@@ -225,8 +225,7 @@ embed the newly-fetched messages at startup and can run out of memory.
 [Google Cloud console](https://console.cloud.google.com/compute/instancesDetail/zones/us-central1-a/instances/gmail-classifier?project=classy-498012)
 Access to the log: ``sudo journalctl -u gmail-classifier -f`` (or `make gcp-logs`).
 
-The service logs `[mem]` RSS checkpoints at each startup stage and after each
-processed batch, and prefixes every per-message line with current RSS, so memory
+The service prefixes every per-message log line with current RSS, so memory
 behavior is visible directly in the log. Expected steady-state is ~220 MB on the
 e2-micro; startup briefly peaks higher (transient, returned to the OS by
 `malloc_trim`).
