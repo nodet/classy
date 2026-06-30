@@ -190,16 +190,9 @@ def _run_poll_mode(args, client, embedder, index,
 
 
 def _process_events(events, args, client, embedder, index, registry,
-                    skip_ids, self_labeled, dots):
-    """Handle a batch of history events: label changes, classification, output.
-
-    ``dots`` is a single-element list used as a mutable flag tracking whether
-    an idle "." heartbeat was the last thing printed (so we can emit a newline
-    before real output).
-    """
+                    skip_ids, self_labeled):
+    """Handle a batch of history events: label changes, classification, output."""
     if not events:
-        print(".", end="", flush=True)
-        dots[0] = True
         return
 
     # Process label changes (update training/skip DBs + in-memory index)
@@ -236,11 +229,6 @@ def _process_events(events, args, client, embedder, index, registry,
         registry=registry,
     )
 
-    # Print results (only if there's something to report)
-    if movements or results:
-        if dots[0]:
-            print()  # newline after dots
-            dots[0] = False
     for src, dst, count in movements:
         print(f"{now()} {count} {'email' if count == 1 else 'emails'} moved from {src} to {dst}")
     for r in results:
@@ -261,16 +249,11 @@ def _process_events(events, args, client, embedder, index, registry,
     training_store.close()
     skip_store.close()
 
-    # Only reclaim + report when the batch did real work. Echoed events (e.g.
-    # Gmail re-notifying us about a label we just applied) reach here with
-    # nothing to show; logging then would print a bare [mem] line with no
-    # preceding result -- a confusing duplicate.
+    # Only reclaim when the batch did real work. Hand back the heap a heavy
+    # message (big HTML parse + embed) just grew, so RSS falls back to idle
+    # instead of ratcheting to the worst-case peak.
     if movements or results:
-        # Hand back the heap a heavy message (big HTML parse + embed) just
-        # grew, so RSS falls back to idle instead of ratcheting to the
-        # worst-case peak.
         trim_memory()
-        log_mem("after events batch")
 
 
 def _run_pubsub_mode(args, client, credentials, embedder, index,
@@ -302,8 +285,6 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     print(f"\nReady (pubsub mode). Waiting for notifications...\n")
     log_mem("steady-state: pubsub loop ready")
 
-    dots = [False]  # mutable heartbeat flag shared with _process_events
-
     def _log(message, lead_newline=False):
         prefix = "\n" if lead_newline else ""
         print(f"{prefix}{now()} {message}")
@@ -316,7 +297,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
             args, client, embedder, index, registry, skip_ids, self_labeled),
         process_events=lambda events: _process_events(
             events, args, client, embedder, index, registry,
-            skip_ids, self_labeled, dots),
+            skip_ids, self_labeled),
         log=_log,
     )
 
@@ -346,13 +327,11 @@ def _check_inbox(args, client, embedder, index, registry, skip_ids,
     from gmail_classifier.inbox_check import process_inbox
 
     # Peek at whether there's anything new before opening the store, so the
-    # idle case stays a cheap "." heartbeat with no DB handle.
+    # idle case stays cheap with no DB handle.
     inbox_ids = client.list_message_ids(label_id="INBOX", max_results=args.max_messages)
     if not any(mid not in skip_ids for mid in inbox_ids):
-        print(".", end="", flush=True)
         return
 
-    print()  # newline after any dots
     skip_store = MessageStore(args.skip_db)
     try:
         results = process_inbox(
