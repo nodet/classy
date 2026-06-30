@@ -265,14 +265,78 @@ startup.
 
 ## Verification
 
-- Unit: `bootstrap.py` with a fake client/embedder — builds the right index, **skips
-  already-embedded ids on a second run** (resumability), excludes XL*, one-at-a-time embed.
+All unit tests drive fakes (fake Gmail client recording calls, fake embedder, in-memory
+SQLite) — no network, no FastEmbed — mirroring the existing `test_pubsub_loop.py` /
+`test_training.py` style. Grouped by the behavior each guards; the two **safety** groups
+(read-only boundary, maturity gate) are the highest priority because they gate
+irreversible archive actions on a fresh mailbox.
+
+### Unit — `state_store.py`
+- `upsert_label` is **last-write-wins** on `message_id` (second upsert overwrites).
+- `iter_index()` join yields only ids present in **both** `embeddings` and `labels`; an
+  embedded id with no label row (or vice versa) is **excluded** — guards the orphaned-row
+  class of bug structurally.
+- `get_fingerprint`/`set_fingerprint` round-trip; a fresh store returns `None`.
+- empty store reports empty (drives the "fresh VM → bootstrap" branch).
+
+### Unit — `bootstrap.py`
+- Builds the right index from a fake client/embedder (ids → vectors → labels as expected).
+- **Resumability:** a second run **skips ids already in `embeddings`** — assert
+  `get_message` is *not* called for cached ids (not merely that the result is the same).
+- Excludes XL* labels at the source (no excluded-label rows reach `labels`).
+- **One-at-a-time:** the raw message for id *i* is released before id *i+1* is fetched —
+  assert no `embed_batch`/bulk path and at most one live body held (e.g. fake records max
+  concurrent un-discarded messages == 1).
+- **Round-robin ordering:** with labels A/B/C each having ≥R messages, the order of
+  `cache.put` cycles A,B,C,A,B,C… (not A,A,…,B,B,…) — so after R rounds every label has ~R
+  examples and crosses the ≥5 eligibility line (`classifier.py:98`) together, not serially.
+- **Skip pool front-loaded:** the first ~50 persisted rows are skip seeds, *before* the
+  round-robin proper begins.
+- **Labeled-wins-over-skip at source:** an INBOX id that also carries a user label is
+  recorded with that **label**, never `__skip__` — `labels` never holds `__skip__` for it.
+  (The load-time guard `exclude_labeled_from_skip` is already shipped + tested in
+  `test_training.py`; this asserts the bootstrap applies the same rule at the source so the
+  conflict never reaches the table.)
+
+### Unit — startup dispatch (fingerprint)
+- **Match** → load index from the join, `client.get_message` **never called** (no fetch).
+- **Mismatch** → store wiped, bootstrap runs, new fingerprint written.
+- **Empty store** → bootstrap runs (fingerprint written on completion).
+
+### Unit — read-only boundary (cold path safety)
+- Bootstrap **never calls `apply_label`/archive** on existing inbox mail — assert
+  `client.apply_label` is not called during bootstrap, even for messages that would
+  classify with high confidence. (Guards against archiving the pre-existing backlog — the
+  current `_check_inbox` labeling behavior must be removed from the cold path.)
+- `client.watch()` is invoked **before the first `get_message`** (ordering assertion), so
+  the pinned `historyId` boundary reflects start-of-service, not end-of-bootstrap.
+- A notification whose `historyId` is **at-or-before** the pinned boundary is treated as
+  existing (not labeled); one **after** it is eligible (subject to the maturity gate).
+
+### Unit — maturity gate
+- Below threshold (**<20/label OR skip pool not yet loaded**), a new (post-boundary)
+  message is classified but **not** labeled/archived **regardless of confidence**.
+- The gate requires **both** conditions: a mature label set with the skip pool *not* loaded
+  still blocks labeling (guards the spurious-high-confidence over-labeling described in
+  "Two gates").
+- Once **≥20/label AND skip pool loaded**, a high-confidence new message **is** labeled.
+
+### Unit — progressive interleave
+- A pending notification is **serviced between bootstrap batches**, not after the whole
+  corpus — drive the loop with a fake where a notification arrives mid-bootstrap and assert
+  it is processed before bootstrap completes (proves the single-threaded interleave, no
+  starvation).
+
+### Memory / Behavior / Deploy (as before)
 - Memory: instrumented bootstrap on the VM shows peak materially below the old ~606 MB (no
-  +447 MB corpus load); steady-state ~220 MB unchanged.
+  +447 MB corpus load); steady-state ~220 MB unchanged. (Idle RSS already held flat by the
+  shipped idle-trim fix `be24c59`.)
 - Behavior: a correction still shifts a prediction (existing live-adaptation guarantee);
   full suite green.
 - Deploy: on a freshly created VM, `gcp-create → gcp-deploy (code+creds) → gcp-start`
-  produces a working classifier with **no DB upload**; restart is fast (reads derived store).
+  produces a working classifier with **no DB upload**; a redeploy (code change, ML
+  unchanged) **preserves `data/state.db`** across the `--exclude='data'` untar-over; restart
+  is fast (reads derived store, no fetch).
 
 ## Relationship to prior plans
 
