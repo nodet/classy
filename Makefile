@@ -106,8 +106,8 @@ gcp-stop: ## Stop the classifier service on GCP
 gcp-restart: ## Restart the classifier service on GCP
 	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl restart gmail-classifier"
 
-gcp-status: ## Show service status on GCP
-	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl status gmail-classifier"
+gcp-status: ## Show service status on GCP (incl. deployed code version)
+	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="echo \"Deployed version: \$$(cat /opt/gmail-classifier/.deployed_version 2>/dev/null || echo unknown)\"; echo; sudo systemctl status gmail-classifier"
 
 gcp-logs: ## Tail service logs on GCP (last 20 + follow)
 	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo journalctl -u gmail-classifier -n 20 -f"

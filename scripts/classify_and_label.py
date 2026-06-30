@@ -52,6 +52,20 @@ def truncate(line):
     return line[:MAX_LINE - 6] + " [...]"
 
 
+def deployed_version():
+    """Code version stamped at deploy time (see scripts/gcp-deploy.sh).
+
+    The VM has no .git, so gcp-deploy writes `git describe` into
+    `.deployed_version` at the repo root. Returns "unknown" if absent (e.g. a
+    local run straight from a checkout, where git itself is the source of truth).
+    """
+    stamp = Path(__file__).resolve().parent.parent / ".deployed_version"
+    try:
+        return stamp.read_text().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Classify inbox messages and apply labels"
@@ -94,6 +108,7 @@ def main():
     )
     args = parser.parse_args()
 
+    print(f"gmail-classifier version: {deployed_version()}", flush=True)
     log_mem("startup: before training DB load")
 
     # Load training data

@@ -75,6 +75,13 @@ fi
 # --- Sync code ---
 
 echo "Syncing code..."
+
+# Stamp the running code version. The VM gets no .git (excluded below), so
+# capture it here where the repo exists: a tag if exactly on one, otherwise the
+# short commit id, with a -dirty suffix if tracked files were modified.
+# gcp-status reads this file back from the VM.
+git describe --tags --always --dirty 2>/dev/null > .deployed_version || echo "unknown" > .deployed_version
+
 TARBALL="/tmp/gmail-classifier-code.tar.gz"
 tar czf "$TARBALL" \
     --no-mac-metadata \
