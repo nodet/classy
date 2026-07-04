@@ -165,6 +165,7 @@ Minimum `meta` keys:
 state_schema_version
 ml_fingerprint
 excluded_labels_hash
+gmail_account_id              # Gmail profile email/id, for seed-state safety
 bootstrap_status              # absent | in_progress | complete
 bootstrap_boundary_history_id
 last_processed_history_id
@@ -187,7 +188,8 @@ embeddings; one file = one connection, atomic, trivial to reset.)
 ### Startup logic (`scripts/classify_and_label.py:main`)
 
 1. Open the derived store.
-2. Validate `state_schema_version`, `ml_fingerprint`, and `excluded_labels_hash`.
+2. Validate `state_schema_version`, `ml_fingerprint`, `excluded_labels_hash`, and
+   `gmail_account_id`.
    - If compatible and the store already has a usable index (`embeddings + id→label`),
      load it and enter the warm path.
    - If the ML fingerprint is incompatible, build `state.rebuild.db` from Gmail and
@@ -442,7 +444,7 @@ when it is stale or explicitly reset**:
 | **ML changed** (embedding model or `build_text_representation`) | Startup compares `meta.ml_fingerprint` to the current code. Mismatch ⇒ cached vectors are stale. Build `state.rebuild.db` from Gmail, validate counts/fingerprint, then atomically replace `state.db`. Only vectors are stale — carry the existing `last_processed_history_id` forward rather than re-pinning a fresh boundary, so live changes during the rebuild are not skipped. No silent wrong vectors. |
 | **Excluded-label config changed** | Startup compares `excluded_labels_hash` (checked independently of the ML fingerprint). Reuse all unchanged embeddings: remove now-excluded labels from the index and bootstrap only the newly-included labels' ids — no re-embed of retained ids. The two-phase rebuild path is a last-resort fallback only if incremental reconciliation proves too complex to implement safely, not the expected path. |
 | **History cursor expired** | Run a full sync/reconcile from Gmail: label registry, trainable label ids, labeled-message ids, skip sample, and `last_processed_history_id`. Do not fall back to inbox-only polling as the sole recovery. |
-| **Explicit reset** | `make gcp-reset-state` / `make reset-state` — stop, remove `state.db` plus SQLite sidecars (`state.db-wal`, `state.db-shm`, `state.rebuild.db*`), start → next boot bootstraps fresh. Legacy DBs are untouched. The escape hatch "just in case." |
+| **Explicit reset** | `make gcp-reset-state` / `make reset-state` — stop, remove `state.db` plus SQLite sidecars (`state.db-wal`, `state.db-shm`, `state.db-journal`, `state.rebuild.db*`), start → next boot bootstraps fresh. Legacy DBs are untouched. The escape hatch "just in case." |
 
 **Fingerprint:** a string or JSON object that includes at least:
 
@@ -549,9 +551,10 @@ deletes, or rewrites the other backend's database contents.
 The plan lands in six phases. The ordering is chosen so that **each phase ships on its own,
 keeps the service deployable at every step, and is gated by a concrete, testable outcome** —
 not just "code exists." Phase 1 is a pure refactor that changes *no* observable behavior; it
-only introduces the seam the later phases plug into. The `state` backend does not become
-reachable in production until Phase 3, and is not *safe* to point at a live mailbox until
-Phase 5. Each phase names the Verification group(s) that gate it (see "Verification").
+only introduces the seam the later phases plug into. The `state` backend is not wired until
+Phase 3, and then only for seeded/tested warm starts; it is not *safe* to point at a live
+mailbox until Phase 5, and not exposed to deploy/ops until Phase 6. Each phase names the
+Verification group(s) that gate it (see "Verification").
 
 The through-line: **first make the current behavior expressible through the future
 architecture (Phase 1), then build the new backend behind that seam one safety property at a
@@ -591,40 +594,44 @@ can be reviewed and tested in isolation while legacy is still the only backend.
 
 **Done when:** legacy still restarts fresh-watch and never double-processes across a healthy
 run. *Gate:* **Unit — Pub/Sub / history cursor safety** (the ack-after-process ordering and
-crash-before-ack cases; the durable-cursor cases are asserted against the `state` adapter once
-it exists in Phase 3), plus the existing `test_pubsub_loop.py` as a regression net.
+legacy no-regression cases; the crash-replay/durable-cursor cases are asserted against the
+`state` adapter once it exists in Phase 3), plus the existing `test_pubsub_loop.py` as a
+regression net.
 
 ### Phase 3 — `state_store.py` + warm path (state backend loads, but does not bootstrap)
 
-Make the `state` backend real for the *already-populated* case only. No fetch-from-Gmail yet —
-a `state.db` is seeded for tests (and optionally via `--seed-state`), so this phase is fully
-testable without a mailbox.
+Make the `state` backend real for the *already-populated* case only. No cold bootstrap yet — a
+`state.db` is seeded for tests (and optionally via `--seed-state`) with an explicit
+`last_processed_history_id`, so this phase is fully testable without a mailbox-sized corpus.
+This phase does not add a deploy target or recommend `state` for a live mailbox; that waits
+until the cold-path and maturity-safety phases land.
 
 - `state_store.py`: the `state.db` schema (`embeddings`/`labels`/`pending_new`/`meta`), the
   join-based `iter_index()`/`load_index()`, `known_ids`/`skip_vote_ids`, `upsert_label`/
   `upsert_embedding`, cursor + fingerprint + meta helpers. Opens only `state.db`/
   `state.rebuild.db`.
 - Startup dispatch on the `state` path: validate `state_schema_version` / `ml_fingerprint` /
-  `excluded_labels_hash`; warm path loads the index from the join and processes history from
-  the persisted `last_processed_history_id`; ML mismatch triggers the two-phase
-  `state.rebuild.db` swap (carrying the cursor forward); exclusion-only change takes the cheap
-  reconcile path. Wire the `state` adapter's durable cursor into the Phase 2 ack ordering.
+  `excluded_labels_hash` / `gmail_account_id`; warm path loads the index from the join and
+  processes history from the persisted `last_processed_history_id`; ML/config mismatches are
+  detected and fail closed rather than loading stale state. The Gmail-backed
+  rebuild/reconcile implementation lands in Phase 4. Wire the `state` adapter's durable cursor
+  into the Phase 2 ack ordering.
 - Live adaptation through the seam: on `state`, `upsert_label`/`upsert_skip` store only
   id/label/vector, no body.
 
 **Done when:** a seeded `state.db` boots warm, classifies, learns from corrections, and
-survives a restart with no re-fetch; ML/config changes take the correct (rebuild vs reconcile)
-path. *Gate:* **Unit — `state_store.py`**, **Unit — startup dispatch**, the "State backend
+survives a restart with no re-fetch; ML/config mismatches are detected and do not load stale
+state. *Gate:* **Unit — `state_store.py`**, **Unit — startup dispatch**, the "State backend
 opens only its own files" / "Presence-independence" / "Storage seam preserves legacy needs"
 checks under **Unit — backend isolation**, and the durable-cursor cases under **Unit — Pub/Sub
 / history cursor safety**.
 
-### Phase 4 — `bootstrap.py` cold path (fetch from Gmail, read-only, resumable)
+### Phase 4 — `bootstrap.py` cold/rebuild path (fetch from Gmail, read-only, resumable)
 
-Add the fresh-VM bootstrap, but *blocking* (finish before going live) — the simplest correct
-cold path. Progressive interleave and the maturity gate come in Phase 5; keeping them separate
-means the irreversible-action safety (read-only boundary) is proven before the more intricate
-early-labeling logic lands.
+Add the Gmail-fetching state path: fresh-VM bootstrap, but *blocking* (finish before going
+live) — the simplest correct cold path. Progressive interleave and the maturity gate come in
+Phase 5; keeping them separate means the irreversible-action safety (read-only boundary) is
+proven before the more intricate early-labeling logic lands.
 
 - `bootstrap.py`: `watch()` **first** (pin the boundary + persist the cursor), then
   round-robin over labels + front-loaded skip pool, one-at-a-time fetch→embed→cache→discard,
@@ -632,9 +639,18 @@ early-labeling logic lands.
   the source.
 - **Read-only over pre-existing mail:** the cold path removes the labeling initial inbox check
   entirely — existing mail is only read to embed it, never labeled or archived.
+- Reuse the same fetch/embed primitives for ML-fingerprint rebuilds and excluded-label
+  reconciles: build `state.rebuild.db`, validate, carry the existing
+  `last_processed_history_id` forward, and reuse unchanged embeddings on exclusion-only
+  changes.
+- After the blocking bootstrap completes, process accumulated Gmail history from the persisted
+  boundary cursor before entering the normal loop. Do not reintroduce an inbox scan as the
+  catch-up path.
 
 **Done when:** a fresh (fake-client) bootstrap builds the right index, is resumable, holds one
-body at a time, and *never* labels/archives pre-existing mail. *Gate:* **Unit — `bootstrap.py`**
+body at a time, processes post-boundary mail that arrived during the blocking bootstrap via
+history replay, and *never* labels/archives pre-existing mail. An ML mismatch builds and swaps
+a validated `state.rebuild.db` while preserving the cursor. *Gate:* **Unit — `bootstrap.py`**
 and **Unit — read-only boundary (cold path safety)**.
 
 ### Phase 5 — Progressive interleave + maturity gate + `pending_new` (safe early responsiveness)
@@ -677,9 +693,10 @@ Phase 1 (seam, no behavior change) ──┬──> Phase 3 (state warm path) �
 Phase 2 (pull/ack split) ────────────┘
 ```
 
-Phases 1 and 2 are independent and can land in either order (both are legacy-only, behavior-
-preserving); Phase 3 depends on both. After Phase 1 the architecture is in place with no
-behavior change — that is the natural stopping point if the `state` backend is deferred.
+Phases 1 and 2 are independent and can land in either order (both are legacy-only; Phase 1 is
+behavior-preserving and Phase 2 preserves successful-run behavior while improving ack ordering);
+Phase 3 depends on both. After Phase 1 the architecture is in place with no behavior change —
+that is the natural stopping point if the `state` backend is deferred.
 
 ## Files
 
@@ -691,7 +708,7 @@ behavior change — that is the natural stopping point if the `state` backend is
   `state.db`/`state.rebuild.db`. One SQLite connection. May *reuse* `EmbeddingCache`'s
   vector-blob (de)serialization by importing the helper, but writes to its own file. Treat SQLite
   sidecars (`state.db-wal`, `state.db-shm`, and rebuild equivalents) as part of the state
-  backend's file set.
+  backend's file set, including rollback-journal sidecars if SQLite is not in WAL mode.
 - New `src/gmail_classifier/storage_backend.py` — the `StorageBackend` protocol (the seam
   above) plus `storage_legacy.py` adapting the existing `MessageStore`+`EmbeddingCache`. The
   `state_store`/`bootstrap` pair is the other implementation.
@@ -708,9 +725,9 @@ behavior change — that is the natural stopping point if the `state` backend is
   `watch()` first and bootstrap; **(e)** else load index from the join and process Gmail history
   from the persisted cursor. Legacy keeps `--training-db`/`--skip-db`; state uses `--state-db`.
 - `pubsub.py` / `pubsub_loop.py` — change pull/ack ownership so messages are acknowledged only
-  after history events are processed and `last_processed_history_id` is persisted. `pull()` returns
-  notifications plus ack ids; a separate `ack()` acknowledges them after successful processing.
-  Preserve the existing "backlog across outage" behavior.
+  after history events are processed and, on `state`, `last_processed_history_id` is persisted.
+  `pull()` returns notifications plus ack ids; a separate `ack()` acknowledges them after
+  successful processing. Preserve the existing "backlog across outage" behavior.
 - `label_change_handler.py` — persist through the `StorageBackend` seam instead of naming
   `MessageStore`: `backend.upsert_label(message, label_id, vec)` /
   `backend.upsert_skip(message, vec)`. On the legacy backend the adapter does today's
@@ -731,11 +748,13 @@ behavior change — that is the natural stopping point if the `state` backend is
   (`--exclude='data'`) and writes `--storage state` into the service config. Both rely on the
   `--exclude='data'` + untar-over behavior, which never deletes files absent from the archive —
   so **neither deploy removes or rewrites the other backend's database contents**. Optional
-  `--seed-state` to upload a prebuilt `state.db` and skip first boot, but not required and never
-  implicit.
+  `--seed-state` may upload a prebuilt `state.db` and skip first boot, but only if its meta
+  matches the current mailbox/config and includes a valid cursor; otherwise startup treats it as
+  invalid and bootstraps/rebuilds. It is never required and never implicit.
 - `Makefile` — add `reset-state` (local: stop, `rm -f data/state.db data/state.db-wal
-  data/state.db-shm data/state.rebuild.db data/state.rebuild.db-wal data/state.rebuild.db-shm`),
-  `gcp-reset-state` (same removal under `$INSTALL_DIR/data`, then start), and `gcp-state-status`
+  data/state.db-shm data/state.db-journal data/state.rebuild.db data/state.rebuild.db-wal
+  data/state.rebuild.db-shm data/state.rebuild.db-journal`), `gcp-reset-state` (same removal
+  under `$INSTALL_DIR/data`, then start), and `gcp-state-status`
   (active backend, schema/fingerprint/bootstrap status/index size/per-label counts/skip count/
   pending count/history cursor). See "Deployment: two backends, one deployed at a time" for the
   backend-selection targets (`gcp-deploy-legacy` / `gcp-deploy-state`).
@@ -825,8 +844,8 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   vector and stores no body/subject/sender.
 - **State deploy guard scope:** `gcp-deploy-state` succeeds with credentials present and no
   legacy DB files; `gcp-deploy-legacy` still fails fast when its required DBs are absent.
-- **`reset-state` scope:** deletes only `state.db`/`state.db-wal`/`state.db-shm` and
-  `state.rebuild.db*`; legacy files untouched.
+- **`reset-state` scope:** deletes only `state.db`/`state.db-wal`/`state.db-shm`/
+  `state.db-journal` and `state.rebuild.db*`; legacy files untouched.
 
 ### Unit — switching backends (cross-restart safety)
 - **Legacy cursor stays non-durable:** the legacy adapter may advance a cursor in memory inside
@@ -851,17 +870,20 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   process and one backend setting in the systemd unit.
 
 ### Unit — startup dispatch (schema/config/fingerprint)
-- **Match** → load index from the join, `client.get_message` **never called** (no fetch).
-- **ML mismatch** → build `state.rebuild.db`, validate it, then atomically swap; crash during
-  rebuild leaves old `state.db` untouched. The rebuilt store **carries the prior
+- **Match** (including `gmail_account_id`) → load index from the join, `client.get_message`
+  **never called** (no fetch).
+- **ML mismatch** → before Phase 4, fails closed rather than loading stale state; from Phase 4
+  onward, build `state.rebuild.db`, validate it, then atomically swap; crash during rebuild
+  leaves old `state.db` untouched. The rebuilt store **carries the prior
   `last_processed_history_id` forward** (assert the cursor is preserved, not re-pinned to a
   fresh watch id).
 - **Empty store** → call `watch()` first, persist boundary/cursor, bootstrap runs (fingerprint
   written on completion).
-- **Excluded-label mismatch** → now-excluded rows are removed or a two-phase rebuild is
-  triggered; newly-included labels are bootstrapped. Assert this takes the cheap reconcile
-  path (no full re-embed) since `excluded_labels_hash` is not in the fingerprint — an
-  exclusion-only change **does not** call `get_message`/`embed` for unchanged ids.
+- **Excluded-label mismatch** → before Phase 4, fails closed rather than loading stale state;
+  from Phase 4 onward, now-excluded rows are removed or a two-phase rebuild is triggered;
+  newly-included labels are bootstrapped. Assert this takes the cheap reconcile path (no full
+  re-embed) since `excluded_labels_hash` is not in the fingerprint — an exclusion-only change
+  **does not** call `get_message`/`embed` for unchanged ids.
 
 ### Unit — read-only boundary (cold path safety)
 - Bootstrap **never calls `apply_label`/archive** on existing inbox mail — assert
@@ -876,6 +898,8 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   replace that cursor with the new watch id and thereby skip backlog.
 - Warm restart runs **no labeling inbox check** — assert `apply_label`/archive is reached only
   via history replay, never via an inbox scan that could touch pre-boundary mail.
+- In the blocking Phase 4 path, post-boundary history accumulated during bootstrap is processed
+  after bootstrap from the persisted cursor, without an inbox scan.
 
 ### Unit — maturity gate
 - Below threshold (**label target not met OR skip pool not yet loaded**), a new post-boundary
@@ -891,10 +915,11 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   idempotently.
 
 ### Unit — Pub/Sub / history cursor safety
-- Pub/Sub notification is not acknowledged until events are processed and
+- Pub/Sub notification is not acknowledged until events are processed and, on `state`,
   `last_processed_history_id` is persisted.
-- Crash after processing but before ack is safe: redelivery replays history idempotently.
-- Crash before processing is safe: persisted cursor causes replay on restart.
+- Crash after processing but before ack is safe on `state`: redelivery replays history
+  idempotently.
+- Crash before processing is safe on `state`: persisted cursor causes replay on restart.
 - History expiration/404 schedules full sync/reconcile, not inbox-only fallback.
 - The Gmail watch is not filtered to INBOX; label-add/remove events outside INBOX still reach
   the service.
