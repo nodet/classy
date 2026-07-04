@@ -91,6 +91,13 @@ def process_label_changes(
     # Track movements: (source, destination) -> count
     movements = defaultdict(int)
 
+    # Collect in-memory index updates and apply them in one batch at the end.
+    # A bulk relabel (hundreds of messages in a single history batch) would
+    # otherwise call index.add() once per message, and each call reallocates the
+    # whole embedding matrix -- spiking RSS and fragmenting the heap. add_many
+    # does a single reallocation regardless of batch size.
+    index_updates: List[Tuple[str, "np.ndarray", str]] = []
+
     # Process each affected message
     for mid, changes in affected.items():
         added = changes["added"]
@@ -114,7 +121,7 @@ def process_label_changes(
             # Update in-memory index
             if index is not None and embedder is not None:
                 embedding = _embed_message(msg, embedder)
-                index.add(mid, embedding, label_name)
+                index_updates.append((mid, embedding, label_name))
 
             # Track the movement
             if removed:
@@ -141,7 +148,7 @@ def process_label_changes(
                 # Update in-memory index: remove from training, add as skip
                 if index is not None and embedder is not None:
                     embedding = _embed_message(msg, embedder)
-                    index.add(mid, embedding, SKIP_LABEL)
+                    index_updates.append((mid, embedding, SKIP_LABEL))
 
                 # Track the movement
                 removed_id = next(iter(removed))
@@ -151,6 +158,9 @@ def process_label_changes(
                 # Still has a user label (maybe a different one) — just remove old entry
                 # The labelsAdded event for the new label will handle re-adding
                 training_store.delete_messages([mid])
+
+    if index is not None and index_updates:
+        index.add_many(index_updates)
 
     return [(src, dst, count) for (src, dst), count in movements.items()]
 
