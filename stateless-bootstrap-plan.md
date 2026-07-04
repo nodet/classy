@@ -21,6 +21,84 @@ As a bonus this **eliminates the ~447 MB startup transient** (the raw-corpus `lo
 which was the last remaining memory fragility and the only reason the lightweight
 classifier was still on the table.
 
+## Two independent backends (coexistence invariant)
+
+This is delivered as a **second storage backend alongside the existing one**, not a rewrite of
+it. The two must be fully isolated so either can be deployed and the other resumed later with
+no cleanup:
+
+- **`legacy` backend** — today's three files: `data/training.db`, `data/inbox_sample.db`,
+  `data/embeddings.db`. Bodies persisted. Unchanged by this plan.
+- **`state` backend** — this plan's single `data/state.db` (+ `data/state.rebuild.db` during a
+  rebuild). Derived-only, no bodies.
+
+Hard invariants:
+
+1. **Disjoint files.** The two file sets never overlap by name. The `state` backend reads and
+   writes only `state.db`/`state.rebuild.db`; it **never opens** `training.db`,
+   `inbox_sample.db`, or `embeddings.db` — not to read, migrate, or delete. The `legacy`
+   backend never opens `state.db`. (There is deliberately **no migration path** between them:
+   the `state` backend's behavior does not depend in any way on whether the legacy files are
+   present, and it never reuses or converts their contents.)
+2. **Behavior independent of the other's presence.** A `state`-backend boot on a VM that still
+   has all three legacy files behaves *identically* to a boot on a clean VM. The only signal it
+   reads is its own `state.db`. Likewise for `legacy`.
+3. **Deploy selects, never destroys.** Deploying one backend sets which one the service starts
+   with; it does **not** remove the other's data files. Switching back is: redeploy the other
+   backend (or flip the config) and restart — the other's `data/*` is exactly as it was left.
+4. **Reset is backend-scoped.** `reset-state` touches only `state.db`; it never deletes legacy
+   files, and there is no combined "reset everything" that crosses the boundary.
+
+The backend is chosen at startup by an explicit selector (see "Backend selection"), defaulting
+to `legacy` so an unflagged/again-old deploy is byte-for-byte today's behavior.
+
+### Switching backends: what each side sees on restart
+
+Because Gmail is the source of truth and the two backends share no files, a switch is safe but
+**stale** — the incoming backend runs whatever it last persisted, ignorant of what the other did
+in between. The one non-obvious hazard is the history cursor.
+
+**Legacy restarting after `state` ran (and archived new mail out of the inbox):**
+
+Legacy only ever acts on what is **currently in the INBOX** (`inbox_check.py:49`), and for each
+such message it treats *labeled* mail as settled truth and *unlabeled* mail as work
+(`inbox_check.py:57-59`):
+- **Mail `state` labeled + archived** — out of the inbox (and labeled). Legacy never lists it,
+  and even if it resurfaced, the user label makes legacy **skip it as truth**. Left exactly as
+  `state` set it. This is the "existing = truth, not to-be-classified" behavior you'd expect.
+- **Mail `state` left unlabeled in the inbox** (low confidence, below maturity, or pre-boundary)
+  — still in the inbox with no user label, so legacy **re-classifies it** with its own model and
+  may label it. Legacy makes no distinction between "arrived during the state era" and "always
+  been here": any unlabeled inbox message is work. (`state`'s *first* boot, by contrast, is
+  read-only over the pre-existing mailbox and leaves such mail alone.) So switching to legacy
+  labels the inbox backlog.
+- **This is not a switching-specific effect.** It is identical to restarting legacy after *any*
+  downtime: legacy always re-`watch()`es fresh and sweeps the current INBOX, classifying whatever
+  unlabeled mail accumulated while it was down. Whether the gap was filled by `state` running, or
+  by nothing running at all, legacy sees the same thing — a current INBOX — and behaves the same.
+  `state` running in the interim changes nothing about it.
+- Legacy runs with its **frozen** `training.db`/`inbox_sample.db` (as of its last fetch) — none
+  of the examples `state` learned. Expected staleness; run `make fetch-training` to refresh.
+- A later `labelsRemoved` on a message `state` handled but legacy never stored is safe: the
+  delete-from-training is a no-op for an unknown id.
+
+**Why the seam must keep legacy's cursor non-durable:** legacy today re-`watch()`es from a
+**fresh** `historyId` every boot and keeps **no durable history cursor** (`_run_pubsub_mode`) —
+it never replays past history, only watches forward from start-of-service. The `StorageBackend`
+interface exposes `get/set_last_processed_history_id()`; the legacy adapter must implement these
+as **non-durable** (in-memory / no-op) so this fresh-watch behavior is preserved byte-for-byte.
+This is not about preventing corruption — a replay would mostly be redundant work (and often just
+hits `HistoryExpiredError` → inbox-poll fallback anyway) — it is about legacy staying *exactly*
+today's behavior after the refactor. Only the `state` backend persists a cursor, in its own
+`state.db`.
+
+**`state` restarting after legacy ran:** `state` replays history from its own persisted cursor,
+which now spans the legacy period, so it ingests the labels legacy applied (including legacy's
+*automated* labels) as training truth. This is **consistent with the existing model** — Gmail
+labels are authoritative and `make fetch-training` already folds the classifier's own auto-labels
+into the training set — so it is accepted, not a new defect. (If the cursor has aged out, the
+"history cursor expired" path does a full reconcile instead.)
+
 ## Why this works (premise check)
 
 All three databases are *derivable* from Gmail; none is ground truth:
@@ -79,13 +157,17 @@ Minimum `meta` keys:
 state_schema_version
 ml_fingerprint
 excluded_labels_hash
-bootstrap_status
+bootstrap_status              # absent | in_progress | complete
 bootstrap_boundary_history_id
 last_processed_history_id
 watch_expiration_ms
 bootstrap_started_at
 bootstrap_completed_at
 ```
+
+`bootstrap_status` drives the cold/warm branch and the progressive-vs-normal loop variant:
+`absent` (fresh VM) → cold bootstrap; `in_progress` (crashed mid-bootstrap) → resume the
+progressive path; `complete` → warm path.
 
 `label_id` is the classifier's internal label identity. `label_name_snapshot` is only for
 logs/status/debug output and can be refreshed from `LabelRegistry`. This avoids stale
@@ -107,6 +189,10 @@ embeddings; one file = one connection, atomic, trivial to reset.)
      rebuild **recomputes embeddings but carries the existing cursor forward**. It must not
      re-pin a fresh watch boundary, or live changes during the (possibly long) rebuild are
      skipped — the same backlog-skipping bug the warm path is careful to avoid.
+     - For the swap to be truly atomic: build `state.rebuild.db` **in `data/`** (same
+       filesystem as `state.db`, so `os.replace` is a rename, not a copy); **close the SQLite
+       connections to both files before renaming**; and move the WAL sidecars too, or
+       checkpoint+`journal_mode=DELETE` before the swap so no `-wal`/`-shm` is orphaned.
    - If the exclusion config changed, reconcile the derived state: remove now-excluded
      labels from the index, bootstrap newly-included labels, and reuse embeddings for
      unchanged message ids where possible.
@@ -184,6 +270,13 @@ is exactly wrong: the service would wake up and archive hundreds of emails that 
 > When bootstrapping (no cache yet), **everything already in Gmail is read-only.** Bootstrap
 > *reads* existing mail only to embed it into the index; it never labels or archives it.
 > Only mail that arrives *after* the service starts is eligible to be labeled.
+
+This read-only property is scoped to the **cold first boot** — the mailbox that pre-existed the
+service's very first start. It is *not* a permanent "state never touches the backlog": a **warm
+restart** after downtime does catch up on the gap, but via history replay from the persisted
+`last_processed_history_id` (step 4), not an inbox scan. That replay is post-cursor only, so it
+classifies mail that arrived during the downtime while still never touching pre-first-boot mail;
+if the cursor has aged out of Gmail's history window, it falls back to a full reconcile.
 
 Mechanism: call `client.watch(PUBSUB_TOPIC)` **first**, before reading a single message, and
 pin the returned `historyId` as the boundary. Anything at-or-before it = existing = read-only
@@ -264,9 +357,10 @@ process one bounded round-robin batch *between* `run_iteration` calls: a batch (
 max 25 messages or max 5 seconds), then service any pending notification, repeat until the
 corpus is exhausted.
 
-For index growth, avoid one `np.vstack` per bootstrapped message. Add `TrainingIndex.extend(...)`
-or publish immutable batch snapshots from a small builder, then classify against the current
-complete snapshot between batches.
+For index growth, avoid one `np.vstack` per bootstrapped message. Use
+`TrainingIndex.add_many(items)` (already implemented, `4cf66a8`), which appends a whole
+round-robin batch of `(id, vector, label)` tuples with a single reallocation, then classify
+against the grown index between batches.
 
 This is single-threaded (no lock, no index race, one embedder caller) and naturally throttled
 (live mail preempts bootstrap between batches). Bootstrap finishes somewhat later in wall-clock —
@@ -304,8 +398,8 @@ idempotent. If it crashes after ack, the durable cursor has already moved.
 (`label_change_handler.py:109,117,139,144`). Under the new model the in-memory `index.add`
 stays; the persistence target changes from "save body to MessageStore" to "upsert
 `id→label_id` + `cache.put(id, vec)` in the derived store." Same learn-on-correction behavior,
-no bodies persisted. The `index.add(...)` calls are untouched, or replaced with `index.extend(...)`
-where batching is available.
+no bodies persisted. The `index.add(...)` calls are untouched; a batch correction can use
+`index.add_many(...)` (`4cf66a8`) where several updates land together.
 
 The live update points map 1:1 from today's body-writes to label+vector upserts:
 - new inbox msg after maturity → skip (`inbox_check`/`history_processor` save empty-label body)
@@ -324,9 +418,9 @@ when it is stale or explicitly reset**:
 | Event | Behavior |
 |---|---|
 | **Service restart** | `state.db` present → validate, load index, refresh watch, process history from durable `last_processed_history_id`. No full Gmail fetch if the cursor is valid. |
-| **Code deploy, ML/config unchanged** | `gcp-deploy.sh` builds the tarball with `--exclude='data'` and untars *over* `INSTALL_DIR`; `tar x` never deletes files absent from the archive, so `data/state.db` is untouched. Deploy + restart → fast, state preserved. |
+| **Code deploy (state backend), ML/config unchanged** | `gcp-deploy-state` builds the tarball with `--exclude='data'` and untars *over* `INSTALL_DIR`; `tar x` never deletes files absent from the archive, so `data/state.db` (and any leftover legacy DBs) is untouched. Deploy + restart → fast, state preserved. |
 | **ML changed** (embedding model or `build_text_representation`) | Startup compares `meta.ml_fingerprint` to the current code. Mismatch ⇒ cached vectors are stale. Build `state.rebuild.db` from Gmail, validate counts/fingerprint, then atomically replace `state.db`. Only vectors are stale — carry the existing `last_processed_history_id` forward rather than re-pinning a fresh boundary, so live changes during the rebuild are not skipped. No silent wrong vectors. |
-| **Excluded-label config changed** | Startup compares `excluded_labels_hash`. Remove now-excluded labels from the index, bootstrap newly-included labels, and reuse unchanged embeddings where possible. If reconciliation is too complex, use the same two-phase rebuild path. |
+| **Excluded-label config changed** | Startup compares `excluded_labels_hash` (checked independently of the ML fingerprint). Reuse all unchanged embeddings: remove now-excluded labels from the index and bootstrap only the newly-included labels' ids — no re-embed of retained ids. The two-phase rebuild path is a last-resort fallback only if incremental reconciliation proves too complex to implement safely, not the expected path. |
 | **History cursor expired** | Run a full sync/reconcile from Gmail: label registry, trainable label ids, labeled-message ids, skip sample, and `last_processed_history_id`. Do not fall back to inbox-only polling as the sole recovery. |
 | **Explicit reset** | `make gcp-reset-state` / `make reset-state` — stop, `rm -f .../data/state.db`, start → next boot bootstraps fresh. The escape hatch "just in case." |
 
@@ -337,7 +431,6 @@ state_schema_version
 embedding_model_name
 embedding_dimension
 textrepr-vN
-excluded_labels_hash
 classifier_params_hash
 ```
 
@@ -345,55 +438,141 @@ The model name comes from `Embedder`'s `model_name`; the `textrepr-vN` is a manu
 bumped whenever `build_text_representation`/`preprocess_email_body` changes in a way that
 alters embeddings. Stored in `meta` on bootstrap, checked on every startup.
 
+**`excluded_labels_hash` is deliberately *not* in the fingerprint.** The fingerprint governs
+*vector validity* (is a cached `id→vector` still correct?); `excluded_labels_hash` governs
+*membership* (which rows participate in the index). They are orthogonal: changing the excluded
+set does not invalidate a single vector, only which rows are loaded — so it must take the cheap
+reconcile path (remove now-excluded, bootstrap newly-included, reuse unchanged embeddings), not
+the full vector rebuild. Folding it into the fingerprint would make that reconcile path dead
+code and force a needless ~4000-message re-embed on a pure config change. It is checked
+independently on startup as its own `meta` key.
+
 **Design defaults chosen** (flag if you want the alternative):
 - *One file, multiple small tables* (not separate vector/label files) — single atomic reset.
 - *Two-phase auto-rebuild on fingerprint mismatch* (not "wipe first" and not "refuse to start
   + tell the user to reset") — avoids surprise downtime and preserves the last usable state
   until replacement succeeds; the explicit `reset-state` still exists for force.
 
+## Code organization (common core, backend-specific edges)
+
+The goal is that both backends share one runtime and one classification path, differing only in
+*how the index is loaded/persisted*. Extract the shared logic; keep each backend's storage code
+in its own file so neither imports the other.
+
+**Common (backend-agnostic), unchanged or lightly generalized:**
+- `classifier.py`, `training_index.py`, `embeddings.py`, `preprocessing.py`,
+  `label_registry.py`, `gmail_client.py`, `gmail_parser.py`, `models.py` — pure runtime, no
+  storage assumptions. No changes beyond what's already noted (`add_many` already landed).
+- `pubsub_loop.py` — the notification/history/ack loop is identical for both backends. The
+  ack-after-persist change applies to both.
+- The classify-and-apply logic in `inbox_check.py` / `history_processor.py`. Their *only*
+  backend dependency is where a skip/label write goes and what set of `known_ids` they consult.
+
+**The seam — a `StorageBackend` protocol.** Define a narrow interface the runtime talks to, so
+`classify_and_label.py` and the handlers never name a concrete store:
+
+```text
+StorageBackend:
+    load_index() -> TrainingIndex            # legacy: load_all+build; state: join
+    known_ids() -> set[str]
+    skip_vote_ids() -> set[str]
+    upsert_label(id, label_id) / upsert_skip(id)
+    put_embedding(id, vec)
+    get/set_last_processed_history_id()   # legacy: NON-DURABLE (in-memory/no-op) by design
+    # state-only extras (pending_new, meta, fingerprint) live behind capability checks
+    #   or on the state subclass; legacy raises NotImplementedError / no-ops them.
+```
+
+**Cursor durability is backend-specific.** Only `state` persists the history cursor (in
+`state.db`). The legacy adapter keeps `set_last_processed_history_id` non-durable so legacy
+continues to fresh-`watch()` every boot — preserving today's behavior byte-for-byte. See
+"Switching backends" for the full rationale.
+
+**Backend-specific files:**
+- `storage_legacy.py` — thin adapter wrapping today's `MessageStore` + `EmbeddingCache` over
+  the three files. This is a *move/wrap* of existing code, not a rewrite; behavior identical.
+- `state_store.py` + `bootstrap.py` — the new backend (this plan). Opens **only**
+  `state.db`/`state.rebuild.db`.
+
+**Backend selection (explicit, defaults to legacy):** `classify_and_label.py` picks the backend
+from a single `--storage {legacy,state}` flag (env `CLASSY_STORAGE`), defaulting to `legacy`.
+The selector is the *only* branch; downstream code sees just a `StorageBackend`. An unflagged
+run is exactly today's behavior. The progressive-bootstrap / maturity / read-only-boundary logic
+is reached **only** on the `state` path; the `legacy` path keeps its current startup verbatim.
+
+## Deployment: two backends, one deployed at a time
+
+Deploy chooses the backend and writes it into the service configuration; it never touches the
+other backend's data.
+
+- `gcp-deploy-legacy` — today's deploy: ships code (+ the three DBs, as now) and sets the
+  service to start with `--storage legacy`. Unchanged from current `gcp-deploy` (keep
+  `gcp-deploy` as an alias for it so existing muscle memory/scripts are safe).
+- `gcp-deploy-state` — ships **code + credentials only** (`--exclude='data'`) and sets the
+  service to start with `--storage state`. Does not upload or delete any `data/*.db`.
+- The backend is persisted in the systemd unit / runner (an added flag or `CLASSY_STORAGE=` in
+  the service's environment), rewritten on each deploy, so a plain `gcp-restart` keeps whatever
+  backend was last deployed.
+- **Switching back is a redeploy, not a cleanup:** `gcp-deploy-legacy` after running `state`
+  finds all three legacy files exactly as they were left (the `state` backend never touched
+  them) and starts against them; `state.db` remains on disk, ignored. And vice-versa. Neither
+  deploy removes the other's files — per coexistence invariant #3.
+
 ## Files
 
-- New `src/gmail_classifier/state_store.py` (or extend `embedding_cache.py`) — the
-  `state.db` wrapper: `embeddings` + `labels` + `pending_new` + `meta` tables;
-  `upsert_label`, `upsert_embedding`, `get_labels()`, `get_known_ids()`, `iter_index()`
-  (join), `get/set_meta()`, `get/set_last_processed_history_id()`, `pending_new` helpers.
-  One SQLite connection.
+- New `src/gmail_classifier/state_store.py` — the `state.db` wrapper (a **new file**, not an
+  extension of `embedding_cache.py`, which belongs to the legacy backend and must stay
+  untouched): `embeddings` + `labels` + `pending_new` + `meta` tables; `upsert_label`,
+  `upsert_embedding`, `get_labels()`, `get_known_ids()`, `iter_index()` (join), `get/set_meta()`,
+  `get/set_last_processed_history_id()`, `pending_new` helpers. Opens only
+  `state.db`/`state.rebuild.db`. One SQLite connection. May *reuse* `EmbeddingCache`'s
+  vector-blob (de)serialization by importing the helper, but writes to its own file.
+- New `src/gmail_classifier/storage_backend.py` — the `StorageBackend` protocol (the seam
+  above) plus `storage_legacy.py` adapting the existing `MessageStore`+`EmbeddingCache`. The
+  `state_store`/`bootstrap` pair is the other implementation.
 - New `src/gmail_classifier/bootstrap.py` — `bootstrap_index(client, embedder, store, ...)`,
   testable with fakes (no heavy imports), one-at-a-time fetch/embed/persist, resumable
   (skips ids already in `embeddings`). Folds in `fetcher.py`'s list/diff logic and the
   round-robin/front-loaded-skip ordering.
-- `scripts/classify_and_label.py` — replace the `MessageStore.load_all` + `build_training_data`
-  startup block with: **(a)** open `state.db`; **(b)** validate schema/config/ML fingerprint;
-  **(c)** two-phase rebuild if needed; **(d)** if empty, call `watch()` first and bootstrap;
-  **(e)** else load index from the join and process Gmail history from the persisted cursor.
-  Drop `--training-db`/`--skip-db` defaults for a single `--state-db` path (keep old flags as
-  overrides for local use).
+- `scripts/classify_and_label.py` — add a `--storage {legacy,state}` selector (env
+  `CLASSY_STORAGE`, default `legacy`) that constructs the chosen `StorageBackend`; the rest of
+  `main` talks only to that interface. **Keep the current `MessageStore.load_all` +
+  `build_training_data` startup as the `legacy` path, verbatim** — it is not replaced, only
+  moved behind the selector. The `state` path is new: **(a)** open `state.db`; **(b)** validate
+  schema/config/ML fingerprint; **(c)** two-phase rebuild if needed; **(d)** if empty, call
+  `watch()` first and bootstrap; **(e)** else load index from the join and process Gmail history
+  from the persisted cursor. Legacy keeps `--training-db`/`--skip-db`; state uses `--state-db`.
 - `pubsub.py` / `pubsub_loop.py` — change pull/ack ownership so messages are acknowledged only
   after history events are processed and `last_processed_history_id` is persisted. Preserve the
   existing "backlog across outage" behavior.
-- `label_change_handler.py` — retarget persistence from `MessageStore.save_message` to
-  `store.upsert_label` + `cache.put`; keep `index.add` untouched or move to `index.extend` when
-  batching lands.
-- `inbox_check.py` / `history_processor.py` — skip-pool write becomes `upsert_label(id, '__skip__')`
-  only after maturity; before maturity, write `pending_new` instead. Inbox/history processors use
-  `known_ids`, not just `skip_ids`, to avoid reprocessing labeled-but-still-INBOX messages.
-- `training_index.py` — add `extend(...)` or a builder/snapshot path so bootstrap does not
-  `np.vstack` one message at a time.
-- `scripts/gcp-deploy.sh` — stop shipping `data/*.db`; ship code + credentials only.
-  Verify the `--exclude='data'` + untar-over behavior preserves `state.db` across deploys
-  (it does today). Optional `--seed-state` to upload a prebuilt `state.db` and skip first
-  boot, but not required.
+- `label_change_handler.py` — persist through the `StorageBackend` seam instead of naming
+  `MessageStore`: `backend.upsert_label(id, label_id)` / `backend.put_embedding(id, vec)`. On
+  the legacy backend the adapter does today's `save_message`; on state it does the label+vector
+  upsert. `index.add`/`add_many` untouched (`4cf66a8`).
+- `inbox_check.py` / `history_processor.py` — consult `backend.known_ids()` (not just
+  `skip_ids`) so labeled-but-still-INBOX messages aren't reprocessed. On the state backend the
+  skip-pool write becomes `upsert_skip(id)` only after maturity, and `pending_new` before
+  maturity; on legacy these map to the current empty-label `save_message`. The maturity /
+  `pending_new` behavior is state-only and is a no-op on legacy.
+- `training_index.py` — no change needed: `add_many(...)` (`4cf66a8`) already appends a batch
+  with a single `np.vstack`, so bootstrap round-robin batches use it directly.
+- `scripts/gcp-deploy.sh` — parameterize by backend (driven by the `gcp-deploy-legacy` /
+  `gcp-deploy-state` targets). Legacy path is today's behavior (ships the three DBs). State path
+  ships **code + credentials only** (`--exclude='data'`) and writes `--storage state` into the
+  service config. Both rely on the `--exclude='data'` + untar-over behavior, which never deletes
+  files absent from the archive — so **neither deploy removes the other backend's `data/*`**.
+  Optional `--seed-state` to upload a prebuilt `state.db` and skip first boot, but not required.
 - `Makefile` — add `reset-state` (local: stop, `rm -f data/state.db`), `gcp-reset-state`
   (VM: stop, `rm -f $INSTALL_DIR/data/state.db`, start), and `gcp-state-status` (schema/
   fingerprint/bootstrap status/index size/per-label counts/skip count/pending count/history
-  cursor).
-- `README.md` — **needs a pass; several current claims become wrong.** Specifically:
-  the GCP deploy steps and "Updating" section currently tell the user to run `make embed`
-  and say `gcp-deploy` uploads the databases — both go away (deploy ships code + credentials
-  only; the VM bootstraps from Gmail). The `# Deploy code, data, credentials` inline comment
-  drops "data". Add: first-boot warm-up time, the auto-rebuild-on-ML-change behavior, and
-  the `make gcp-reset-state` escape hatch. Quick-start's `make fetch-training`/`fetch-inbox`
-  become optional (local-only) rather than prerequisites for deployment.
+  cursor). See "Deployment: two backends, one deployed at a time" for the backend-selection
+  targets (`gcp-deploy-legacy` / `gcp-deploy-state`).
+- `README.md` — **needs a pass to document both backends.** Keep the current legacy deploy
+  instructions (`make embed`, DB upload) but scope them to `gcp-deploy-legacy`. Add a `state`
+  backend section: `gcp-deploy-state` ships code + credentials only and the VM bootstraps from
+  Gmail; document first-boot warm-up time, auto-rebuild-on-ML-change, `make gcp-reset-state`,
+  and that switching backends is a redeploy that leaves the other's data intact. `make
+  fetch-training`/`fetch-inbox` remain required for legacy, optional (local-only) for state.
 
 ## Costs / wrinkles (accepted, but explicit)
 
@@ -414,6 +593,11 @@ alters embeddings. Stored in `meta` on bootstrap, checked on every startup.
    contains message ids, label ids/names, and embeddings. Use `chmod 700 data/`,
    `chmod 600 data/state.db`, never upload `state.db` from the VM by default, and keep
    message ids out of normal logs.
+7. **Skip pool is never refreshed (accepted).** `__skip__` vectors are seeded once at bootstrap
+   and persist indefinitely. As sampled inbox mail is later archived or deleted in Gmail, those
+   rows linger — semantically harmless (an old "inbox-like" example is still a valid negative)
+   but unbounded-in-staleness. Accepted for now; a periodic resample of the skip pool is a
+   possible later refinement, not required for correctness.
 
 ## Verification
 
@@ -451,6 +635,37 @@ priority because they gate irreversible archive actions on a fresh mailbox.
 - **Labeled-wins-over-skip at source:** an INBOX id that also carries a user label is
   recorded with that **label**, never `__skip__` — `labels` never holds `__skip__` for it.
 
+### Unit — backend isolation (coexistence invariant)
+- **State backend opens only its own files:** run the full `state` startup + bootstrap against
+  a fake/temp `data/` and assert `training.db`/`inbox_sample.db`/`embeddings.db` are never
+  opened (e.g. sentinel files with a mtime that must not change, or an open() spy) — no read,
+  no write, no delete.
+- **Presence-independence:** a `state` boot with all three legacy files present produces the
+  same index and same calls as a `state` boot on an empty `data/` — the legacy files are
+  ignored entirely (no migration).
+- **Legacy backend unchanged:** the `legacy` path never opens `state.db`; its startup calls and
+  index match the pre-plan baseline (regression guard on the moved-behind-selector code).
+- **Selector default:** no `--storage` flag / no `CLASSY_STORAGE` → `legacy`.
+- **`reset-state` scope:** deletes only `state.db`; legacy files untouched.
+
+### Unit — switching backends (cross-restart safety)
+- **Legacy cursor stays non-durable:** the legacy adapter's `set_last_processed_history_id(x)`
+  followed by a fresh adapter's `get_last_processed_history_id()` returns `None` (or the
+  fresh-watch sentinel) — legacy persists no cursor, so it keeps watching forward from
+  start-of-service rather than replaying, exactly as today.
+- **Legacy after state — labeled mail treated as truth:** for an id `state` labeled+archived,
+  legacy's inbox check either never lists it (not in INBOX) or, if it appears in INBOX with a
+  user label, **skips it** — never re-classifies or re-archives it.
+- **Legacy after state — unlabeled inbox mail is re-classified:** an unlabeled inbox message that
+  `state` left alone **is** run through legacy's classifier (confirms the accepted behavior
+  difference: legacy re-enables backlog labeling, `state` boots read-only).
+- **Legacy after state — stale `labelsRemoved` is a no-op:** a `labelsRemoved` for an id legacy
+  never stored does not crash and does not corrupt the stores (delete-from-training no-ops).
+- **State after legacy — cursor replay ingests legacy labels:** `state` resumes from its
+  persisted cursor across a window in which labels were applied; those labels are folded into the
+  index as training truth (asserts the accepted "Gmail is truth" behavior, and that an expired
+  cursor instead triggers full reconcile).
+
 ### Unit — startup dispatch (schema/config/fingerprint)
 - **Match** → load index from the join, `client.get_message` **never called** (no fetch).
 - **ML mismatch** → build `state.rebuild.db`, validate it, then atomically swap; crash during
@@ -460,7 +675,9 @@ priority because they gate irreversible archive actions on a fresh mailbox.
 - **Empty store** → call `watch()` first, persist boundary/cursor, bootstrap runs (fingerprint
   written on completion).
 - **Excluded-label mismatch** → now-excluded rows are removed or a two-phase rebuild is
-  triggered; newly-included labels are bootstrapped.
+  triggered; newly-included labels are bootstrapped. Assert this takes the cheap reconcile
+  path (no full re-embed) since `excluded_labels_hash` is not in the fingerprint — an
+  exclusion-only change **does not** call `get_message`/`embed` for unchanged ids.
 
 ### Unit — read-only boundary (cold path safety)
 - Bootstrap **never calls `apply_label`/archive** on existing inbox mail — assert
@@ -504,18 +721,26 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   it is processed before bootstrap completes (proves the single-threaded interleave, no
   starvation).
 - Bootstrap batches obey max message/time budgets.
-- `TrainingIndex.extend` or builder snapshots avoid one `np.vstack` per message.
+- Bootstrap grows the index via `add_many` per batch (single `np.vstack`), not one append per
+  message — already covered by `test_training_index_batch.py` (`4cf66a8`).
 
 ### Memory / Behavior / Deploy (as before)
 - Memory: instrumented bootstrap on the VM shows peak materially below the old ~606 MB (no
   +447 MB corpus load); steady-state ~220 MB unchanged. (Idle RSS already held flat by the
-  shipped idle-trim fix `be24c59`.)
+  shipped idle-trim fix `be24c59`.) Note: the `[mem]`/`log_mem` startup probes were removed in
+  `0a8ef3d`, and the surviving per-message `log_prefix` RSS does **not** sample the startup
+  transient — so verifying the "no +447 MB" claim requires temporarily re-adding a peak probe
+  (or reading RSS once right after bootstrap completes).
 - Behavior: a correction still shifts a prediction (existing live-adaptation guarantee);
   full suite green.
-- Deploy: on a freshly created VM, `gcp-create → gcp-deploy (code+creds) → gcp-start`
+- Deploy (state): on a freshly created VM, `gcp-create → gcp-deploy-state → gcp-start`
   produces a working classifier with **no DB upload**; a redeploy (code change, ML/config
   unchanged) **preserves `data/state.db`** across the `--exclude='data'` untar-over; restart
   is fast (reads derived store, no full fetch).
+- Deploy (switch-back, on a real VM): after running the `state` backend, `gcp-deploy-legacy`
+  finds the three legacy DBs exactly as left (unmodified by the `state` run) and starts against
+  them; `state.db` remains on disk, ignored. Then `gcp-deploy-state` again starts against the
+  preserved `state.db` with no re-bootstrap. Confirms deploy selects, never destroys.
 - Status: `make gcp-state-status` reports schema version, ML fingerprint, bootstrap status,
   index size, per-label counts, skip count, pending count, and last processed history id.
 
