@@ -403,9 +403,9 @@ non-durable by design so a restart keeps today's fresh-watch behavior.
 
 Note the crash-safety guarantee here (crash-before-ack → idempotent history replay) is
 **state-only**. Legacy does not inherit it: after a restart legacy fresh-`watch()`es and does not
-replay the pre-crash history, so events acked-but-not-yet-processed at crash time are not replayed
-from history. Legacy's safety net is instead its startup inbox scan, which re-examines whatever is
-currently unlabeled in the INBOX — the same catch-up-after-downtime behavior described in
+persist the pre-crash history cursor. Pub/Sub redelivery alone is therefore not relied on to replay
+pre-crash history. Legacy's safety net is instead its startup inbox scan, which re-examines whatever
+is currently unlabeled in the INBOX — the same catch-up-after-downtime behavior described in
 "Switching backends." This is today's legacy behavior, unchanged.
 
 ### Live adaptation (preserve today's behavior)
@@ -571,8 +571,9 @@ deletes, or rewrites the other backend's database contents.
   `watch()` first and bootstrap; **(e)** else load index from the join and process Gmail history
   from the persisted cursor. Legacy keeps `--training-db`/`--skip-db`; state uses `--state-db`.
 - `pubsub.py` / `pubsub_loop.py` — change pull/ack ownership so messages are acknowledged only
-  after history events are processed and `last_processed_history_id` is persisted. Preserve the
-  existing "backlog across outage" behavior.
+  after history events are processed and `last_processed_history_id` is persisted. `pull()` returns
+  notifications plus ack ids; a separate `ack()` acknowledges them after successful processing.
+  Preserve the existing "backlog across outage" behavior.
 - `label_change_handler.py` — persist through the `StorageBackend` seam instead of naming
   `MessageStore`: `backend.upsert_label(message, label_id, vec)` /
   `backend.upsert_skip(message, vec)`. On the legacy backend the adapter does today's
