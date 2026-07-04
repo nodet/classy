@@ -544,6 +544,143 @@ deletes, or rewrites the other backend's database contents.
   them) and starts against them; `state.db` remains on disk, ignored. And vice-versa. Neither
   deploy removes or rewrites the other's database contents — per coexistence invariant #3.
 
+## Phased delivery
+
+The plan lands in six phases. The ordering is chosen so that **each phase ships on its own,
+keeps the service deployable at every step, and is gated by a concrete, testable outcome** —
+not just "code exists." Phase 1 is a pure refactor that changes *no* observable behavior; it
+only introduces the seam the later phases plug into. The `state` backend does not become
+reachable in production until Phase 3, and is not *safe* to point at a live mailbox until
+Phase 5. Each phase names the Verification group(s) that gate it (see "Verification").
+
+The through-line: **first make the current behavior expressible through the future
+architecture (Phase 1), then build the new backend behind that seam one safety property at a
+time (Phases 3–5), with the shared plumbing it needs pulled out first (Phase 2).**
+
+### Phase 1 — `StorageBackend` seam behind the legacy backend (pure refactor, no behavior change)
+
+The refactor you asked for: get closer to the target architecture while the service behaves
+byte-for-byte as today.
+
+- Add `storage_backend.py` (the protocol) and `storage_legacy.py` (a thin adapter wrapping
+  today's `MessageStore` + `EmbeddingCache` over the three files). This is a *move/wrap* of
+  existing code, not a rewrite.
+- Route `classify_and_label.py`, `label_change_handler.py`, `inbox_check.py`, and
+  `history_processor.py` through the seam instead of naming concrete stores. Add the
+  `--storage {legacy,state}` selector defaulting to `legacy`; only `legacy` is wired up.
+- The legacy adapter keeps the cursor **process-local (non-durable)**, so fresh-`watch()`
+  restart semantics are unchanged.
+
+**Done when:** the full suite is green with `legacy` as the only path, and the
+backend-isolation regression guards prove the moved-behind-selector code matches the pre-plan
+baseline. No new user-visible behavior; a deploy of this phase is indistinguishable from
+today. *Gate:* the "Legacy backend unchanged" and "Selector default" checks under
+**Unit — backend isolation**, plus the existing full suite as a regression net.
+
+### Phase 2 — Pub/Sub `pull()`/`ack()` split (shared plumbing, still legacy-only)
+
+Pull the acknowledgement ordering out ahead of the `state` backend that depends on it, so it
+can be reviewed and tested in isolation while legacy is still the only backend.
+
+- Split `PubSubSubscriber.pull()` (which today acks inside the pull) into `pull()` returning
+  notifications + ack ids, and a separate `ack(ack_ids)`. In `pubsub_loop`, ack only *after*
+  events are processed (and, on `state` later, after the cursor is persisted).
+- On `legacy` this is purely an ordering improvement — the cursor stays non-durable, so
+  restart behavior is unchanged. Preserve the existing "backlog across outage" `history_id`
+  handling.
+
+**Done when:** legacy still restarts fresh-watch and never double-processes across a healthy
+run. *Gate:* **Unit — Pub/Sub / history cursor safety** (the ack-after-process ordering and
+crash-before-ack cases; the durable-cursor cases are asserted against the `state` adapter once
+it exists in Phase 3), plus the existing `test_pubsub_loop.py` as a regression net.
+
+### Phase 3 — `state_store.py` + warm path (state backend loads, but does not bootstrap)
+
+Make the `state` backend real for the *already-populated* case only. No fetch-from-Gmail yet —
+a `state.db` is seeded for tests (and optionally via `--seed-state`), so this phase is fully
+testable without a mailbox.
+
+- `state_store.py`: the `state.db` schema (`embeddings`/`labels`/`pending_new`/`meta`), the
+  join-based `iter_index()`/`load_index()`, `known_ids`/`skip_vote_ids`, `upsert_label`/
+  `upsert_embedding`, cursor + fingerprint + meta helpers. Opens only `state.db`/
+  `state.rebuild.db`.
+- Startup dispatch on the `state` path: validate `state_schema_version` / `ml_fingerprint` /
+  `excluded_labels_hash`; warm path loads the index from the join and processes history from
+  the persisted `last_processed_history_id`; ML mismatch triggers the two-phase
+  `state.rebuild.db` swap (carrying the cursor forward); exclusion-only change takes the cheap
+  reconcile path. Wire the `state` adapter's durable cursor into the Phase 2 ack ordering.
+- Live adaptation through the seam: on `state`, `upsert_label`/`upsert_skip` store only
+  id/label/vector, no body.
+
+**Done when:** a seeded `state.db` boots warm, classifies, learns from corrections, and
+survives a restart with no re-fetch; ML/config changes take the correct (rebuild vs reconcile)
+path. *Gate:* **Unit — `state_store.py`**, **Unit — startup dispatch**, the "State backend
+opens only its own files" / "Presence-independence" / "Storage seam preserves legacy needs"
+checks under **Unit — backend isolation**, and the durable-cursor cases under **Unit — Pub/Sub
+/ history cursor safety**.
+
+### Phase 4 — `bootstrap.py` cold path (fetch from Gmail, read-only, resumable)
+
+Add the fresh-VM bootstrap, but *blocking* (finish before going live) — the simplest correct
+cold path. Progressive interleave and the maturity gate come in Phase 5; keeping them separate
+means the irreversible-action safety (read-only boundary) is proven before the more intricate
+early-labeling logic lands.
+
+- `bootstrap.py`: `watch()` **first** (pin the boundary + persist the cursor), then
+  round-robin over labels + front-loaded skip pool, one-at-a-time fetch→embed→cache→discard,
+  resumable (skip ids already embedded). Excludes XL* at the source; labeled-wins-over-skip at
+  the source.
+- **Read-only over pre-existing mail:** the cold path removes the labeling initial inbox check
+  entirely — existing mail is only read to embed it, never labeled or archived.
+
+**Done when:** a fresh (fake-client) bootstrap builds the right index, is resumable, holds one
+body at a time, and *never* labels/archives pre-existing mail. *Gate:* **Unit — `bootstrap.py`**
+and **Unit — read-only boundary (cold path safety)**.
+
+### Phase 5 — Progressive interleave + maturity gate + `pending_new` (safe early responsiveness)
+
+Turn the blocking cold boot into the live-from-the-first-second design, adding the two gates
+that keep a still-warming model from over-labeling a fresh mailbox.
+
+- Single-threaded interleave in the pubsub loop: bounded round-robin batch between
+  `run_iteration` calls, growing the index via `add_many` per batch.
+- Maturity gate (≈20/label + skip pool loaded) with finite targets; genuinely-new pre-maturity
+  mail parks in `pending_new` (no label, no archive), drained through normal classification
+  once mature.
+
+**Done when:** a notification arriving mid-bootstrap is serviced before bootstrap completes; no
+new mail is labeled before both maturity conditions hold; `pending_new` drains idempotently.
+*Gate:* **Unit — maturity gate** and **Unit — progressive interleave**.
+
+### Phase 6 — Deployment, ops, and docs (make it operable and switchable)
+
+Only now expose the backend choice to deploy/ops, since the `state` backend is finally safe to
+point at a real mailbox.
+
+- `gcp-deploy-state` (code + credentials only) / `gcp-deploy-legacy` (today's deploy, with
+  `gcp-deploy` as its alias); backend persisted in the service env; explicit per-backend sync
+  lists so neither deploy can touch the other's DBs.
+- `make reset-state` / `gcp-reset-state` (backend-scoped) and `gcp-state-status`.
+- `README.md` pass documenting both backends and that switching is a redeploy that leaves the
+  other's data intact.
+
+**Done when:** on a real VM, `gcp-create → gcp-deploy-state → gcp-start` yields a working
+classifier with no DB upload; a redeploy preserves `state.db`; `gcp-deploy-legacy` then
+`gcp-deploy-state` round-trips with the other backend's data untouched. *Gate:* the **Deploy**,
+**Memory**, and **Status** checks under **Verification**, plus **Unit — switching backends
+(cross-restart safety)** and the deploy-scope checks under **Unit — backend isolation**.
+
+### Phase dependency summary
+
+```text
+Phase 1 (seam, no behavior change) ──┬──> Phase 3 (state warm path) ──> Phase 4 (cold bootstrap) ──> Phase 5 (progressive+maturity) ──> Phase 6 (deploy/ops/docs)
+Phase 2 (pull/ack split) ────────────┘
+```
+
+Phases 1 and 2 are independent and can land in either order (both are legacy-only, behavior-
+preserving); Phase 3 depends on both. After Phase 1 the architecture is in place with no
+behavior change — that is the natural stopping point if the `state` backend is deferred.
+
 ## Files
 
 - New `src/gmail_classifier/state_store.py` — the `state.db` wrapper (a **new file**, not an
