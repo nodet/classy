@@ -9,6 +9,7 @@ from gmail_classifier.sample_size import (
     per_label_stats,
     recommend_cap,
     sample_pool,
+    select_diverse,
     select_latest,
     split_ids_by_set,
     tally,
@@ -204,6 +205,61 @@ def test_select_latest_missing_date_sorts_last():
     }
     # With n=1, the dated message must win over the undated one.
     assert select_latest(["recent", "nodate"], 1, id_to_date) == ["recent"]
+
+
+# --- select_diverse ---------------------------------------------------------
+
+def _unit(vec):
+    v = np.array(vec, dtype=np.float64)
+    return v / np.linalg.norm(v)
+
+
+def test_select_diverse_returns_all_when_n_exceeds_pool():
+    vectors = {"a": _unit([1, 0, 0]), "b": _unit([0, 1, 0])}
+    assert select_diverse(["a", "b"], 5, vectors) == ["a", "b"]
+
+
+def test_select_diverse_picks_one_from_each_cluster():
+    """Three tight clusters along distinct axes; picking 3 must hit all three."""
+    dim = 8
+    rng = np.random.default_rng(0)
+    vectors = {}
+    axes = {0: "x", 1: "y", 2: "z"}
+    for axis, tag in axes.items():
+        for i in range(10):
+            v = np.zeros(dim)
+            v[axis] = 1.0
+            v = v + rng.normal(scale=0.01, size=dim)
+            vectors[f"{tag}{i}"] = v / np.linalg.norm(v)
+    chosen = select_diverse(list(vectors), 3, vectors)
+    clusters_hit = {c[0] for c in chosen}  # first char = cluster tag
+    assert clusters_hit == {"x", "y", "z"}
+
+
+def test_select_diverse_is_deterministic_and_order_independent():
+    dim = 6
+    rng = np.random.default_rng(1)
+    vectors = {f"m{i}": _unit(rng.normal(size=dim)) for i in range(20)}
+    ids = list(vectors)
+    first = select_diverse(ids, 5, vectors)
+    second = select_diverse(list(reversed(ids)), 5, vectors)
+    assert first == second
+
+
+def test_select_diverse_spreads_more_than_a_clustered_subset():
+    """The chosen set's min pairwise distance should beat picking all-from-one-cluster."""
+    dim = 8
+    rng = np.random.default_rng(2)
+    vectors = {}
+    for axis, tag in {0: "x", 1: "y"}.items():
+        for i in range(15):
+            v = np.zeros(dim)
+            v[axis] = 1.0
+            v = v + rng.normal(scale=0.01, size=dim)
+            vectors[f"{tag}{i}"] = v / np.linalg.norm(v)
+    chosen = select_diverse(list(vectors), 2, vectors)
+    # With two axis-clusters and n=2, the two picks must straddle both axes.
+    assert {c[0] for c in chosen} == {"x", "y"}
 
 
 # --- tally ------------------------------------------------------------------

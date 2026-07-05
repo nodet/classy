@@ -31,6 +31,7 @@ from gmail_classifier.sample_size import (
     per_label_stats,
     recommend_cap,
     sample_pool,
+    select_diverse,
     select_latest,
     split_ids_by_set,
     tally,
@@ -117,11 +118,13 @@ def _stack(ids: list, vectors: dict, id_to_label: dict):
 def run_sweep(vectors, id_to_label, id_to_date, *, ns, seeds, k, cap_skip):
     """Return raw rows: dicts of policy/scope/label/N/seed/threshold/metrics.
 
-    Two sampling policies share the *same* held-out test set per seed, so the only
+    Three sampling policies share the *same* held-out test set per seed, so the only
     variable between them is how the training pool is subsampled:
       - ``random``: a random N per seed (variance across seeds).
       - ``latest``: the N most recent by date (what the live newest-first cap keeps;
         deterministic given the pool, but the pool still varies by seed's holdout).
+      - ``diverse``: N maximally-spread by farthest-first (coverage heuristic; tests
+        whether one example per cluster reaches the plateau at smaller N).
     """
     rows = []
     for seed in range(seeds):
@@ -133,6 +136,7 @@ def run_sweep(vectors, id_to_label, id_to_date, *, ns, seeds, k, cap_skip):
             selections = {
                 "random": lambda pool: sample_pool(pool, n, rng),
                 "latest": lambda pool: select_latest(pool, n, id_to_date),
+                "diverse": lambda pool: select_diverse(pool, n, vectors),
             }
             for policy, select in selections.items():
                 train_ids = []
@@ -176,7 +180,7 @@ def _write_csv(rows, path: Path):
 
 
 def _write_summary(rows, split, path: Path, *, k, seeds, cap_skip):
-    policies = ["random", "latest"]
+    policies = ["random", "latest", "diverse"]
 
     def agg_curve(policy, metric, threshold):
         curve = {}
@@ -190,9 +194,11 @@ def _write_summary(rows, split, path: Path, *, k, seeds, cap_skip):
     lines = ["# Sample-size experiment — results", ""]
     lines.append(f"k={k}, seeds={seeds}, skip pool {'capped in lockstep' if cap_skip else 'fixed (uncapped)'}.")
     lines.append("")
-    lines.append("Two training-pool sampling policies over the **same** held-out test set: "
-                 "**random** N (variance across seeds) vs **latest** N by date "
-                 "(what the live newest-first `--max-per-label` cap actually keeps).")
+    lines.append("Three training-pool sampling policies over the **same** held-out test set: "
+                 "**random** N (variance across seeds), **latest** N by date "
+                 "(what the live newest-first `--max-per-label` cap actually keeps), and "
+                 "**diverse** N by farthest-first traversal (coverage heuristic — one example "
+                 "per cluster).")
     if split.low_confidence_sets:
         lines.append(f"\n> Low-confidence sets (test set < min_test, read with caution): "
                      f"{', '.join(split.low_confidence_sets)}")

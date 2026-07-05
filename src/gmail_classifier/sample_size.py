@@ -179,6 +179,45 @@ def select_latest(pool_ids: List[str], n: int, id_to_date: Dict[str, str]) -> Li
     return ordered[:n]
 
 
+def select_diverse(pool_ids: List[str], n: int, vectors: Dict[str, np.ndarray]) -> List[str]:
+    """Take ``n`` maximally-spread ids by greedy farthest-first traversal.
+
+    The cheap heuristic for "one example from every cluster": a 2-approximation to
+    k-center over cosine distance. Seed with the point nearest the centroid (a
+    deterministic central representative), then repeatedly add the point *farthest*
+    (min cosine similarity) from everything already chosen. Tests whether picking
+    for coverage lets a label reach its accuracy plateau at a smaller N than random
+    or latest selection -- i.e. whether the issue #1 coreset is worth solving
+    exactly (e.g. via Gurobi p-median/p-center) rather than heuristically.
+
+    Deterministic given the pool (ties broken by first index); vectors are
+    L2-normalized here so cosine reduces to a dot product.
+    """
+    ids = sorted(pool_ids)
+    if n >= len(ids):
+        return ids
+
+    mat = np.stack([vectors[i] for i in ids]).astype(np.float64)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    unit = mat / norms
+
+    centroid = unit.mean(axis=0)
+    first = int(np.argmax(unit @ centroid))
+    selected = [first]
+    # max_sim[i] = cosine similarity of point i to its nearest selected point.
+    # The next pick minimizes it (is farthest from the selected set).
+    max_sim = unit @ unit[first]
+    for _ in range(n - 1):
+        candidate = max_sim.copy()
+        candidate[selected] = np.inf  # never re-pick a selected point
+        nxt = int(np.argmin(candidate))
+        selected.append(nxt)
+        max_sim = np.maximum(max_sim, unit @ unit[nxt])
+
+    return [ids[i] for i in selected]
+
+
 @dataclass
 class Tally:
     """Operational metrics at one confidence threshold over one test set.

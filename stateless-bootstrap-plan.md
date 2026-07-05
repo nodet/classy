@@ -307,6 +307,21 @@ What the curve showed:
   — but the gap is within ~2 pts and does not change the choice. Note at the strict 0.95
   threshold, latest never reaches the coverage plateau below 500.
 
+- **Diversity/dispersion selection is *worse*, not better (negative result).** A natural idea:
+  if a label's vectors form several clusters, pick training examples *spread apart* so every
+  cluster is represented. Tested as a third policy (`diverse` = greedy farthest-first, the
+  2-approximation to max-min dispersion / k-center). It was the **worst** arm at every N below
+  350 — coverage 0.445 vs 0.68 (random) at N=20, 0.62 vs 0.81 at N=50 — while precision went
+  slightly *up* (0.997, mislabel 0.2%). Farthest-first spends the budget on **outliers/boundary
+  points** (the mutually-farthest messages), so KNN queries from the *dense* core find no nearby
+  same-label anchor and abstain: high precision bought by collapsed coverage. Lesson: KNN wants
+  training anchors where query *density* is, i.e. **coverage/representatives**, not dispersion.
+  Consequence for issue #1's coreset: do **not** use a dispersion objective (max-min/max-sum) or
+  its farthest-first heuristic; if pursuing an exact selection, use a **p-median / p-center**
+  (coverage/medoid) formulation, which picks centers rather than fringe. Even so, expect little
+  headroom over random here — the hard labels' coverage keeps climbing to 500 regardless of
+  *how* the sample is chosen, so a smarter coreset is unlikely to move the 200 recommendation.
+
 - **The skip pool works *opposite* to labels — lockstep is right, and skip must not exceed the
   label cap.** The `--no-cap-skip` axis (skip fixed at the full 500 while labels vary) was run
   and settles the "one cap for both" question. Fixing skip large while label sets are small
