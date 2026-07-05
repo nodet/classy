@@ -27,7 +27,10 @@ class Notification:
 class FakeSubscriber:
     """Scripted subscriber: each pull() consumes the next scripted action.
 
-    An action is either a list (returned) or an Exception instance (raised).
+    An action is either a list of notifications (returned) or an Exception
+    instance (raised). pull() now returns ``(notifications, ack_ids)`` where
+    ack_ids is one synthetic id per notification; ``acked`` records the ack_ids
+    passed to ack() so tests can assert ack happens after processing.
     """
 
     _counter = [0]  # class-level construction counter across instances
@@ -36,17 +39,22 @@ class FakeSubscriber:
         self.actions = list(actions or [])
         self.closed = False
         self.pull_calls = 0
+        self.acked = []  # list of ack_id lists, in ack() call order
         FakeSubscriber._counter[0] += 1
         self.index = FakeSubscriber._counter[0]
 
     def pull(self, timeout):
         self.pull_calls += 1
         if not self.actions:
-            return []
+            return [], []
         action = self.actions.pop(0)
         if isinstance(action, Exception):
             raise action
-        return action
+        ack_ids = [f"ack-{n.history_id}" for n in action]
+        return action, ack_ids
+
+    def ack(self, ack_ids):
+        self.acked.append(list(ack_ids))
 
     def close(self):
         self.closed = True
@@ -388,3 +396,90 @@ def test_pointer_advances_to_response_history_id():
     state = run_iteration(state, deps)
 
     assert state.history_id == "555"
+
+
+# --------------------------------------------------------------------------
+# Case 9: ack happens only after processing (Pub/Sub ack ordering).
+# --------------------------------------------------------------------------
+
+def test_ack_after_events_processed():
+    """The pulled messages are acked only after process_events runs, and with
+    the ack_ids from that pull."""
+    order = []
+    client = FakeClient(history_result=[object()], history_latest="555")
+    sub = FakeSubscriber(actions=[[Notification("200")]])
+
+    def record_process(evs):
+        order.append("process")
+
+    orig_ack = sub.ack
+    def record_ack(ack_ids):
+        order.append("ack")
+        orig_ack(ack_ids)
+    sub.ack = record_ack
+
+    deps, _ = make_deps(client, lambda: sub, process_events=record_process)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+
+    assert order == ["process", "ack"]
+    assert sub.acked == [["ack-200"]]
+
+
+def test_no_ack_when_processing_raises():
+    """If process_events raises (non-network), the batch is NOT acked, so
+    Pub/Sub redelivers and history replay recovers it."""
+    client = FakeClient(history_result=[object()])
+    sub = FakeSubscriber(actions=[[Notification("200")]])
+
+    def boom(evs):
+        raise ValueError("processing bug")
+
+    deps, _ = make_deps(client, lambda: sub, process_events=boom)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    with pytest.raises(ValueError):
+        run_iteration(state, deps)
+
+    assert sub.acked == []  # never acked -> redelivery replays
+
+
+def test_empty_pull_does_not_ack():
+    """A pull that returns no messages has nothing to ack."""
+    client = FakeClient()
+    sub = FakeSubscriber(actions=[[]])
+    deps, _ = make_deps(client, lambda: sub)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+
+    assert sub.acked == []
+
+
+def test_history_expired_acks_after_inbox_poll():
+    """On history expiry, the pulled messages are serviced via the inbox poll
+    and then acked (they've been handled, just not via history replay)."""
+    order = []
+    client = FakeClient(watch_id="REWATCH-555",
+                        history_exc=HistoryExpiredError("too old"))
+    sub = FakeSubscriber(actions=[[Notification("777")]])
+
+    orig_ack = sub.ack
+    def record_ack(ack_ids):
+        order.append("ack")
+        orig_ack(ack_ids)
+    sub.ack = record_ack
+
+    deps, _ = make_deps(client, lambda: sub,
+                        check_inbox=lambda: order.append("check_inbox"))
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+
+    assert order == ["check_inbox", "ack"]
+    assert sub.acked == [["ack-777"]]

@@ -105,9 +105,12 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
                 _, expiration = deps.watch()
                 deps.log("Watch renewed")
 
-        # Pull notifications (shorter timeout when retrying).
+        # Pull notifications (shorter timeout when retrying). pull() no longer
+        # acks -- we ack only after the notifications' history is processed
+        # (and, on a durable-cursor backend, persisted), so a crash mid-batch
+        # leaves them for redelivery.
         pull_timeout = PULL_TIMEOUT_RETRY if backoff else PULL_TIMEOUT
-        notifications = subscriber.pull(timeout=pull_timeout)
+        notifications, ack_ids = subscriber.pull(timeout=pull_timeout)
 
         # A successful pull -- even one that returns no messages -- proves the
         # connection is healthy again. Exit backoff immediately rather than
@@ -138,7 +141,9 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         except HistoryExpiredError:
             deps.log("History expired, falling back to inbox poll")
             deps.check_inbox()
-            # Re-watch to get a fresh historyId.
+            # The pulled notifications have now been serviced (via the inbox
+            # poll), so ack them before re-watching for a fresh historyId.
+            subscriber.ack(ack_ids)
             history_id, expiration = deps.watch()
             return LoopState(history_id, expiration, backoff, subscriber)
 
@@ -153,6 +158,11 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         # reports + double index.add). Fall back to the notification id only
         # if the response carried none.
         history_id = latest_history_id or max_history
+
+        # Ack only now that the batch is fully processed and the pointer has
+        # advanced. A crash before this leaves the messages un-acked; Pub/Sub
+        # redelivers and get_history replay is idempotent.
+        subscriber.ack(ack_ids)
         return LoopState(history_id, expiration, backoff, subscriber)
 
     except Exception as e:

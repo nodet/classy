@@ -1,7 +1,7 @@
 """Pub/Sub subscriber wrapper for Gmail push notifications."""
 import json
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 
 @dataclass
@@ -21,11 +21,14 @@ class PubSubSubscriber:
             client = SubscriberClient(credentials=credentials)
         self._client = client
 
-    def pull(self, timeout: int = 60) -> List[PubSubNotification]:
+    def pull(self, timeout: int = 60) -> Tuple[List[PubSubNotification], List[str]]:
         """Pull notifications from the subscription.
 
-        Returns decoded notifications. Acknowledges received messages.
-        Returns empty list on timeout or no messages.
+        Returns ``(notifications, ack_ids)``. Does **not** acknowledge -- the
+        caller must call :meth:`ack` only after the notifications' Gmail history
+        has been durably processed, so a crash mid-processing leaves the
+        messages un-acked for redelivery. Returns ``([], [])`` on timeout or no
+        messages.
         """
         from google.api_core.exceptions import DeadlineExceeded
 
@@ -36,11 +39,11 @@ class PubSubSubscriber:
                 timeout=timeout,
             )
         except DeadlineExceeded:
-            return []
+            return [], []
 
         messages = response.received_messages
         if not messages:
-            return []
+            return [], []
 
         notifications = []
         ack_ids = []
@@ -52,12 +55,22 @@ class PubSubSubscriber:
             ))
             ack_ids.append(msg.ack_id)
 
+        return notifications, ack_ids
+
+    def ack(self, ack_ids: List[str]) -> None:
+        """Acknowledge previously-pulled messages by their ack ids.
+
+        Call this only after the pulled notifications' history has been
+        processed (and, on a durable-cursor backend, persisted), so an
+        interrupted run redelivers rather than dropping mail. No-op on an
+        empty list.
+        """
+        if not ack_ids:
+            return
         self._client.acknowledge(
             subscription=self._subscription_path,
             ack_ids=ack_ids,
         )
-
-        return notifications
 
     def close(self) -> None:
         """Close the underlying gRPC channel and release its resources."""
