@@ -17,6 +17,7 @@ Method (see messages-per-label-experiment.md):
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import statistics
 import sys
@@ -170,13 +171,24 @@ def _mean(xs):
     return statistics.fmean(xs) if xs else float("nan")
 
 
+def _md_cell(text: str) -> str:
+    """Escape a value for use inside a Markdown table cell.
+
+    A pipe would start a new column and a newline would break the row, so a
+    user label containing either must be escaped/flattened.
+    """
+    return str(text).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
 def _write_csv(rows, path: Path):
     cols = ["policy", "scope", "label", "N", "seed", "threshold", "precision", "coverage",
             "mislabel_rate", "skip_fp_rate", "n_test"]
-    lines = [",".join(cols)]
-    for r in rows:
-        lines.append(",".join(str(r[c]) for c in cols))
-    path.write_text("\n".join(lines) + "\n")
+    # csv.DictWriter quotes any field containing commas/quotes/newlines, so a
+    # user label like "Foo, Bar" can't corrupt the column structure.
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=cols)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _write_summary(rows, split, path: Path, *, k, seeds, cap_skip):
@@ -240,7 +252,7 @@ def _write_summary(rows, split, path: Path, *, k, seeds, cap_skip):
                         and r["scope"] == "per_label" and r["label"] == label
                         and r["N"] == n and r["threshold"] == 0.80]
                 cells.append(f"{_mean(vals):.2f}" if vals else "—")
-            lines.append(f"| {label} | " + " | ".join(cells) + " |")
+            lines.append(f"| {_md_cell(label)} | " + " | ".join(cells) + " |")
         lines.append("")
     path.write_text("\n".join(lines) + "\n")
 
@@ -260,8 +272,15 @@ def main():
     if excluded:
         print(f"Excluded labels: {', '.join(sorted(excluded))}")
 
+    # Labeled wins over skip: a message can carry a user label *and* still sit
+    # in the inbox sample, so the same id can appear in both DBs. Production
+    # (assemble_training_index / exclude_labeled_from_skip) keeps it as a
+    # labeled example and drops the skip copy; mirror that here, or the sweep
+    # would undercount labels and inflate the skip pool.
     messages = _load_labeled(args.db, excluded)
-    messages.update(_load_skip(args.skip_db))
+    for mid, entry in _load_skip(args.skip_db).items():
+        if mid not in messages:
+            messages[mid] = entry
     if not messages:
         print("No messages found.")
         sys.exit(1)
