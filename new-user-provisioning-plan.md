@@ -6,10 +6,25 @@ Status: proposed (follow-on to the stateless-bootstrap plan)
 ## Relationship to the stateless-bootstrap plan
 
 This plan **leans on `stateless-bootstrap-plan.md` being implemented first** and does not
-duplicate its scope. The bootstrap plan removes one axis of install friction — the local
-`training.db`/`inbox_sample.db`/`embeddings.db` build and the DB upload — so that a fresh
-deploy is "code + credentials → start, the VM bootstraps from Gmail." That is necessary but
-**not sufficient** for a *new* user (someone other than the author) to install the service.
+duplicate its scope. The bootstrap plan delivers the `state` backend, which removes one axis of
+install friction — the local `training.db`/`inbox_sample.db`/`embeddings.db` build and the DB
+upload — so that a fresh deploy is "code + credentials → start, the VM bootstraps from Gmail."
+That is necessary but **not sufficient** for a *new* user (someone other than the author) to
+install the service.
+
+> **This plan assumes the `state` backend and GCP-only deployment.** Two premises hold
+> throughout, and the docs this plan produces must state them plainly:
+>
+> - **Backend: `state`.** The bootstrap plan ships *two* backends and defaults to `legacy` (an
+>   unflagged deploy stays byte-for-byte today's behavior), where `gcp-deploy`/`gcp-deploy-legacy`
+>   **still ship the three DBs**. The "no DB upload" property this plan depends on is a property
+>   of `gcp-deploy-state`. So the entire new-user happy path standardizes on `--storage state` /
+>   `gcp-deploy-state`; wherever this plan says "deploy," it means the state deploy.
+> - **Deployment: GCP only.** The service runs on the GCP e2-micro VM — that is the one supported
+>   way for a new user to *operate* it. Running locally, with or without a service wrapper, is a
+>   **test/debug-only** path (dry runs, eval, development), never how the real service is stood up
+>   or kept running. So "install the service" always means "provision GCP and deploy the state
+>   backend there," and the docs must not present a local run as an alternative way to operate it.
 
 What remains is provisioning and configuration friction the bootstrap plan deliberately
 leaves alone:
@@ -24,18 +39,35 @@ leaves alone:
   surprised by Google's Testing-mode refresh-token expiry.
 
 So this plan picks up exactly where the bootstrap plan stops: turning an author-specific,
-manually-provisioned setup into something a stranger can stand up. Sequencing: implement the
-bootstrap plan, then this. Several items here (the startup-legibility logging, the
-`gcp-state-status` surfacing) reference modules and behavior the bootstrap plan introduces
-(`watch()`-first cold path, discovered-label set, maturity gate), so they cannot land before it.
+manually-provisioned setup into something a stranger can stand up.
+
+**Sequencing against the bootstrap plan's six phases** (it is no longer one monolith — see its
+"Phased delivery"): the four items below map onto those phases rather than "do all of bootstrap,
+then all of this":
+
+| This plan's item | Depends on bootstrap phase | Why |
+|---|---|---|
+| 1. De-hardcode project + provision Pub/Sub | none (independent) | pure config/scripts + `gcloud`; touches no `state` code. Can land in parallel with, or before, any bootstrap phase. |
+| 2. `make doctor` preflight | none for the core; the `state`/Pub/Sub checks pair with Phase 3+ | read-only checks of local files, `gcloud`, and cloud resources. **The bootstrap plan already forward-references `doctor`** (its excluded-label section and `gcp-state-status` expect "unresolved excluded-label names" surfaced by `doctor`/status), so that specific check is *shared surface* — see note below. |
+| 3. Startup legibility (banner, discovered labels, empty-set failure) | Phase 4 (cold path) minimum; the "live-but-not-labeling" nuance is Phase 5 | hooks the `watch()`-first cold path and the discovered-label set. The maturity-gate banner wording assumes Phase 5's progressive interleave. |
+| 4. Neutral config + docs/README pass | Phase 6 for the deploy-steps README coordination | the bootstrap plan's own README pass is Phase 6; coordinate, don't double-edit. Config neutralization itself is independent. |
+
+**Bidirectional `doctor` dependency (resolve during implementation):** the bootstrap plan cites
+`doctor`/`gcp-state-status` for surfacing unresolved excluded-label names, but `doctor` is
+*introduced here*. Neither plan should hard-block on the other: the bootstrap plan must **degrade
+gracefully** (log the unresolved names itself; `doctor` upgrades the surfacing), and this plan's
+`doctor` excluded-label check simply reads the mechanism the bootstrap plan defines. Land the
+excluded-label surfacing with whichever ships second.
 
 ## The core problem
 
-After the bootstrap plan ships, deploy is "code + credentials → start" — but the *code* is
-wired to the author's GCP project `classy-498012` in at least eight places, and the GCP-side
-resources it talks to must be created by hand. A new user cannot clone and deploy; they must
-find-and-replace an opaque project id across source and shell scripts, manually create cloud
-resources, and follow OAuth setup prose that is currently too easy to misapply.
+After the bootstrap plan ships, the **state-backend** deploy (`gcp-deploy-state`) is "code +
+credentials → start" (the default `gcp-deploy`/legacy path still ships DBs — see the box above)
+— but the *code* is wired to the author's GCP project `classy-498012` in at least eight places,
+and the GCP-side resources it talks to must be created by hand. A new user cannot clone and
+deploy; they must find-and-replace an opaque project id across source and shell scripts,
+manually create cloud resources, and follow OAuth setup prose that is currently too easy to
+misapply.
 
 Hardcoded author-specific identifiers found today:
 
@@ -69,9 +101,10 @@ subscription = "gmail-notifications-sub"   # short name; full path derived
 
 - Add `config.py` accessors: `gcp_project()`, `gcp_zone()`, `gcp_instance()`,
   `pubsub_topic_path()`, `pubsub_subscription_path()`, and `require_gcp_config()`.
-- Keep the empty-string-means-unset convention so local-only / non-GCP use never trips over it.
-  Accessors may return `""` for unset values, but any GCP command or Pub/Sub mode should call
-  `require_gcp_config()` and fail with one clear message that names the missing key.
+- Keep the empty-string-means-unset convention so the **test/debug local paths** (dry runs,
+  eval — which never touch GCP) don't trip over unset GCP keys. Accessors may return `""` for
+  unset values, but the service's real (GCP) mode must call `require_gcp_config()` and fail with
+  one clear message that names the missing key — an operating deploy always has these set.
 - `scripts/classify_and_label.py` — replace the `PUBSUB_TOPIC` / `PUBSUB_SUBSCRIPTION` module
   constants with calls to the config accessors. (These are read at startup, so no hot-path
   cost.)
@@ -128,10 +161,14 @@ fix command or setup step:
   Gmail modify plus Pub/Sub. A token produced under old docs that only requested
   `gmail.readonly` should fail loudly and tell the user to delete `credentials/token.json` or
   run `make reauth` after fixing the consent-screen scopes.
-- `config.toml` has a non-empty `[gcp].project` for GCP mode, and the configured
-  `zone`/`instance` are valid strings.
+- `config.toml` has a non-empty `[gcp].project` and valid `zone`/`instance` — these are
+  **required** to operate the service (GCP is the only supported deployment), so `doctor` treats
+  an unset project as a hard failure, not an "only if you're using GCP" warning.
 - The configured Pub/Sub **topic and subscription exist** and are reachable, and the
   `gmail-api-push` publisher IAM binding is present.
+- (State backend, optional) if a `state.db` is present, its `gmail_account_id` matches the
+  authorized account and `last_processed_at` is sane — the same guards the bootstrap plan applies
+  to `--seed-state`. Catches an uploaded/seeded cache from the wrong mailbox before it runs.
 - The Gmail account has at least one trainable user label after exclusions; warn if most labels
   have fewer than the classifier's minimum example count.
 
@@ -157,11 +194,16 @@ docs should tell users what that means before they put the service on a VM:
 
 The bootstrap plan makes first boot a 10–20 min **read-only** warmup during which, by design,
 nothing is labeled. For a new user that long silent stretch reads as "broken." Make the
-service explain itself — these hook into bootstrap-plan code paths, so they land *after* it:
+service explain itself — these hook into bootstrap-plan code paths, so they land *after* it
+(Phase 4 minimum; the maturity-gate wording assumes Phase 5). Note the warmup shape differs by
+phase: at **Phase 4** the bootstrap is *blocking* (the service isn't live until it finishes), so
+the whole stretch is silent; at **Phase 5** it is live-from-the-first-second but *not labeling*
+until mature. The banner is needed either way; word it so it doesn't assume progressive
+interleave is present:
 
 - On the cold path, log a startup banner: bootstrapping, **read-only until ~N examples/label**,
-  will not touch existing mail, ordering is round-robin. (Uses the maturity targets the
-  bootstrap plan defines.)
+  will not touch existing mail, ordering is round-robin (Phase 5) or sequential (Phase 4). (Uses
+  the maturity targets the bootstrap plan defines.)
 - Log the **discovered label set and the effective exclusions** once the cold path's
   `list_user_labels()` runs, so the user sees what the service will and won't classify *before*
   it acts. The bootstrap plan already discovers labels at startup; this just surfaces them.
@@ -179,7 +221,10 @@ service explain itself — these hook into bootstrap-plan code paths, so they la
 - `config.toml` currently ships with the **author's** labels (`XLC`, `XLE`, `XLCap`) in
   `[labels].excluded` (`config.toml:11`). Replace with an **empty** `excluded = []` plus a
   comment explaining what to put there, and the empty `[gcp]` section from item 1. A new user's
-  first edit should be obvious and theirs, not a cleanup of the author's leftovers.
+  first edit should be obvious and theirs, not a cleanup of the author's leftovers. (This is only
+  the *action* — the bootstrap plan's "Excluded-label configuration" section already documents
+  the *mechanism*, including that these values are this-deployment choices and not built-in
+  defaults, and the empty-list = classify-into-every-label behavior. Don't re-explain it here.)
 - Keep the implementation simple for now: a neutral tracked `config.toml` is acceptable. If
   local edits start creating merge friction later, move to `config.example.toml` + gitignored
   `config.toml` + `make init-config`; that is a follow-up, not required for the first new-user
@@ -193,10 +238,13 @@ service explain itself — these hook into bootstrap-plan code paths, so they la
   `auth.py` (`gmail.modify` + `pubsub`), not the current read-only-only guidance. Add a
   troubleshooting entry for `insufficient authentication scopes` / `invalid_grant` that says
   when to run `make reauth`.
-- Split the setup docs into two clear paths: **local dry run** and **always-on GCP service**.
-  The local path should not make users think GCP is mandatory; the GCP path should not make
-  users think local `training.db` / `inbox_sample.db` are deploy prerequisites after the
-  bootstrap plan lands.
+- Frame the setup docs around the **one supported way to operate the service: the always-on GCP
+  deploy of the `state` backend (`gcp-deploy-state`).** Running locally — with or without a
+  service wrapper — is documented only as a **test/debug path** (dry runs, eval, development), in
+  a clearly-labeled subsection, never as an alternative way to run the real service. The GCP path
+  must not make users think local `training.db` / `inbox_sample.db` are deploy prerequisites: be
+  explicit that "no DB upload" is a `state`-backend property (the default/legacy `gcp-deploy`
+  still ships those DBs), so a new user is pointed at `gcp-deploy-state`.
 - Add a short cost/safety note: `e2-micro` should remain in a free-tier-eligible US zone by
   default, but users must still have billing enabled and are responsible for checking their own
   GCP billing page.
@@ -238,6 +286,6 @@ service explain itself — these hook into bootstrap-plan code paths, so they la
   exclusions (assertable in the bootstrap dispatch tests once that code exists). Empty
   trainable-label set fails clearly; too-few-examples state logs a warning.
 - End-to-end (manual, documented): a second GCP project + a different Google account can go
-  from `git clone` to a running, bootstrapping service using only `config.toml` edits and the
-  documented targets — no source edits, no local training DB upload, no author-specific labels
-  or project ids.
+  from `git clone` to a running, bootstrapping service **using the `state` backend
+  (`gcp-deploy-state`)** with only `config.toml` edits and the documented targets — no source
+  edits, no local training DB upload, no author-specific labels or project ids.
