@@ -281,7 +281,7 @@ def _process_events(events, args, client, embedder, index, registry,
             print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
             if not args.dry_run:
                 msg = r["message"]
-                backend.upsert_skip(msg)
+                backend.upsert_skip(msg, r.get("embedding"))
 
     # Only reclaim when the batch did real work. Hand back the heap a heavy
     # message (big HTML parse + embed) just grew, so RSS falls back to idle

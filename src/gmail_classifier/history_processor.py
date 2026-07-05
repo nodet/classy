@@ -82,6 +82,11 @@ def process_history_events(
             "sender": sender,
             "subject": msg.subject,
             "message": msg,
+            # Carry the query vector so the caller can persist a NO_LABEL skip
+            # example WITH its embedding. The state backend stores no body, so a
+            # vector-less skip row could never be recovered; passing it here
+            # mirrors how process_inbox() hands its embedding to upsert_skip.
+            "embedding": query_embedding,
         }
 
         if result.action in (Action.LABEL, Action.LABEL_WITH_REVIEW):

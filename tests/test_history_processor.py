@@ -63,6 +63,39 @@ def test_process_new_inbox_message_classifies_it():
     assert results[0]["message_id"] == "msg1"
 
 
+def test_result_carries_query_embedding():
+    """The result dict carries the query vector so the caller can persist a
+    NO_LABEL skip example WITH its embedding. The state backend stores no body,
+    so a vector-less skip row could never be recovered later."""
+    events = [
+        HistoryEvent(type="messagesAdded", message_id="msg1", label_ids=["INBOX"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1")
+
+    embedder = MagicMock()
+    sentinel = np.arange(384, dtype=np.float32)
+    embedder.embed.return_value = sentinel
+
+    results = process_history_events(
+        events=events,
+        client=client,
+        embedder=embedder,
+        train_embeddings=np.zeros((10, 384)),
+        train_labels=["Tech"] * 5 + ["__skip__"] * 5,
+        label_name_to_id={"Tech": "Label_1"},
+        user_label_ids={"Label_1"},
+        excluded_labels=set(),
+        skip_ids=set(),
+        k=5,
+        dry_run=False,
+    )
+
+    assert len(results) == 1
+    assert results[0]["embedding"] is sentinel
+
+
 def test_process_skips_message_already_in_skip_pool():
     """Messages already in the skip pool should not be re-processed."""
     events = [
