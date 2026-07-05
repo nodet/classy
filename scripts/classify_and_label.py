@@ -62,6 +62,30 @@ def deployed_version():
         return "unknown"
 
 
+def _validate_storage_mode(args):
+    """Reject storage/mode combinations that would violate the state backend's
+    read-only boundary.
+
+    Poll mode *is* the labeling inbox path: ``_run_poll_mode`` calls
+    ``_check_inbox`` every interval, which lists the current INBOX and hands it
+    to ``process_inbox`` -- classify + apply labels with ``archive=True`` +
+    record skips. That is correct for legacy (it treats the current inbox as
+    work) but unsafe for the state backend, which must only advance via history
+    replay from its durable cursor and never label/archive pre-boundary backlog.
+    ``--mode`` defaults to poll while ``--storage``/``$CLASSY_STORAGE`` can be
+    state, so guard here rather than trusting the pubsub-only sweep gate. Fail
+    closed until the read-only resync path lands (Phase 4).
+    """
+    if args.storage == "state" and args.mode != "pubsub":
+        print(
+            f"--storage state requires --mode pubsub (got --mode {args.mode}). "
+            "Poll mode sweeps and labels the current inbox, which would archive "
+            "pre-boundary backlog under the state backend; it advances only via "
+            "history replay. Re-run with --mode pubsub."
+        )
+        sys.exit(1)
+
+
 def _build_backend(args, excluded, client, embedder):
     """Construct the selected StorageBackend. The only place that branches on
     the backend choice; callers downstream see just a StorageBackend.
@@ -161,6 +185,7 @@ def main():
         help="Storage backend (default: legacy, or $CLASSY_STORAGE)",
     )
     args = parser.parse_args()
+    _validate_storage_mode(args)
 
     print(f"gmail-classifier version: {deployed_version()}", flush=True)
 
