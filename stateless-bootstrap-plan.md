@@ -265,13 +265,14 @@ embeddings; one file = one connection, atomic, trivial to reset.)
 
 Bootstrap must fetch a **bounded** number of messages. `__skip__` is just one more set in the
 KNN index (a row in the `labels` table like any label), so a single per-set cap —
-**`--max-per-label`**, the existing flag (default **500**) — bounds every set, the skip pool
-included. No separate skip cap: there is no principled reason the skip pool should hold a
-different number of examples than a user label.
+**`--max-per-label`** (existing flag; recommended default **200**, see below — the code
+currently ships 500) — bounds every set, the skip pool included. No separate skip cap: there
+is no principled reason the skip pool should hold a different number of examples than a user
+label.
 
 So `total ≈ Σ_labels min(--max-per-label, n_label) + min(--max-per-label, n_inbox)`, i.e. at
-most `--max-per-label × (label_count + 1)`. With ~11 labels this is the ~4–5k first-boot reads
-in wrinkle #1.
+most `--max-per-label × (label_count + 1)` — e.g. ~2k reads at 200 over ~9 labels, vs. the
+~4–5k full-corpus reads in wrinkle #1.
 
 The cap is **well above what maturity needs**, and that is deliberate but worth stating: the
 maturity gate only wants ≈`MATURITY_EXAMPLES_PER_LABEL` (~20) per set (see "Two gates"). The
@@ -279,6 +280,29 @@ bootstrap cap sizes the *durable corpus* (classification quality + KNN neighborh
 not the point at which the service starts labeling. The uncapped INBOX listing is the
 dominant unbounded-index grower (wrinkle #7) and issue #1's per-set coreset cap is the
 eventual bound.
+
+**Measured default: `--max-per-label = 200`** (down from 500), from the learning-curve
+experiment (`messages-per-label-experiment.md`, run 2026-07-05 on ~4.3k messages / 9 labels).
+What the curve showed:
+
+- **Precision is safe everywhere.** It clears the 0.97 target by **N=20** and is flat after
+  (~0.98 → 0.996); the classifier abstains rather than mislabels (mislabel rate 1.6% → 0.4%
+  across the sweep). So the cap is a *coverage* knob, not a correctness one.
+- **Coverage is the binding metric and has no clean plateau** — still rising at N=500
+  (0.68 @20 → 0.93 @200 → 0.96 @500). The 200→500 stretch buys only ~+3 pts coverage for 2.5×
+  the storage, so **200 is the diminishing-returns compromise**, not a saturation point.
+- **Two label populations.** Distinct labels (Banque, github, Transports, Gurobi, LBC)
+  saturate by ~20–50; overlapping ones (RO, Politique, Pub, Technologie) keep gaining coverage
+  all the way to 500. A single global cap is set by the *limiting* label, so 200 deliberately
+  under-serves the hardest few. If coverage on those matters more than storage, there is no
+  quality reason to cap below 500 — the data is there and still helping.
+
+Caveats on the number: the sample itself is truncated at 500 (labels larger than that never
+expose their tail, so the curve only describes "up to 500"), it is one mailbox at one point in
+time, and holdout optimism means real future mail is harder — prefer the conservative end of a
+flat region. The skip pool was capped in lockstep in this run; whether it wants a *lower* cap
+than labels is the open `--no-cap-skip` axis (not yet run), so the "one cap for both" choice
+above stands on principle, not yet on measurement.
 
 ### Labeled wins over skip (the one semantic rule the single table needs)
 
@@ -869,12 +893,13 @@ that is the natural stopping point if the `state` backend is deferred.
 
 ## Costs / wrinkles (accepted, but explicit)
 
-1. **Slow first boot.** ~4331 messages = that many `get_message` calls + parse + serial
-   embed. On the e2-micro, plausibly **10–20 min** for a fresh VM (parse alone was 327 s at
-   this corpus size; serial embed adds more). First boot only; restarts are fast. The total is
-   **bounded** by `--max-per-label` applied to every set — see "Bounding the bootstrap total":
-   at most `--max-per-label × (label_count + 1)`. Lowering the cap is the direct lever on
-   first-boot time.
+1. **Slow first boot.** At the *uncapped* corpus (~4331 messages) that many `get_message`
+   calls + parse + serial embed is plausibly **10–20 min** on a fresh e2-micro (parse alone was
+   327 s at this size; serial embed adds more). The recommended `--max-per-label = 200` roughly
+   halves this to ~2k reads. First boot only; restarts are fast. The total is **bounded** by
+   `--max-per-label` applied to every set — see "Bounding the bootstrap total": at most
+   `--max-per-label × (label_count + 1)`. Lowering the cap is the direct lever on first-boot
+   time.
 2. **Credentials still ship.** "Look at Gmail" needs the OAuth token + client secret. Deploy
    is code **+ `credentials/`**, not code alone. One small dir, not user training data.
 3. **Model / text-representation changes force a re-fetch.** With no bodies persisted,
