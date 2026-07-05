@@ -62,7 +62,7 @@ def deployed_version():
         return "unknown"
 
 
-def _build_backend(args, excluded):
+def _build_backend(args, excluded, client, embedder):
     """Construct the selected StorageBackend. The only place that branches on
     the backend choice; callers downstream see just a StorageBackend.
 
@@ -71,6 +71,10 @@ def _build_backend(args, excluded):
     fingerprint-matching store) is wired in this phase -- the Gmail-backed
     bootstrap/rebuild/reconcile paths fail closed with a clear message rather
     than silently loading stale state (they land in Phase 4).
+
+    ``client``/``embedder`` are the already-authenticated Gmail client and the
+    embedder, so the state path can validate the store against the *actual*
+    mailbox account id and current ML fingerprint.
     """
     if args.storage == "legacy":
         return LegacyBackend(args.training_db, args.skip_db, excluded)
@@ -84,16 +88,17 @@ def _build_backend(args, excluded):
         decide_startup,
     )
 
+    # The live mailbox's account id, so a state.db copied from another account
+    # is rejected instead of warm-started with the wrong label ids/cursor.
+    gmail_account_id = client.get_profile_email()
+
     backend = StateBackend(args.state_db, excluded)
-    embedder = Embedder()
     decision = decide_startup(
         backend.store,
         schema_version=STATE_SCHEMA_VERSION,
         ml_fingerprint=compute_ml_fingerprint(embedder.model_name, embedder.dimension),
         excluded_hash=compute_excluded_hash(excluded),
-        # gmail_account_id validation lands with the Gmail-backed paths (Phase 4);
-        # a seeded/bootstrapped store records it then.
-        gmail_account_id=backend.store.get_meta("gmail_account_id"),
+        gmail_account_id=gmail_account_id,
     )
     if decision is not StartupDecision.WARM:
         backend.close()
@@ -163,16 +168,29 @@ def main():
     if excluded:
         print(f"  Excluded labels: {', '.join(sorted(excluded))}")
 
+    # Connect to Gmail FIRST. The state backend needs the authenticated
+    # mailbox's account id to validate that a state.db belongs to this mailbox
+    # (a copied/stale DB from another account must not warm-start), and that
+    # check has to run before the backend is selected -- so auth precedes the
+    # backend build rather than following the index load.
+    print("Authenticating...")
+    credentials_dir = Path(args.credentials)
+    creds = get_credentials(credentials_dir)
+    service = get_gmail_service(credentials_dir)
+    client = GmailClient(service)
+    _credentials = creds  # saved for Pub/Sub client
+
+    embedder = Embedder()
+
     # Build the storage backend behind the seam. The runtime below talks only
     # to this interface, never to a concrete store. Only the selector branches
     # on which backend to build; everything downstream sees a StorageBackend.
-    backend = _build_backend(args, excluded)
+    backend = _build_backend(args, excluded, client, embedder)
 
     # Build the runtime index (config exclusion + labeled-wins-over-skip dedup +
     # cache-backed embedding). The assembly logic lives in the backend/training
     # module so it is unit-testable apart from this I/O shell.
     print("Embedding training data...")
-    embedder = Embedder()
     loaded = backend.load_index(embedder)
     index, skip_ids, stats = loaded.index, loaded.skip_ids, loaded.stats
 
@@ -185,14 +203,6 @@ def main():
     print(f"  {stats.n_skip} skip examples{note}")
     trim_memory()
     print(f"  {index.embeddings.shape[0]} embeddings, {index.embeddings.shape[1]} dimensions")
-
-    # Connect to Gmail
-    print("Authenticating...")
-    credentials_dir = Path(args.credentials)
-    creds = get_credentials(credentials_dir)
-    service = get_gmail_service(credentials_dir)
-    client = GmailClient(service)
-    _credentials = creds  # saved for Pub/Sub client
 
     # Build label registry (refreshes automatically on new labels)
     registry = LabelRegistry(client, excluded=excluded)

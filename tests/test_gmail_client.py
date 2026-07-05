@@ -8,6 +8,16 @@ from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.models import HistoryExpiredError
 
 
+def test_get_profile_email():
+    service = MagicMock()
+    service.users().getProfile.return_value.execute.return_value = {
+        "emailAddress": "user@gmail.com",
+        "messagesTotal": 42,
+    }
+    client = GmailClient(service)
+    assert client.get_profile_email() == "user@gmail.com"
+
+
 def test_list_user_labels():
     service = MagicMock()
     service.users().labels().list.return_value.execute.return_value = {

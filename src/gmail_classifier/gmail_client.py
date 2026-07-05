@@ -11,6 +11,16 @@ class GmailClient:
     def __init__(self, service):
         self._service = service
 
+    def get_profile_email(self) -> str:
+        """Return the authenticated mailbox's email address.
+
+        Used by the state backend to bind a ``state.db`` to the mailbox that
+        produced it, so a copied/stale DB from another account is rejected
+        rather than warm-started with the wrong label ids and history cursor.
+        """
+        profile = self._service.users().getProfile(userId="me").execute()
+        return profile.get("emailAddress", "")
+
     def list_user_labels(self) -> List[Tuple[str, str]]:
         """List user-created labels. Returns [(id, name), ...]."""
         response = self._service.users().labels().list(userId="me").execute()
