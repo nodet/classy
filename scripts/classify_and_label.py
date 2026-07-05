@@ -313,10 +313,23 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     # Track messages labeled by the classifier itself (to ignore echoed events)
     self_labeled = set()
 
-    # Do an initial inbox check to catch anything missed
-    print("Initial inbox check...")
-    _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
-                 self_labeled)
+    # The labeling inbox sweep is LEGACY-ONLY. It lists the current INBOX and
+    # classifies whatever is unlabeled -- catch-up-after-downtime behavior that
+    # is correct for legacy (which always fresh-watches and treats the current
+    # inbox as work). It is unsafe for the state backend: inbox listing carries
+    # no per-message historyId, so it cannot enforce the read-only boundary, and
+    # known_ids is incomplete when the skip pool is only sampled -- so a sweep
+    # could label/archive pre-boundary backlog. State catches up via history
+    # replay from its durable cursor instead; read-only resync (for expired /
+    # out-of-window cursors) lands in Phase 4, so until then state fails closed
+    # rather than falling back to a labeling inbox poll.
+    is_legacy = args.storage == "legacy"
+
+    if is_legacy:
+        # Do an initial inbox check to catch anything missed.
+        print("Initial inbox check...")
+        _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
+                     self_labeled)
 
     if args.once:
         return
@@ -332,13 +345,25 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         prefix = "\n" if lead_newline else ""
         print(f"{prefix}{now()} {message}")
 
+    def _check_inbox_fallback():
+        # The loop calls this on HistoryExpiredError. On legacy it's the inbox
+        # poll; on state it must NOT label the backlog (see note above), and the
+        # read-only resync that should run instead is not implemented yet, so we
+        # fail closed by raising rather than silently sweeping the inbox.
+        if not is_legacy:
+            raise NotImplementedError(
+                "state backend history-expiry recovery (read-only resync + "
+                "re-pin) is not implemented yet (Phase 4); refusing to fall "
+                "back to a labeling inbox poll that could archive backlog."
+            )
+        _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
+                     self_labeled)
+
     deps = LoopDeps(
         make_subscriber=_make_subscriber,
         watch=lambda: client.watch(PUBSUB_TOPIC),
         get_history=client.get_history,
-        check_inbox=lambda: _check_inbox(
-            args, client, embedder, index, registry, skip_ids, backend,
-            self_labeled),
+        check_inbox=_check_inbox_fallback,
         process_events=lambda events: _process_events(
             events, args, client, embedder, index, registry,
             skip_ids, self_labeled, backend),
