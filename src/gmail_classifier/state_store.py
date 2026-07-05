@@ -143,9 +143,14 @@ def decide_startup(
     if stored_schema is not None and stored_schema != schema_version:
         return StartupDecision.INCOMPATIBLE
 
+    # A warm store must be *bound* to this mailbox: require a non-empty stored
+    # account id that equals the live one. A missing/empty stored value is not a
+    # free pass -- an old, manually seeded, or partially populated state.db that
+    # never recorded its account is not actually tied to this mailbox, so its
+    # label ids and history cursor cannot be trusted. Treat missing, empty, or
+    # mismatched as INCOMPATIBLE (a hard reset, same as a schema mismatch).
     stored_account = store.get_meta("gmail_account_id")
-    if (gmail_account_id is not None and stored_account is not None
-            and stored_account != gmail_account_id):
+    if not stored_account or stored_account != gmail_account_id:
         return StartupDecision.INCOMPATIBLE
 
     if store.get_meta("ml_fingerprint") != ml_fingerprint:

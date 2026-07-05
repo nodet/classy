@@ -270,6 +270,30 @@ def test_dispatch_account_mismatch_is_incompatible(tmp_path):
     store.close()
 
 
+def test_dispatch_missing_account_is_incompatible(tmp_path):
+    """A store that never recorded its account id is not bound to this mailbox,
+    so it must NOT warm-start even when every other fingerprint matches."""
+    store = StateStore(str(tmp_path / "state.db"))
+    _seed_complete(store, ml="ml-1", excluded_hash="ex-1", account="acct-1")
+    store.set_meta("gmail_account_id", None)  # absent stored account
+    d = decide_startup(store, schema_version=STATE_SCHEMA_VERSION,
+                       ml_fingerprint="ml-1", excluded_hash="ex-1",
+                       gmail_account_id="acct-1")
+    assert d is StartupDecision.INCOMPATIBLE
+    store.close()
+
+
+def test_dispatch_empty_account_is_incompatible(tmp_path):
+    """An empty stored account id is treated the same as a missing one."""
+    store = StateStore(str(tmp_path / "state.db"))
+    _seed_complete(store, ml="ml-1", excluded_hash="ex-1", account="")
+    d = decide_startup(store, schema_version=STATE_SCHEMA_VERSION,
+                       ml_fingerprint="ml-1", excluded_hash="ex-1",
+                       gmail_account_id="acct-1")
+    assert d is StartupDecision.INCOMPATIBLE
+    store.close()
+
+
 # --------------------------------------------------------------------------
 # StateBackend: seam adapter (warm load + live-adaptation writes, no body)
 # --------------------------------------------------------------------------
