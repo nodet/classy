@@ -31,6 +31,7 @@ from gmail_classifier.sample_size import (
     per_label_stats,
     recommend_cap,
     sample_pool,
+    select_latest,
     split_ids_by_set,
     tally,
 )
@@ -113,8 +114,15 @@ def _stack(ids: list, vectors: dict, id_to_label: dict):
     return embs, labels
 
 
-def run_sweep(vectors, id_to_label, *, ns, seeds, k, cap_skip):
-    """Return raw rows: dicts of scope/label/N/seed/threshold/metrics."""
+def run_sweep(vectors, id_to_label, id_to_date, *, ns, seeds, k, cap_skip):
+    """Return raw rows: dicts of policy/scope/label/N/seed/threshold/metrics.
+
+    Two sampling policies share the *same* held-out test set per seed, so the only
+    variable between them is how the training pool is subsampled:
+      - ``random``: a random N per seed (variance across seeds).
+      - ``latest``: the N most recent by date (what the live newest-first cap keeps;
+        deterministic given the pool, but the pool still varies by seed's holdout).
+    """
     rows = []
     for seed in range(seeds):
         split = split_ids_by_set(id_to_label, seed=seed)
@@ -122,30 +130,35 @@ def run_sweep(vectors, id_to_label, *, ns, seeds, k, cap_skip):
         rng = np.random.default_rng(1000 + seed)
 
         for n in ns:
-            train_ids = []
-            for set_name, pool in split.pool_by_set.items():
-                if set_name == SKIP_LABEL and not cap_skip:
-                    train_ids.extend(pool)  # skip axis fixed: use whole pool
-                else:
-                    train_ids.extend(sample_pool(pool, n, rng))
-            train_embs, train_labels = _stack(train_ids, vectors, id_to_label)
+            selections = {
+                "random": lambda pool: sample_pool(pool, n, rng),
+                "latest": lambda pool: select_latest(pool, n, id_to_date),
+            }
+            for policy, select in selections.items():
+                train_ids = []
+                for set_name, pool in split.pool_by_set.items():
+                    if set_name == SKIP_LABEL and not cap_skip:
+                        train_ids.extend(pool)  # skip axis fixed: use whole pool
+                    else:
+                        train_ids.extend(select(pool))
+                train_embs, train_labels = _stack(train_ids, vectors, id_to_label)
 
-            results = holdout_predict(train_embs, train_labels, test_embs, test_labels, k=k)
-            for t in THRESHOLDS:
-                agg = tally(results, t)
-                rows.append({
-                    "scope": "aggregate", "label": "", "N": n, "seed": seed,
-                    "threshold": t, "precision": agg.precision, "coverage": agg.coverage,
-                    "mislabel_rate": agg.mislabel_rate, "skip_fp_rate": agg.skip_fp_rate,
-                    "n_test": agg.n_test_user,
-                })
-                for label, st in per_label_stats(results, t).items():
+                results = holdout_predict(train_embs, train_labels, test_embs, test_labels, k=k)
+                for t in THRESHOLDS:
+                    agg = tally(results, t)
                     rows.append({
-                        "scope": "per_label", "label": label, "N": n, "seed": seed,
-                        "threshold": t, "precision": st["precision"], "coverage": st["coverage"],
-                        "mislabel_rate": float("nan"), "skip_fp_rate": float("nan"),
-                        "n_test": st["total"],
+                        "policy": policy, "scope": "aggregate", "label": "", "N": n, "seed": seed,
+                        "threshold": t, "precision": agg.precision, "coverage": agg.coverage,
+                        "mislabel_rate": agg.mislabel_rate, "skip_fp_rate": agg.skip_fp_rate,
+                        "n_test": agg.n_test_user,
                     })
+                    for label, st in per_label_stats(results, t).items():
+                        rows.append({
+                            "policy": policy, "scope": "per_label", "label": label, "N": n,
+                            "seed": seed, "threshold": t, "precision": st["precision"],
+                            "coverage": st["coverage"], "mislabel_rate": float("nan"),
+                            "skip_fp_rate": float("nan"), "n_test": st["total"],
+                        })
     return rows
 
 
@@ -154,7 +167,7 @@ def _mean(xs):
 
 
 def _write_csv(rows, path: Path):
-    cols = ["scope", "label", "N", "seed", "threshold", "precision", "coverage",
+    cols = ["policy", "scope", "label", "N", "seed", "threshold", "precision", "coverage",
             "mislabel_rate", "skip_fp_rate", "n_test"]
     lines = [",".join(cols)]
     for r in rows:
@@ -163,55 +176,66 @@ def _write_csv(rows, path: Path):
 
 
 def _write_summary(rows, split, path: Path, *, k, seeds, cap_skip):
-    def agg_curve(metric, threshold):
+    policies = ["random", "latest"]
+
+    def agg_curve(policy, metric, threshold):
         curve = {}
         for n in SWEEP_NS:
-            vals = [r[metric] for r in rows
-                    if r["scope"] == "aggregate" and r["N"] == n and r["threshold"] == threshold]
+            vals = [r[metric] for r in rows if r["policy"] == policy
+                    and r["scope"] == "aggregate" and r["N"] == n and r["threshold"] == threshold]
             if vals:
                 curve[n] = _mean(vals)
         return curve
 
     lines = ["# Sample-size experiment — results", ""]
     lines.append(f"k={k}, seeds={seeds}, skip pool {'capped in lockstep' if cap_skip else 'fixed (uncapped)'}.")
+    lines.append("")
+    lines.append("Two training-pool sampling policies over the **same** held-out test set: "
+                 "**random** N (variance across seeds) vs **latest** N by date "
+                 "(what the live newest-first `--max-per-label` cap actually keeps).")
     if split.low_confidence_sets:
         lines.append(f"\n> Low-confidence sets (test set < min_test, read with caution): "
                      f"{', '.join(split.low_confidence_sets)}")
     lines.append("")
 
     for t in THRESHOLDS:
-        prec = agg_curve("precision", t)
-        cov = agg_curve("coverage", t)
-        mis = agg_curve("mislabel_rate", t)
-        sfp = agg_curve("skip_fp_rate", t)
-        cap = recommend_cap(prec, cov)
         lines.append(f"## Aggregate @ threshold {t:.2f}")
         lines.append("")
-        lines.append("| N | precision | coverage | mislabel | skip-FP |")
-        lines.append("|---|---|---|---|---|")
-        for n in sorted(prec):
-            lines.append(f"| {n} | {prec[n]:.3f} | {cov[n]:.3f} | {mis[n]:.3f} | {sfp[n]:.3f} |")
-        lines.append("")
-        lines.append(f"**Recommended cap @ {t:.2f}: "
-                     f"{cap if cap is not None else 'none meets target'}** "
-                     f"(smallest N with precision ≥ 0.97 and coverage within 2 pts of N={max(cov)}).")
-        lines.append("")
+        for policy in policies:
+            prec = agg_curve(policy, "precision", t)
+            cov = agg_curve(policy, "coverage", t)
+            mis = agg_curve(policy, "mislabel_rate", t)
+            sfp = agg_curve(policy, "skip_fp_rate", t)
+            cap = recommend_cap(prec, cov)
+            lines.append(f"### policy = {policy}")
+            lines.append("")
+            lines.append("| N | precision | coverage | mislabel | skip-FP |")
+            lines.append("|---|---|---|---|---|")
+            for n in sorted(prec):
+                lines.append(f"| {n} | {prec[n]:.3f} | {cov[n]:.3f} | {mis[n]:.3f} | {sfp[n]:.3f} |")
+            lines.append("")
+            lines.append(f"**Recommended cap ({policy}) @ {t:.2f}: "
+                         f"{cap if cap is not None else 'none meets target'}** "
+                         f"(smallest N with precision ≥ 0.97 and coverage within 2 pts of N={max(cov)}).")
+            lines.append("")
 
-    # Per-label knees at the review threshold (0.80).
-    lines.append("## Per-label precision @ 0.80 (mean over seeds)")
-    lines.append("")
+    # Per-label knees at the review threshold (0.80), per policy.
     labels = sorted({r["label"] for r in rows if r["scope"] == "per_label"})
-    header = "| label | " + " | ".join(f"N={n}" for n in SWEEP_NS) + " |"
-    lines.append(header)
-    lines.append("|" + "---|" * (len(SWEEP_NS) + 1))
-    for label in labels:
-        cells = []
-        for n in SWEEP_NS:
-            vals = [r["precision"] for r in rows if r["scope"] == "per_label"
-                    and r["label"] == label and r["N"] == n and r["threshold"] == 0.80]
-            cells.append(f"{_mean(vals):.2f}" if vals else "—")
-        lines.append(f"| {label} | " + " | ".join(cells) + " |")
-    lines.append("")
+    for policy in policies:
+        lines.append(f"## Per-label precision @ 0.80 — policy = {policy} (mean over seeds)")
+        lines.append("")
+        header = "| label | " + " | ".join(f"N={n}" for n in SWEEP_NS) + " |"
+        lines.append(header)
+        lines.append("|" + "---|" * (len(SWEEP_NS) + 1))
+        for label in labels:
+            cells = []
+            for n in SWEEP_NS:
+                vals = [r["precision"] for r in rows if r["policy"] == policy
+                        and r["scope"] == "per_label" and r["label"] == label
+                        and r["N"] == n and r["threshold"] == 0.80]
+                cells.append(f"{_mean(vals):.2f}" if vals else "—")
+            lines.append(f"| {label} | " + " | ".join(cells) + " |")
+        lines.append("")
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -236,11 +260,13 @@ def main():
         print("No messages found.")
         sys.exit(1)
 
+    id_to_date = {mid: msg.date for mid, (msg, _) in messages.items()}
+
     out_dir = Path(args.out_dir)
     vectors, id_to_label = _embed_all(messages, out_dir / "vectors.npz")
 
     split0 = split_ids_by_set(id_to_label, seed=0)
-    rows = run_sweep(vectors, id_to_label, ns=SWEEP_NS, seeds=args.seeds,
+    rows = run_sweep(vectors, id_to_label, id_to_date, ns=SWEEP_NS, seeds=args.seeds,
                      k=args.k, cap_skip=not args.no_cap_skip)
 
     _write_csv(rows, out_dir / "learning_curve.csv")

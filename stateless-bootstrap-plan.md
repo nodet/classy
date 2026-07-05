@@ -296,6 +296,16 @@ What the curve showed:
   all the way to 500. A single global cap is set by the *limiting* label, so 200 deliberately
   under-serves the hardest few. If coverage on those matters more than storage, there is no
   quality reason to cap below 500 — the data is there and still helping.
+- **Recency vs. random selection matters (mildly).** The experiment ran two training-pool
+  policies over the same held-out test set: a *random* N and the *latest* N by date. The live
+  cap keeps the latest N (`list_message_ids(max_results=N)` returns newest-first), so **latest
+  is the policy that predicts deployed behavior** — and it is consistently ~1–2 pts *worse* on
+  coverage in the mid-range (0.93→0.93 at 200, but 0.87 vs 0.89 at 100) with a higher skip
+  false-positive rate (≈29% vs 19% at N=50). The newest messages cluster (recent bursts) and
+  under-cover each label's breadth. So the earlier "200 is conservative" reading was
+  wrong-signed: latest-N is the *harder* arm, making 200 slightly optimistic vs. a random draw
+  — but the gap is within ~2 pts and does not change the choice. Note at the strict 0.95
+  threshold, latest never reaches the coverage plateau below 500.
 
 Caveats on the number: the sample itself is truncated at 500 (labels larger than that never
 expose their tail, so the curve only describes "up to 500"), it is one mailbox at one point in

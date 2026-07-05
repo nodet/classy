@@ -4,10 +4,12 @@ import pytest
 from gmail_classifier.classifier import Action, SKIP_LABEL
 from gmail_classifier.cross_validation import PredictionResult, leave_one_out
 from gmail_classifier.sample_size import (
+    date_key,
     holdout_predict,
     per_label_stats,
     recommend_cap,
     sample_pool,
+    select_latest,
     split_ids_by_set,
     tally,
 )
@@ -149,6 +151,59 @@ def test_sample_pool_size_and_membership():
     got = sample_pool(pool, 20, np.random.default_rng(0))
     assert len(got) == 20
     assert set(got).issubset(set(pool))
+
+
+# --- date_key / select_latest ----------------------------------------------
+
+def test_date_key_orders_chronologically():
+    older = date_key("Mon, 4 May 2026 06:17:16 +0200")
+    newer = date_key("Tue, 16 Jun 2026 06:09:45 +0200")
+    assert older < newer
+
+
+def test_date_key_respects_timezone():
+    # Same wall-clock instant, different zones -> equal epoch keys.
+    utc = date_key("Tue, 16 Jun 2026 10:00:00 +0000")
+    plus2 = date_key("Tue, 16 Jun 2026 12:00:00 +0200")
+    assert utc == pytest.approx(plus2)
+
+
+def test_date_key_empty_and_bad_sort_oldest():
+    assert date_key("") == float("-inf")
+    assert date_key("not a date") == float("-inf")
+
+
+def test_select_latest_takes_most_recent():
+    id_to_date = {
+        "a": "Mon, 4 May 2026 06:00:00 +0000",
+        "b": "Tue, 16 Jun 2026 06:00:00 +0000",
+        "c": "Sun, 29 Mar 2026 06:00:00 +0000",
+        "d": "Wed, 1 Jul 2026 06:00:00 +0000",
+    }
+    got = select_latest(["a", "b", "c", "d"], 2, id_to_date)
+    assert set(got) == {"b", "d"}  # the two newest
+
+
+def test_select_latest_returns_all_when_n_exceeds_pool():
+    id_to_date = {"a": "Mon, 4 May 2026 06:00:00 +0000"}
+    assert select_latest(["a"], 5, id_to_date) == ["a"]
+
+
+def test_select_latest_is_deterministic():
+    id_to_date = {f"m{i}": f"Mon, {i+1} May 2026 06:00:00 +0000" for i in range(10)}
+    ids = list(id_to_date)
+    first = select_latest(ids, 4, id_to_date)
+    second = select_latest(list(reversed(ids)), 4, id_to_date)
+    assert first == second  # order-independent
+
+
+def test_select_latest_missing_date_sorts_last():
+    id_to_date = {
+        "recent": "Wed, 1 Jul 2026 06:00:00 +0000",
+        "nodate": "",
+    }
+    # With n=1, the dated message must win over the undated one.
+    assert select_latest(["recent", "nodate"], 1, id_to_date) == ["recent"]
 
 
 # --- tally ------------------------------------------------------------------

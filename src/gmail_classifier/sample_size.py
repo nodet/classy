@@ -141,6 +141,44 @@ def sample_pool(pool_ids: List[str], n: int, rng: np.random.Generator) -> List[s
     return [ids[perm[i]] for i in range(n)]
 
 
+def date_key(date_str: str) -> float:
+    """Sortable epoch-seconds key from an RFC-2822 ``Date:`` header.
+
+    Naive (no-timezone) dates are treated as UTC. Unparseable/empty dates sort
+    to the *oldest* position (``-inf``) so they are the first dropped by a
+    latest-N selection rather than masquerading as recent.
+    """
+    import email.utils
+
+    if not date_str:
+        return float("-inf")
+    try:
+        dt = email.utils.parsedate_to_datetime(date_str)
+    except (ValueError, TypeError):
+        return float("-inf")
+    if dt is None:
+        return float("-inf")
+    if dt.tzinfo is None:
+        import datetime
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def select_latest(pool_ids: List[str], n: int, id_to_date: Dict[str, str]) -> List[str]:
+    """Take the ``n`` most recent ids from a pool (production's newest-first cap).
+
+    Deterministic: sorts by date descending, breaking ties by id so the result is
+    stable regardless of input order. This mirrors what the live service keeps --
+    ``list_message_ids(max_results=N)`` returns newest-first -- so pairing it with
+    ``sample_pool`` isolates *sampling policy* (recency vs. random) as the only
+    variable, the test set held fixed.
+    """
+    if n >= len(pool_ids):
+        return sorted(pool_ids)
+    ordered = sorted(pool_ids, key=lambda mid: (date_key(id_to_date.get(mid, "")), mid), reverse=True)
+    return ordered[:n]
+
+
 @dataclass
 class Tally:
     """Operational metrics at one confidence threshold over one test set.
