@@ -496,16 +496,35 @@ def _send_crash_alert(exc):
     )
 
 
-if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, _sigterm_handler)
+def _run_with_shutdown_handling(main_fn):
+    """Run ``main_fn`` and translate shutdown/exit into the right process code.
+
+    A clean stop (Ctrl-C, or SIGTERM via ``_sigterm_handler`` raising
+    ``SystemExit(0)``) prints "Stopped." and exits 0. But a **failed** exit --
+    ``_validate_storage_mode``'s ``sys.exit(1)`` or the state cursor's
+    ``raise SystemExit(...)`` -- must propagate its original non-zero code, not
+    be flattened to success. Otherwise systemd/cron/CI would read a rejected
+    config or fail-closed startup as a clean run and never restart or alert.
+    """
     try:
-        main()
-    except (KeyboardInterrupt, SystemExit):
+        main_fn()
+    except KeyboardInterrupt:
         print(f"\n{datetime.now().strftime('%H:%M:%S')} Stopped.")
         sys.exit(0)
+    except SystemExit as e:
+        # Only a zero/None code is a clean stop worth the "Stopped." banner;
+        # any non-zero code is a real failure and must reach the caller intact.
+        if e.code in (0, None):
+            print(f"\n{datetime.now().strftime('%H:%M:%S')} Stopped.")
+        raise
     except Exception as e:
         try:
             _send_crash_alert(e)
         except Exception:
             pass  # don't mask the original error
         raise
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    _run_with_shutdown_handling(main)
