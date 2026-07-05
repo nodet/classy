@@ -14,8 +14,9 @@ import numpy as np
 
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.models import HistoryEvent
-from gmail_classifier.storage import MessageStore
 from gmail_classifier.training_index import TrainingIndex
+
+from tests.fakes import FakeBackend
 
 FLOAT_BYTES = 4
 DIM = 384
@@ -116,8 +117,7 @@ def _relabel_peak_bytes(tmp_path, n_start, n_batch):
     client = MagicMock()
     client.get_message.side_effect = lambda mid: _raw(mid, "Label_T")
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
+    backend = FakeBackend()
 
     rng = np.random.default_rng(1)
     index = TrainingIndex(
@@ -134,8 +134,7 @@ def _relabel_peak_bytes(tmp_path, n_start, n_batch):
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
+        backend=backend,
         label_id_to_name={"Label_T": "Transports"},
         user_label_ids={"Label_T"},
         excluded_labels=set(),
@@ -144,9 +143,6 @@ def _relabel_peak_bytes(tmp_path, n_start, n_batch):
     )
     peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
-
-    training_store.close()
-    skip_store.close()
 
     assert len(index) == n_start + n_batch  # the whole batch really was applied
     final_matrix = (n_start + n_batch) * DIM * FLOAT_BYTES

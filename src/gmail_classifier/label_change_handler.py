@@ -1,6 +1,6 @@
 """Handle label change events from Gmail history."""
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.embeddings import Embedder
@@ -9,15 +9,16 @@ from gmail_classifier.gmail_parser import parse_gmail_message
 from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.models import HistoryEvent
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation
-from gmail_classifier.storage import MessageStore
 from gmail_classifier.training_index import TrainingIndex
+
+if TYPE_CHECKING:
+    from gmail_classifier.storage_backend import StorageBackend
 
 
 def process_label_changes(
     events: List[HistoryEvent],
     client: GmailClient,
-    training_store: MessageStore,
-    skip_store: MessageStore,
+    backend: "StorageBackend",
     label_id_to_name: Dict[str, str],
     user_label_ids: Set[str],
     excluded_labels: Set[str],
@@ -32,6 +33,10 @@ def process_label_changes(
     - Label removed: if message has no other user labels, remove from
       training and add to skip.
     - Label moved (remove + add same message): update training, not skip.
+
+    Persistence goes through the ``StorageBackend`` seam (``upsert_label`` /
+    ``upsert_skip`` / ``remove``) rather than naming concrete stores, so the
+    same handler serves either backend.
 
     If index and embedder are provided, also updates the in-memory
     training index for immediate effect on classification.
@@ -113,14 +118,14 @@ def process_label_changes(
             label_name = label_id_to_name[label_id]
             msg.labels = [label_name]
 
-            training_store.save_message(msg)
-            # Remove from skip pool if present
-            if skip_store.has_message(mid):
-                skip_store.delete_messages([mid])
-
-            # Update in-memory index
+            embedding = None
             if index is not None and embedder is not None:
                 embedding = _embed_message(msg, embedder)
+
+            backend.upsert_label(msg, label_id, embedding)
+
+            # Update in-memory index
+            if embedding is not None:
                 index_updates.append((mid, embedding, label_name))
 
             # Track the movement
@@ -140,14 +145,17 @@ def process_label_changes(
 
             if not has_user_label:
                 # No user labels left — move to skip
-                training_store.delete_messages([mid])
                 msg = parse_gmail_message(raw)
                 msg.labels = []
-                skip_store.save_message(msg)
 
-                # Update in-memory index: remove from training, add as skip
+                embedding = None
                 if index is not None and embedder is not None:
                     embedding = _embed_message(msg, embedder)
+
+                backend.upsert_skip(msg, embedding)
+
+                # Update in-memory index: remove from training, add as skip
+                if embedding is not None:
                     index_updates.append((mid, embedding, SKIP_LABEL))
 
                 # Track the movement
@@ -157,7 +165,7 @@ def process_label_changes(
             else:
                 # Still has a user label (maybe a different one) — just remove old entry
                 # The labelsAdded event for the new label will handle re-adding
-                training_store.delete_messages([mid])
+                backend.remove(mid)
 
     if index is not None and index_updates:
         index.add_many(index_updates)

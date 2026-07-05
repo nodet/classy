@@ -6,8 +6,9 @@ from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.models import HistoryEvent, Message
-from gmail_classifier.storage import MessageStore
 from gmail_classifier.training_index import TrainingIndex
+
+from tests.fakes import FakeBackend
 
 
 def _make_raw_message(msg_id, subject="Test", label_ids=None):
@@ -25,8 +26,8 @@ def _make_raw_message(msg_id, subject="Test", label_ids=None):
     }
 
 
-def test_label_added_updates_training(tmp_path):
-    """When a user label is added, message goes into training DB."""
+def test_label_added_updates_training():
+    """When a user label is added, message is recorded as a labeled example."""
     events = [
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
     ]
@@ -34,40 +35,27 @@ def test_label_added_updates_training(tmp_path):
     client = MagicMock()
     client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_1"])
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
-
-    # Pre-populate skip store with msg1
-    skip_store.save_message(Message(id="msg1", subject="Test", from_address="a@x.com", labels=[]))
-
-    label_id_to_name = {"Label_1": "Tech"}
-    user_label_ids = {"Label_1"}
+    backend = FakeBackend()
+    # Pre-populate skip with msg1
+    backend.skipped["msg1"] = Message(id="msg1", subject="Test", from_address="a@x.com", labels=[])
 
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
-        label_id_to_name=label_id_to_name,
-        user_label_ids=user_label_ids,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech"},
+        user_label_ids={"Label_1"},
         excluded_labels=set(),
     )
 
-    # Message should be in training
-    training_msgs = training_store.load_all()
-    assert len(training_msgs) == 1
-    assert training_msgs[0].id == "msg1"
-    assert training_msgs[0].labels == ["Tech"]
-
-    # Message should be removed from skip
-    assert not skip_store.has_message("msg1")
-
-    training_store.close()
-    skip_store.close()
+    # Message should be labeled Tech and dropped from skip.
+    assert "msg1" in backend.labeled
+    assert backend.labeled["msg1"].labels == ["Tech"]
+    assert "msg1" not in backend.skipped
 
 
-def test_label_removed_moves_to_skip(tmp_path):
-    """When a user label is removed and message has no other user labels, it goes to skip."""
+def test_label_removed_moves_to_skip():
+    """When a user label is removed and no user labels remain, message goes to skip."""
     events = [
         HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
     ]
@@ -76,119 +64,78 @@ def test_label_removed_moves_to_skip(tmp_path):
     # Message now only has INBOX (no user labels left)
     client.get_message.return_value = _make_raw_message("msg1", label_ids=["INBOX"])
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
-
-    # Pre-populate training with msg1
-    training_store.save_message(
-        Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
-    )
-
-    label_id_to_name = {"Label_1": "Tech"}
-    user_label_ids = {"Label_1"}
+    backend = FakeBackend()
+    backend.labeled["msg1"] = Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
 
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
-        label_id_to_name=label_id_to_name,
-        user_label_ids=user_label_ids,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech"},
+        user_label_ids={"Label_1"},
         excluded_labels=set(),
     )
 
-    # Message should be removed from training
-    assert not training_store.has_message("msg1")
-
-    # Message should be in skip
-    skip_msgs = skip_store.load_all()
-    assert len(skip_msgs) == 1
-    assert skip_msgs[0].id == "msg1"
-
-    training_store.close()
-    skip_store.close()
+    # Message moved from labeled to skip.
+    assert "msg1" not in backend.labeled
+    assert "msg1" in backend.skipped
 
 
-def test_label_moved_updates_training_not_skip(tmp_path):
-    """When label A removed and label B added on same message, update training only."""
+def test_label_moved_updates_training_not_skip():
+    """When label A removed and label B added on same message, update label only."""
     events = [
         HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_2"]),
     ]
 
     client = MagicMock()
-    # Message now has Label_2
     client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_2"])
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
-
-    # Pre-populate training with msg1 under Tech
-    training_store.save_message(
-        Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
-    )
-
-    label_id_to_name = {"Label_1": "Tech", "Label_2": "Travel"}
-    user_label_ids = {"Label_1", "Label_2"}
+    backend = FakeBackend()
+    backend.labeled["msg1"] = Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
 
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
-        label_id_to_name=label_id_to_name,
-        user_label_ids=user_label_ids,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech", "Label_2": "Travel"},
+        user_label_ids={"Label_1", "Label_2"},
         excluded_labels=set(),
     )
 
-    # Message should be in training under Travel
-    training_msgs = training_store.load_all()
-    assert len(training_msgs) == 1
-    assert training_msgs[0].labels == ["Travel"]
-
-    # Should NOT be in skip
-    assert not skip_store.has_message("msg1")
-
-    training_store.close()
-    skip_store.close()
+    # Message re-labeled Travel, never moved to skip.
+    assert backend.labeled["msg1"].labels == ["Travel"]
+    assert "msg1" not in backend.skipped
 
 
-def test_excluded_label_changes_ignored(tmp_path):
+def test_excluded_label_changes_ignored():
     """Changes to excluded labels should be ignored."""
     events = [
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_XLC"]),
     ]
 
     client = MagicMock()
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
-
-    label_id_to_name = {"Label_XLC": "XLC"}
-    user_label_ids = {"Label_XLC"}
+    backend = FakeBackend()
 
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
-        label_id_to_name=label_id_to_name,
-        user_label_ids=user_label_ids,
+        backend=backend,
+        label_id_to_name={"Label_XLC": "XLC"},
+        user_label_ids={"Label_XLC"},
         excluded_labels={"XLC"},
     )
 
     # No fetch, no store changes
     client.get_message.assert_not_called()
-    assert training_store.load_all() == []
-    assert skip_store.load_all() == []
-
-    training_store.close()
-    skip_store.close()
+    assert backend.labeled == {}
+    assert backend.skipped == {}
 
 
 # --- Tests for in-memory index updates ---
 
 
-def test_label_added_updates_in_memory_index(tmp_path):
+def test_label_added_updates_in_memory_index():
     """When a label is added and index is provided, index gets updated."""
     events = [
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
@@ -197,8 +144,7 @@ def test_label_added_updates_in_memory_index(tmp_path):
     client = MagicMock()
     client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_1"])
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
+    backend = FakeBackend()
 
     # Start with an empty index (just one dummy entry)
     index = TrainingIndex(
@@ -213,8 +159,7 @@ def test_label_added_updates_in_memory_index(tmp_path):
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
+        backend=backend,
         label_id_to_name={"Label_1": "Tech"},
         user_label_ids={"Label_1"},
         excluded_labels=set(),
@@ -227,11 +172,8 @@ def test_label_added_updates_in_memory_index(tmp_path):
     idx = index._id_to_idx["msg1"]
     assert index.labels[idx] == "Tech"
 
-    training_store.close()
-    skip_store.close()
 
-
-def test_label_removed_updates_in_memory_index_to_skip(tmp_path):
+def test_label_removed_updates_in_memory_index_to_skip():
     """When a label is removed and no labels left, index entry becomes __skip__."""
     events = [
         HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
@@ -240,11 +182,8 @@ def test_label_removed_updates_in_memory_index_to_skip(tmp_path):
     client = MagicMock()
     client.get_message.return_value = _make_raw_message("msg1", label_ids=["INBOX"])
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
-    training_store.save_message(
-        Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
-    )
+    backend = FakeBackend()
+    backend.labeled["msg1"] = Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
 
     # Index has msg1 as Tech
     embeddings = np.random.randn(2, 384).astype(np.float32)
@@ -256,8 +195,7 @@ def test_label_removed_updates_in_memory_index_to_skip(tmp_path):
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
+        backend=backend,
         label_id_to_name={"Label_1": "Tech"},
         user_label_ids={"Label_1"},
         excluded_labels=set(),
@@ -270,14 +208,11 @@ def test_label_removed_updates_in_memory_index_to_skip(tmp_path):
     idx = index._id_to_idx["msg1"]
     assert index.labels[idx] == SKIP_LABEL
 
-    training_store.close()
-    skip_store.close()
-
 
 # --- Tests for dynamic label discovery via LabelRegistry ---
 
 
-def test_unknown_label_triggers_refresh_and_processes(tmp_path):
+def test_unknown_label_triggers_refresh_and_processes():
     """When a label ID is unknown and registry is provided, refresh discovers it."""
     events = [
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_NEW"]),
@@ -292,8 +227,7 @@ def test_unknown_label_triggers_refresh_and_processes(tmp_path):
     ]
 
     registry = LabelRegistry(client, excluded=set())
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
+    backend = FakeBackend()
 
     index = TrainingIndex(
         np.random.randn(1, 384).astype(np.float32),
@@ -306,8 +240,7 @@ def test_unknown_label_triggers_refresh_and_processes(tmp_path):
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
+        backend=backend,
         label_id_to_name={},  # ignored when registry provided
         user_label_ids=set(),
         excluded_labels=set(),
@@ -320,21 +253,16 @@ def test_unknown_label_triggers_refresh_and_processes(tmp_path):
     assert registry.is_known("Label_NEW")
     assert registry.get_name("Label_NEW") == "Science"
 
-    # Message should be in training under the new label
-    training_msgs = training_store.load_all()
-    assert len(training_msgs) == 1
-    assert training_msgs[0].labels == ["Science"]
+    # Message should be labeled under the new label
+    assert backend.labeled["msg1"].labels == ["Science"]
 
     # In-memory index should have the new entry
     assert "msg1" in index
     idx = index._id_to_idx["msg1"]
     assert index.labels[idx] == "Science"
 
-    training_store.close()
-    skip_store.close()
 
-
-def test_unknown_label_still_unknown_after_refresh_is_skipped(tmp_path):
+def test_unknown_label_still_unknown_after_refresh_is_skipped():
     """If label is still unknown after refresh, the event is silently skipped."""
     events = [
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_GHOST"]),
@@ -345,14 +273,12 @@ def test_unknown_label_still_unknown_after_refresh_is_skipped(tmp_path):
     client.list_user_labels.return_value = [("L1", "Tech")]
 
     registry = LabelRegistry(client, excluded=set())
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
+    backend = FakeBackend()
 
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
+        backend=backend,
         label_id_to_name={},
         user_label_ids=set(),
         excluded_labels=set(),
@@ -361,13 +287,10 @@ def test_unknown_label_still_unknown_after_refresh_is_skipped(tmp_path):
 
     # No message fetched, nothing stored
     client.get_message.assert_not_called()
-    assert training_store.load_all() == []
-
-    training_store.close()
-    skip_store.close()
+    assert backend.labeled == {}
 
 
-def test_movements_summary_inbox_to_label(tmp_path):
+def test_movements_summary_inbox_to_label():
     """Movement summary reports messages moved from inbox to a label."""
     events = [
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
@@ -382,19 +305,14 @@ def test_movements_summary_inbox_to_label(tmp_path):
         _make_raw_message("msg3", label_ids=["Label_2"]),
     ]
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
-
-    label_id_to_name = {"Label_1": "Tech", "Label_2": "Travel"}
-    user_label_ids = {"Label_1", "Label_2"}
+    backend = FakeBackend()
 
     movements = process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
-        label_id_to_name=label_id_to_name,
-        user_label_ids=user_label_ids,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech", "Label_2": "Travel"},
+        user_label_ids={"Label_1", "Label_2"},
         excluded_labels=set(),
     )
 
@@ -404,11 +322,8 @@ def test_movements_summary_inbox_to_label(tmp_path):
         ("inbox", "Travel", 1),
     ])
 
-    training_store.close()
-    skip_store.close()
 
-
-def test_movements_summary_label_to_inbox(tmp_path):
+def test_movements_summary_label_to_inbox():
     """Movement summary reports messages moved from a label to inbox (unlabeled)."""
     events = [
         HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
@@ -422,31 +337,23 @@ def test_movements_summary_label_to_inbox(tmp_path):
         _make_raw_message("msg2", label_ids=["INBOX"]),
     ]
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
-    training_store.save_message(Message(id="msg1", subject="A", from_address="a@x.com", labels=["Tech"]))
-    training_store.save_message(Message(id="msg2", subject="B", from_address="b@x.com", labels=["Tech"]))
-
-    label_id_to_name = {"Label_1": "Tech"}
-    user_label_ids = {"Label_1"}
+    backend = FakeBackend()
+    backend.labeled["msg1"] = Message(id="msg1", subject="A", from_address="a@x.com", labels=["Tech"])
+    backend.labeled["msg2"] = Message(id="msg2", subject="B", from_address="b@x.com", labels=["Tech"])
 
     movements = process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
-        label_id_to_name=label_id_to_name,
-        user_label_ids=user_label_ids,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech"},
+        user_label_ids={"Label_1"},
         excluded_labels=set(),
     )
 
     assert movements == [("Tech", "inbox", 2)]
 
-    training_store.close()
-    skip_store.close()
 
-
-def test_movements_summary_label_to_label(tmp_path):
+def test_movements_summary_label_to_label():
     """Movement summary reports messages moved between labels."""
     events = [
         HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
@@ -456,30 +363,22 @@ def test_movements_summary_label_to_label(tmp_path):
     client = MagicMock()
     client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_2"])
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
-    training_store.save_message(Message(id="msg1", subject="A", from_address="a@x.com", labels=["Tech"]))
-
-    label_id_to_name = {"Label_1": "Tech", "Label_2": "Travel"}
-    user_label_ids = {"Label_1", "Label_2"}
+    backend = FakeBackend()
+    backend.labeled["msg1"] = Message(id="msg1", subject="A", from_address="a@x.com", labels=["Tech"])
 
     movements = process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
-        label_id_to_name=label_id_to_name,
-        user_label_ids=user_label_ids,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech", "Label_2": "Travel"},
+        user_label_ids={"Label_1", "Label_2"},
         excluded_labels=set(),
     )
 
     assert movements == [("Tech", "Travel", 1)]
 
-    training_store.close()
-    skip_store.close()
 
-
-def test_ignore_ids_skips_self_labeled_messages(tmp_path):
+def test_ignore_ids_skips_self_labeled_messages():
     """Messages in ignore_ids are skipped (classifier's own echo)."""
     events = [
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
@@ -489,37 +388,28 @@ def test_ignore_ids_skips_self_labeled_messages(tmp_path):
     client = MagicMock()
     client.get_message.return_value = _make_raw_message("msg2", label_ids=["Label_1"])
 
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
-
-    label_id_to_name = {"Label_1": "Tech"}
-    user_label_ids = {"Label_1"}
+    backend = FakeBackend()
     ignore_ids = {"msg1"}  # msg1 was labeled by the classifier
 
     movements = process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
-        label_id_to_name=label_id_to_name,
-        user_label_ids=user_label_ids,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech"},
+        user_label_ids={"Label_1"},
         excluded_labels=set(),
         ignore_ids=ignore_ids,
     )
 
     # Only msg2 should be processed (msg1 ignored)
-    assert len(training_store.load_all()) == 1
-    assert training_store.load_all()[0].id == "msg2"
+    assert list(backend.labeled) == ["msg2"]
     assert movements == [("inbox", "Tech", 1)]
 
     # msg1 should be removed from ignore_ids (so future corrections work)
     assert "msg1" not in ignore_ids
 
-    training_store.close()
-    skip_store.close()
 
-
-def test_ignore_ids_allows_subsequent_user_correction(tmp_path):
+def test_ignore_ids_allows_subsequent_user_correction():
     """After being ignored once, the same message ID can be processed (user correction)."""
     # First call: classifier labeled msg1, echo comes back → ignored
     events1 = [
@@ -527,8 +417,7 @@ def test_ignore_ids_allows_subsequent_user_correction(tmp_path):
     ]
 
     client = MagicMock()
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
+    backend = FakeBackend()
 
     label_id_to_name = {"Label_1": "Tech", "Label_2": "Travel"}
     user_label_ids = {"Label_1", "Label_2"}
@@ -537,8 +426,7 @@ def test_ignore_ids_allows_subsequent_user_correction(tmp_path):
     process_label_changes(
         events=events1,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
+        backend=backend,
         label_id_to_name=label_id_to_name,
         user_label_ids=user_label_ids,
         excluded_labels=set(),
@@ -558,8 +446,7 @@ def test_ignore_ids_allows_subsequent_user_correction(tmp_path):
     movements = process_label_changes(
         events=events2,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
+        backend=backend,
         label_id_to_name=label_id_to_name,
         user_label_ids=user_label_ids,
         excluded_labels=set(),
@@ -567,16 +454,11 @@ def test_ignore_ids_allows_subsequent_user_correction(tmp_path):
     )
 
     # Should be processed now (user correction)
-    training_msgs = training_store.load_all()
-    assert len(training_msgs) == 1
-    assert training_msgs[0].labels == ["Travel"]
+    assert backend.labeled["msg1"].labels == ["Travel"]
     assert movements == [("Tech", "Travel", 1)]
 
-    training_store.close()
-    skip_store.close()
 
-
-def test_new_excluded_label_is_ignored(tmp_path):
+def test_new_excluded_label_is_ignored():
     """A newly discovered label that's in the excluded set is not processed."""
     events = [
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_XLZ"]),
@@ -589,14 +471,12 @@ def test_new_excluded_label_is_ignored(tmp_path):
     ]
 
     registry = LabelRegistry(client, excluded={"XLZ"})
-    training_store = MessageStore(str(tmp_path / "training.db"))
-    skip_store = MessageStore(str(tmp_path / "skip.db"))
+    backend = FakeBackend()
 
     process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
+        backend=backend,
         label_id_to_name={},
         user_label_ids=set(),
         excluded_labels=set(),
@@ -605,7 +485,4 @@ def test_new_excluded_label_is_ignored(tmp_path):
 
     # Excluded label: no message fetch, no storage
     client.get_message.assert_not_called()
-    assert training_store.load_all() == []
-
-    training_store.close()
-    skip_store.close()
+    assert backend.labeled == {}

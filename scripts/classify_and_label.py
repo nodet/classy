@@ -9,26 +9,23 @@ Modes:
   pubsub: wait for Gmail push notifications via Pub/Sub
 """
 import argparse
+import os
 import signal
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-
 from gmail_classifier.auth import get_credentials, get_gmail_service
 from gmail_classifier.classifier import Action
 from gmail_classifier.config import excluded_labels
-from gmail_classifier.embedding_cache import EmbeddingCache
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
 from gmail_classifier.history_processor import process_history_events
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.memory import trim_memory
-from gmail_classifier.storage import MessageStore
-from gmail_classifier.training import assemble_training_index
+from gmail_classifier.storage_legacy import LegacyBackend
 
 PUBSUB_TOPIC = "projects/classy-498012/topics/gmail-notifications"
 PUBSUB_SUBSCRIPTION = "projects/classy-498012/subscriptions/gmail-notifications-sub"
@@ -105,48 +102,44 @@ def main():
         "--mode", choices=["poll", "pubsub"], default="poll",
         help="Notification mode: poll (default) or pubsub",
     )
+    parser.add_argument(
+        "--storage", choices=["legacy", "state"],
+        default=os.environ.get("CLASSY_STORAGE", "legacy"),
+        help="Storage backend (default: legacy, or $CLASSY_STORAGE)",
+    )
     args = parser.parse_args()
 
-    print(f"gmail-classifier version: {deployed_version()}", flush=True)
-
-    # Load training data
-    print("Loading training data...")
-    train_store = MessageStore(args.training_db)
-    train_messages = train_store.load_all()
-    train_store.close()
-
-    if not train_messages:
-        print("No training messages found.")
+    if args.storage != "legacy":
+        # Only the legacy backend is wired up in this phase; the state backend
+        # plugs in behind the same StorageBackend seam later.
+        print(f"Storage backend '{args.storage}' is not available yet.")
         sys.exit(1)
+
+    print(f"gmail-classifier version: {deployed_version()}", flush=True)
 
     excluded = set(excluded_labels())
     if excluded:
         print(f"  Excluded labels: {', '.join(sorted(excluded))}")
 
-    # Load skip examples (the inbox sample used as __skip__ negatives)
-    skip_messages = []
-    skip_path = Path(args.skip_db)
-    if skip_path.exists():
-        skip_store = MessageStore(args.skip_db)
-        skip_messages = skip_store.load_all()
-        skip_store.close()
+    # Build the storage backend behind the seam. The runtime below talks only
+    # to this interface, never to a concrete store.
+    backend = LegacyBackend(args.training_db, args.skip_db, excluded)
 
     # Build the runtime index (config exclusion + labeled-wins-over-skip dedup +
-    # cache-backed embedding) -- the assembly logic lives in training so it is
-    # unit-testable apart from this I/O shell.
-    cache_path = Path(args.training_db).parent / "embeddings.db"
-    cache = EmbeddingCache(str(cache_path))
+    # cache-backed embedding). The assembly logic lives in the backend/training
+    # module so it is unit-testable apart from this I/O shell.
     print("Embedding training data...")
     embedder = Embedder()
-    index, skip_ids, stats = assemble_training_index(
-        train_messages, skip_messages,
-        excluded=excluded, embedder=embedder, cache=cache,
-    )
-    cache.close()
+    loaded = backend.load_index(embedder)
+    index, skip_ids, stats = loaded.index, loaded.skip_ids, loaded.stats
+
+    if stats.n_train == 0:
+        print("No training messages found.")
+        sys.exit(1)
+
     print(f"  {stats.n_train} training messages")
     note = f" ({stats.n_dropped} also labeled, kept as labeled)" if stats.n_dropped else ""
     print(f"  {stats.n_skip} skip examples{note}")
-    del train_messages, skip_messages
     trim_memory()
     print(f"  {index.embeddings.shape[0]} embeddings, {index.embeddings.shape[1]} dimensions")
 
@@ -161,21 +154,24 @@ def main():
     # Build label registry (refreshes automatically on new labels)
     registry = LabelRegistry(client, excluded=excluded)
 
-    if args.mode == "pubsub":
-        _run_pubsub_mode(args, client, _credentials, embedder, index,
-                         registry, skip_ids)
-    else:
-        _run_poll_mode(args, client, embedder, index,
-                       registry, skip_ids)
+    try:
+        if args.mode == "pubsub":
+            _run_pubsub_mode(args, client, _credentials, embedder, index,
+                             registry, skip_ids, backend)
+        else:
+            _run_poll_mode(args, client, embedder, index,
+                           registry, skip_ids, backend)
+    finally:
+        backend.close()
 
 
 def _run_poll_mode(args, client, embedder, index,
-                   registry, skip_ids):
+                   registry, skip_ids, backend):
     """Poll inbox every N seconds."""
     print(f"\nReady (poll mode, every {args.interval}s). Ctrl+C to stop.\n")
 
     while True:
-        _check_inbox(args, client, embedder, index, registry, skip_ids)
+        _check_inbox(args, client, embedder, index, registry, skip_ids, backend)
 
         if args.once:
             break
@@ -183,20 +179,16 @@ def _run_poll_mode(args, client, embedder, index,
 
 
 def _process_events(events, args, client, embedder, index, registry,
-                    skip_ids, self_labeled):
+                    skip_ids, self_labeled, backend):
     """Handle a batch of history events: label changes, classification, output."""
     if not events:
         return
 
-    # Process label changes (update training/skip DBs + in-memory index)
-    training_store = MessageStore(args.training_db)
-    skip_store = MessageStore(args.skip_db)
-
+    # Process label changes (persist via the backend + update in-memory index)
     movements = process_label_changes(
         events=events,
         client=client,
-        training_store=training_store,
-        skip_store=skip_store,
+        backend=backend,
         label_id_to_name=registry.id_to_name,
         user_label_ids=registry.user_label_ids,
         excluded_labels=set(),
@@ -236,11 +228,7 @@ def _process_events(events, args, client, embedder, index, registry,
             print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
             if not args.dry_run:
                 msg = r["message"]
-                msg.labels = []
-                skip_store.save_message(msg)
-
-    training_store.close()
-    skip_store.close()
+                backend.upsert_skip(msg)
 
     # Only reclaim when the batch did real work. Hand back the heap a heavy
     # message (big HTML parse + embed) just grew, so RSS falls back to idle
@@ -250,7 +238,7 @@ def _process_events(events, args, client, embedder, index, registry,
 
 
 def _run_pubsub_mode(args, client, credentials, embedder, index,
-                     registry, skip_ids):
+                     registry, skip_ids, backend):
     """Wait for Pub/Sub notifications and process via history API."""
     from gmail_classifier.pubsub import PubSubSubscriber
     from gmail_classifier.pubsub_loop import LoopState, LoopDeps, run_iteration
@@ -265,7 +253,8 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
 
     # Do an initial inbox check to catch anything missed
     print("Initial inbox check...")
-    _check_inbox(args, client, embedder, index, registry, skip_ids, self_labeled)
+    _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
+                 self_labeled)
 
     if args.once:
         return
@@ -286,10 +275,11 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         watch=lambda: client.watch(PUBSUB_TOPIC),
         get_history=client.get_history,
         check_inbox=lambda: _check_inbox(
-            args, client, embedder, index, registry, skip_ids, self_labeled),
+            args, client, embedder, index, registry, skip_ids, backend,
+            self_labeled),
         process_events=lambda events: _process_events(
             events, args, client, embedder, index, registry,
-            skip_ids, self_labeled),
+            skip_ids, self_labeled, backend),
         log=_log,
     )
 
@@ -313,34 +303,30 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
             pass
 
 
-def _check_inbox(args, client, embedder, index, registry, skip_ids,
+def _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
                  self_labeled=None):
     """Check inbox and classify new messages (poll mode)."""
     from gmail_classifier.inbox_check import process_inbox
 
-    # Peek at whether there's anything new before opening the store, so the
-    # idle case stays cheap with no DB handle.
+    # Peek at whether there's anything new before doing any work, so the idle
+    # case stays cheap.
     inbox_ids = client.list_message_ids(label_id="INBOX", max_results=args.max_messages)
     if not any(mid not in skip_ids for mid in inbox_ids):
         return
 
-    skip_store = MessageStore(args.skip_db)
-    try:
-        results = process_inbox(
-            client=client,
-            embedder=embedder,
-            index=index,
-            registry=registry,
-            skip_ids=skip_ids,
-            skip_store=skip_store,
-            k=args.k,
-            max_messages=args.max_messages,
-            dry_run=args.dry_run,
-            self_labeled=self_labeled,
-            inbox_ids=inbox_ids,
-        )
-    finally:
-        skip_store.close()
+    results = process_inbox(
+        client=client,
+        embedder=embedder,
+        index=index,
+        registry=registry,
+        skip_ids=skip_ids,
+        backend=backend,
+        k=args.k,
+        max_messages=args.max_messages,
+        dry_run=args.dry_run,
+        self_labeled=self_labeled,
+        inbox_ids=inbox_ids,
+    )
 
     w = registry.max_label_width
     for r in results:

@@ -23,7 +23,7 @@ def process_inbox(
     index,
     registry,
     skip_ids: Set[str],
-    skip_store,
+    backend,
     k: int = 5,
     max_messages: int = 50,
     dry_run: bool = False,
@@ -38,9 +38,10 @@ def process_inbox(
     ``sender``, ``subject``, and either ``applied`` (bool) or ``warning``
     (True when the predicted label doesn't exist in Gmail).
 
-    Side effects: applies labels (unless ``dry_run``), saves SKIP messages to
-    ``skip_store`` (unless ``dry_run``), and records processed ids in
-    ``skip_ids`` (and ``self_labeled`` when a label was actually applied).
+    Side effects: applies labels (unless ``dry_run``), records SKIP messages
+    through ``backend.upsert_skip`` (unless ``dry_run``), and records processed
+    ids in ``skip_ids`` (and ``self_labeled`` when a label was actually
+    applied).
 
     ``inbox_ids`` may be supplied by a caller that already listed the inbox, to
     avoid a redundant API call; otherwise the inbox is listed here.
@@ -101,8 +102,7 @@ def process_inbox(
         else:
             entry["applied"] = False
             if not dry_run:
-                msg.labels = []
-                skip_store.save_message(msg)
+                backend.upsert_skip(msg, query_embedding)
 
         # Remember this message so it's not re-processed.
         skip_ids.add(mid)

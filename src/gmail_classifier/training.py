@@ -158,6 +158,12 @@ def build_training_data(
     labels = [m.labels[0] for m in labeled]
     ids = [m.id for m in labeled]
 
+    if not ids:
+        # No labeled messages: return an empty index. The dimension is unknown
+        # without a vector, but classify() short-circuits on a zero-length index
+        # before any matmul, so a (0, 0) array is safe.
+        return np.empty((0, 0), dtype=np.float32), [], []
+
     # Look up cached embeddings
     cached = cache.get_batch(ids)
     miss_indices = [i for i, mid in enumerate(ids) if mid not in cached]
