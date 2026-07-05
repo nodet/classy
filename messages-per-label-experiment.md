@@ -17,10 +17,9 @@ recommended cap and the evidence behind it, not a single guessed number.
 ## What already exists (reuse map — do NOT rebuild)
 
 - **Capture:** `scripts/fetch_training_data.py --max-per-label 500` → `data/training.db`
-  (one label per message, `--max-per-label` default already 500). `scripts/fetch_inbox.py` →
-  `data/inbox_sample.db` (the skip pool). **Caveat:** `fetch_inbox` lists INBOX *uncapped*
-  (`inbox_check.py:49` → `list_message_ids("INBOX")`), so capturing "500 inbox" is a small
-  change, not free today.
+  (one label per message, `--max-per-label` default already 500). `scripts/fetch_inbox.py
+  --count 500` → `data/inbox_sample.db` (the skip pool; `--count` default is already 500 and it
+  slices the INBOX listing, so "500 inbox" needs no code change).
 - **Embedding:** `training.build_training_data(messages, embedder)` → `(embeddings, labels,
   ids)`. `embeddings.Embedder` is the FastEmbed runtime — the expensive step; embed once.
 - **KNN + decision:** `classifier.find_neighbors` / `aggregate_scores` / `compute_confidence`
@@ -50,9 +49,9 @@ classifier get right?"
 
 ### Phase 0 — Capture and embed once (store for later, as you suggested)
 
-- Fetch **500 per user label** into `data/training.db` (already the default) and **cap the inbox
-  capture at 500** into `data/inbox_sample.db` (add a `--max-messages` to `fetch_inbox`, or
-  slice after listing). 500 is the ceiling of the sweep; keep the raw DBs as the durable
+- Fetch **500 per user label** into `data/training.db` (already the default) and **500 inbox
+  messages** into `data/inbox_sample.db` via `fetch_inbox --count 500` (already the default; it
+  slices the listing). 500 is the ceiling of the sweep; keep the raw DBs as the durable
   "just in case" corpus.
 - Embed **every** captured message exactly once via `build_training_data` and persist vectors to
   `data/experiments/vectors.npz` keyed by message id (plus a sidecar `labels.json`:

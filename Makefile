@@ -1,4 +1,4 @@
-.PHONY: help setup test quick clean reauth fetch-training fetch-inbox evaluate dry-run classify watch watch-pubsub embed \
+.PHONY: help setup test quick clean reauth fetch-training fetch-inbox evaluate experiment-sample-size dry-run classify watch watch-pubsub embed \
        service-install service-uninstall service-start service-stop service-restart service-status service-logs \
        gcp-create gcp-slim gcp-deploy gcp-destroy gcp-start gcp-stop gcp-restart gcp-status gcp-logs gcp-ssh
 
@@ -36,6 +36,9 @@ fetch-inbox: ## Fetch recent inbox messages for dry-run classification
 
 evaluate: ## Run cross-validation evaluation on stored messages
 	uv run python scripts/train_and_evaluate.py
+
+experiment-sample-size: ## Learning curve: how many messages/label are needed
+	uv run python scripts/experiment_sample_size.py
 
 dry-run: ## Classify inbox messages without modifying Gmail
 	uv run python scripts/dry_run.py
