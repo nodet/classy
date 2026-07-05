@@ -75,7 +75,21 @@ def _validate_storage_mode(args):
     ``--mode`` defaults to poll while ``--storage``/``$CLASSY_STORAGE`` can be
     state, so guard here rather than trusting the pubsub-only sweep gate. Fail
     closed until the read-only resync path lands (Phase 4).
+
+    Also validate the storage value itself: argparse only enforces ``choices``
+    for values typed on the command line, not for the default -- and the default
+    comes straight from ``$CLASSY_STORAGE``. So a typo like ``CLASSY_STORAGE=stat``
+    would slip through, and ``_build_backend`` would treat any non-"legacy" value
+    as the state backend. Reject unknown values here, before that dispatch.
     """
+    if args.storage not in ("legacy", "state"):
+        print(
+            f"--storage must be 'legacy' or 'state' (got {args.storage!r}). "
+            "Check the --storage argument or the $CLASSY_STORAGE environment "
+            "variable for a typo."
+        )
+        sys.exit(1)
+
     if args.storage == "state" and args.mode != "pubsub":
         print(
             f"--storage state requires --mode pubsub (got --mode {args.mode}). "
@@ -102,6 +116,13 @@ def _build_backend(args, excluded, client, embedder):
     """
     if args.storage == "legacy":
         return LegacyBackend(args.training_db, args.skip_db, excluded)
+
+    # Explicit: anything that isn't a known backend is a bug or an unvalidated
+    # value slipping past _validate_storage_mode -- never silently fall through
+    # to the state backend (which archives differently and must not run by
+    # accident on a mistyped $CLASSY_STORAGE).
+    if args.storage != "state":
+        raise ValueError(f"unknown storage backend: {args.storage!r}")
 
     from gmail_classifier.state_store import (
         STATE_SCHEMA_VERSION,

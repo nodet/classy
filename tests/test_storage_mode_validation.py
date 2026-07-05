@@ -36,3 +36,28 @@ def test_state_pubsub_mode_is_allowed():
 def test_legacy_poll_mode_is_allowed():
     args = SimpleNamespace(storage="legacy", mode="poll")
     cal._validate_storage_mode(args)  # no raise
+
+
+def test_invalid_storage_value_is_rejected():
+    """argparse only enforces `choices` for command-line values, not the
+    default -- and the default is $CLASSY_STORAGE. A typo must be rejected here,
+    before _build_backend treats any non-legacy value as the state backend."""
+    args = SimpleNamespace(storage="stat", mode="poll")
+    with pytest.raises(SystemExit) as exc:
+        cal._validate_storage_mode(args)
+    assert exc.value.code == 1
+
+
+def test_invalid_storage_value_rejected_even_in_pubsub():
+    args = SimpleNamespace(storage="stat", mode="pubsub")
+    with pytest.raises(SystemExit) as exc:
+        cal._validate_storage_mode(args)
+    assert exc.value.code == 1
+
+
+def test_build_backend_raises_on_unknown_storage():
+    """Defense in depth: even if an unvalidated value reaches _build_backend,
+    it must not silently fall through to the state backend."""
+    args = SimpleNamespace(storage="stat", training_db="t", skip_db="s")
+    with pytest.raises(ValueError):
+        cal._build_backend(args, excluded=set(), client=None, embedder=None)
