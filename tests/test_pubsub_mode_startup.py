@@ -11,6 +11,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 _SPEC = importlib.util.spec_from_file_location(
     "classify_and_label",
     Path(__file__).resolve().parent.parent / "scripts" / "classify_and_label.py",
@@ -37,11 +39,15 @@ class _SweepClient:
         return []  # empty -> _check_inbox returns right after listing
 
 
-class _NoCursorBackend:
+class _CursorBackend:
+    """A durable cursor stand-in. The state path fails closed without one, so a
+    test that wants to reach the sweep gate must supply a resume cursor."""
+    def __init__(self, cursor=None):
+        self._cursor = cursor
     def get_last_processed_history_id(self):
-        return None
+        return self._cursor
     def set_last_processed_history_id(self, hid):
-        pass
+        self._cursor = hid
 
 
 def _pubsub_args(storage):
@@ -56,7 +62,7 @@ def test_startup_inbox_sweep_runs_on_legacy():
     cal._run_pubsub_mode(
         _pubsub_args("legacy"), client, credentials=None,
         embedder=_FakeEmbedder(), index=object(), registry=object(),
-        skip_ids=set(), backend=_NoCursorBackend(),
+        skip_ids=set(), backend=_CursorBackend(),
     )
     assert client.list_calls == 1  # legacy sweeps the inbox at startup
 
@@ -68,6 +74,33 @@ def test_startup_inbox_sweep_skipped_on_state():
     cal._run_pubsub_mode(
         _pubsub_args("state"), client, credentials=None,
         embedder=_FakeEmbedder(), index=object(), registry=object(),
-        skip_ids=set(), backend=_NoCursorBackend(),
+        skip_ids=set(), backend=_CursorBackend(cursor="400"),
     )
     assert client.list_calls == 0  # no inbox sweep on the state path
+
+
+def test_state_without_cursor_fails_closed():
+    """A warm-looking state.db with no durable cursor must NOT start at the
+    fresh watch boundary -- that would silently skip all history before the
+    watch (and the state path also skips the startup sweep, so it would never
+    be seen). Fail closed instead of adopting an arbitrary boundary."""
+    client = _SweepClient()
+    with pytest.raises(SystemExit):
+        cal._run_pubsub_mode(
+            _pubsub_args("state"), client, credentials=None,
+            embedder=_FakeEmbedder(), index=object(), registry=object(),
+            skip_ids=set(), backend=_CursorBackend(cursor=None),
+        )
+    assert client.list_calls == 0  # bailed before any inbox work
+
+
+def test_legacy_without_cursor_uses_watch_boundary():
+    """Legacy has no durable cursor and legitimately adopts the fresh watch id;
+    it must not be caught by the state fail-closed guard."""
+    client = _SweepClient()
+    cal._run_pubsub_mode(
+        _pubsub_args("legacy"), client, credentials=None,
+        embedder=_FakeEmbedder(), index=object(), registry=object(),
+        skip_ids=set(), backend=_CursorBackend(cursor=None),
+    )
+    assert client.list_calls == 1  # started normally, swept the inbox

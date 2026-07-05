@@ -330,7 +330,24 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     # restart) so history since the last processed id is replayed rather than
     # skipped by adopting the fresh watch boundary. Legacy has no durable cursor
     # (returns None), so it starts from the fresh watch id exactly as before.
+    is_legacy = args.storage == "legacy"
     resume_id = backend.get_last_processed_history_id()
+
+    # Only legacy may adopt the fresh watch id as its starting cursor. For state,
+    # a missing cursor means every history event before this watch would be
+    # silently skipped -- and because the state path also skips the startup inbox
+    # sweep, that mail would never be seen at all. A warm-looking state.db with no
+    # last_processed_history_id is therefore a bug (bootstrap should have pinned
+    # one); fail closed rather than start from an arbitrary boundary. The
+    # read-only resync that recovers a missing/expired cursor lands in Phase 4.
+    if not is_legacy and not resume_id:
+        raise SystemExit(
+            "state backend has no durable history cursor to resume from; "
+            "starting at the fresh watch boundary would silently skip all "
+            "prior history. Bootstrap must pin last_processed_history_id "
+            "(Phase 4); refusing to start."
+        )
+
     history_id = resume_id or watch_history_id
     if resume_id:
         print(f"  Resuming from persisted historyId={resume_id}")
@@ -348,8 +365,6 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     # replay from its durable cursor instead; read-only resync (for expired /
     # out-of-window cursors) lands in Phase 4, so until then state fails closed
     # rather than falling back to a labeling inbox poll.
-    is_legacy = args.storage == "legacy"
-
     if is_legacy:
         # Do an initial inbox check to catch anything missed.
         print("Initial inbox check...")
