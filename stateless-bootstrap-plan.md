@@ -217,8 +217,13 @@ embeddings; one file = one connection, atomic, trivial to reset.)
    - `list_user_labels()` minus the **configured excluded labels** (see "Excluded-label
      configuration"; XLC/XLE/XLCap are only *this* deployment's defaults).
    - For each label: `list_message_ids(label_id, max_results=--max-per-label)`.
-   - For the skip pool: list recent INBOX ids, **minus any id that already carries a
-     user label** (see "Labeled wins over skip" below).
+   - For the skip pool: list recent INBOX ids capped at **`--max-per-label`** (newest first) —
+     `__skip__` is treated as one more set, so the same per-set cap applies —
+     **minus any id that already carries a user label** (see "Labeled wins over skip"
+     below). The cap is required: `list_message_ids(label_id="INBOX")` with no limit
+     returns the *entire* inbox, so without it the skip pool grows to the whole mailbox
+     — the dominant unbounded-index grower (see "Bounding the bootstrap total" and
+     wrinkle #7).
    - For each id **not already embedded**: `get_message` → parse → `build_text_representation`
      → `embedder.embed` → `cache.put(id, vec)` + record `id→label_id` (or `__skip__`).
      Discard the raw message. **One at a time** — bounded memory, resumable.
@@ -255,6 +260,25 @@ embeddings; one file = one connection, atomic, trivial to reset.)
 5. Either path → the pubsub loop. The **cold** (bootstrap) path enters a progressive variant —
    see "Progressive bootstrap" below — so the service is live and safe from the first second
    rather than after a 20-min wait.
+
+### Bounding the bootstrap total
+
+Bootstrap must fetch a **bounded** number of messages. `__skip__` is just one more set in the
+KNN index (a row in the `labels` table like any label), so a single per-set cap —
+**`--max-per-label`**, the existing flag (default **500**) — bounds every set, the skip pool
+included. No separate skip cap: there is no principled reason the skip pool should hold a
+different number of examples than a user label.
+
+So `total ≈ Σ_labels min(--max-per-label, n_label) + min(--max-per-label, n_inbox)`, i.e. at
+most `--max-per-label × (label_count + 1)`. With ~11 labels this is the ~4–5k first-boot reads
+in wrinkle #1.
+
+The cap is **well above what maturity needs**, and that is deliberate but worth stating: the
+maturity gate only wants ≈`MATURITY_EXAMPLES_PER_LABEL` (~20) per set (see "Two gates"). The
+bootstrap cap sizes the *durable corpus* (classification quality + KNN neighborhood density),
+not the point at which the service starts labeling. The uncapped INBOX listing is the
+dominant unbounded-index grower (wrinkle #7) and issue #1's per-set coreset cap is the
+eventual bound.
 
 ### Labeled wins over skip (the one semantic rule the single table needs)
 
@@ -705,8 +729,10 @@ proven before the more intricate early-labeling logic lands.
 
 - `bootstrap.py`: `watch()` **first** (pin the boundary + persist the cursor), then
   round-robin over labels + front-loaded skip pool, one-at-a-time fetch→embed→cache→discard,
-  resumable (skip ids already embedded). Excludes the **configured** labels at the source (see
-  "Excluded-label configuration"); labeled-wins-over-skip at the source.
+  resumable (skip ids already embedded). Bounded by `--max-per-label` applied to every set,
+  the INBOX/skip listing included — see "Bounding the bootstrap total". Excludes the
+  **configured** labels at the source (see "Excluded-label configuration");
+  labeled-wins-over-skip at the source.
 - **Read-only over pre-existing mail:** the cold path removes the labeling initial inbox check
   entirely — existing mail is only read to embed it, never labeled or archived.
 - Reuse the same fetch/embed primitives for ML-fingerprint rebuilds and excluded-label
@@ -845,14 +871,18 @@ that is the natural stopping point if the `state` backend is deferred.
 
 1. **Slow first boot.** ~4331 messages = that many `get_message` calls + parse + serial
    embed. On the e2-micro, plausibly **10–20 min** for a fresh VM (parse alone was 327 s at
-   this corpus size; serial embed adds more). First boot only; restarts are fast.
+   this corpus size; serial embed adds more). First boot only; restarts are fast. The total is
+   **bounded** by `--max-per-label` applied to every set — see "Bounding the bootstrap total":
+   at most `--max-per-label × (label_count + 1)`. Lowering the cap is the direct lever on
+   first-boot time.
 2. **Credentials still ship.** "Look at Gmail" needs the OAuth token + client secret. Deploy
    is code **+ `credentials/`**, not code alone. One small dir, not user training data.
 3. **Model / text-representation changes force a re-fetch.** With no bodies persisted,
    changing the embedding model or `build_text_representation` invalidates the cache and
    requires re-bootstrapping. Consistent with "Gmail is truth," but a real consequence.
 4. **Gmail API volume.** ~4–5k reads on first boot; well within daily quota, network-bound
-   not quota-bound. Keep the existing `--max-per-label` cap to bound it.
+   not quota-bound. Bounded by `--max-per-label` applied to every set, the skip pool included
+   (see "Bounding the bootstrap total").
 5. **Local dev unaffected by default.** `make fetch-training`/`fetch-inbox` + the DB files can
    remain for local runs; unqualified local targets and the macOS service continue to use
    `legacy` unless `--storage state` / `CLASSY_STORAGE=state` is explicitly set. (Or converge
@@ -862,10 +892,13 @@ that is the natural stopping point if the `state` backend is deferred.
    `chmod 600 data/state.db`, never upload `state.db` from the VM by default, and keep
    message ids out of normal logs.
 7. **Skip pool is never refreshed (accepted).** `__skip__` vectors are seeded once at bootstrap
-   and persist indefinitely. As sampled inbox mail is later archived or deleted in Gmail, those
-   rows linger — semantically harmless (an old "inbox-like" example is still a valid negative)
-   but unbounded-in-staleness. Accepted for now; a periodic resample of the skip pool is a
-   possible later refinement, not required for correctness.
+   (capped at `--max-per-label` like every set — see "Bounding the bootstrap total", so the
+   *initial* set is bounded) and persist indefinitely. As sampled inbox mail is later archived or deleted in
+   Gmail, those rows linger — semantically harmless (an old "inbox-like" example is still a
+   valid negative) but unbounded-in-staleness. Note the cap bounds only the *initial* skip
+   load; live label-removals still `upsert(id, '__skip__')` post-boot, so the pool still grows
+   with uptime — issue #1's per-set coreset is the eventual bound. Accepted for now; a periodic
+   resample of the skip pool is a possible later refinement, not required for correctness.
 
 ## Verification
 
