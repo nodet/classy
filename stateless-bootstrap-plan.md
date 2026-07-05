@@ -307,12 +307,22 @@ What the curve showed:
   — but the gap is within ~2 pts and does not change the choice. Note at the strict 0.95
   threshold, latest never reaches the coverage plateau below 500.
 
+- **The skip pool works *opposite* to labels — lockstep is right, and skip must not exceed the
+  label cap.** The `--no-cap-skip` axis (skip fixed at the full 500 while labels vary) was run
+  and settles the "one cap for both" question. Fixing skip large while label sets are small
+  **collapses coverage** (0.68→0.51 at N=20, 0.81→0.73 at N=50; converging only as label N
+  approaches 500). Because `__skip__` votes in the KNN and sits in the confidence denominator, a
+  skip pool large *relative to* the label sets dominates the neighborhood and over-suppresses —
+  near-zero false positives (0.5% vs 19% at N=20) bought by abstaining on genuine mail too. So
+  the danger is an *over-large* skip pool, not too small a one; capping skip in lockstep keeps
+  its mass proportional to labels and avoids the collapse, which matters most during
+  bootstrap/warmup when label sets are still small. The committed "one cap for both" rule is now
+  measured, not just principled — refined to **skip cap ≤ label cap**, which lockstep satisfies.
+
 Caveats on the number: the sample itself is truncated at 500 (labels larger than that never
 expose their tail, so the curve only describes "up to 500"), it is one mailbox at one point in
 time, and holdout optimism means real future mail is harder — prefer the conservative end of a
-flat region. The skip pool was capped in lockstep in this run; whether it wants a *lower* cap
-than labels is the open `--no-cap-skip` axis (not yet run), so the "one cap for both" choice
-above stands on principle, not yet on measurement.
+flat region.
 
 ### Labeled wins over skip (the one semantic rule the single table needs)
 
