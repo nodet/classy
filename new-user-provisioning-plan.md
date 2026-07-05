@@ -147,15 +147,20 @@ Each step is check-then-create so re-running is safe. This is the single change 
 OAuth client setup cannot be fully automated — Google requires console clicks (consent screen,
 desktop-app client type, scopes, publishing status / test-user allow-listing). But the
 *failure modes* can be made loud and actionable instead of a confusing runtime stack trace.
-Add a `make doctor` / `scripts/doctor.py` that checks, and for each failure prints the specific
-fix command or setup step:
+Add a `make doctor` / `scripts/doctor.py` that defaults to the deploy/GCP preflight and,
+for each failure, prints the specific fix command or setup step. Keep a small `make doctor-local`
+(or `make doctor --local`) mode for dry runs/eval/development: it checks local prerequisites and
+credentials but deliberately skips GCP project/Pub/Sub/billing checks. The real install path must
+still use plain `make doctor`:
 
 - Local prerequisites: `uv` exists, Python is ≥3.11, dependencies are installed or `make setup`
   is the next action.
-- `gcloud` is installed, authenticated, and pointed at the configured project.
+- `gcloud` is installed, authenticated, and pointed at the configured project (deploy mode).
 - Billing is enabled or at least detectable as required for Compute Engine; if the caller lacks
   billing permissions, print a warning rather than a false failure.
 - `credentials/client_secret.json` exists and is a **desktop-app** OAuth client (not web).
+  If the file exposes a `project_id`, it matches `[gcp].project`; a mismatch usually means
+  the user copied credentials from the wrong project.
 - A token is present and refreshable (or: "run `make reauth` to do the OAuth flow").
 - The granted scopes match the code's required scopes exactly enough for current behavior:
   Gmail modify plus Pub/Sub. A token produced under old docs that only requested
@@ -233,18 +238,24 @@ interleave is present:
   changes — coordinate, don't double-edit): replace the literal `classy-498012` occurrences
   (`README.md:168,175,225`) with the configured-value placeholder, fold in the
   `make gcp-bootstrap`, `make gcp-bootstrap-pubsub`, and `make doctor` steps, and reframe
-  Quick-start so the config-and-provision steps precede deploy.
+  Quick-start so the config-and-provision steps precede deploy. Do not use an unqualified
+  `make gcp-deploy` in the new-user Quick-start unless it has intentionally become an alias for
+  `gcp-deploy-state`; otherwise use the explicit state target.
 - `docs/gmail-setup.md` pass: update the OAuth consent-screen scope instructions to match
-  `auth.py` (`gmail.modify` + `pubsub`), not the current read-only-only guidance. Add a
+  `auth.py` (`gmail.modify` + `pubsub`), not the current read-only-only guidance. Tell users
+  to create the OAuth client in the configured GCP project, so `[gcp].project`, API
+  enablement, the consent screen, and `client_secret.json` refer to one project. Add a
   troubleshooting entry for `insufficient authentication scopes` / `invalid_grant` that says
   when to run `make reauth`.
 - Frame the setup docs around the **one supported way to operate the service: the always-on GCP
   deploy of the `state` backend (`gcp-deploy-state`).** Running locally — with or without a
   service wrapper — is documented only as a **test/debug path** (dry runs, eval, development), in
-  a clearly-labeled subsection, never as an alternative way to run the real service. The GCP path
-  must not make users think local `training.db` / `inbox_sample.db` are deploy prerequisites: be
-  explicit that "no DB upload" is a `state`-backend property (the default/legacy `gcp-deploy`
-  still ships those DBs), so a new user is pointed at `gcp-deploy-state`.
+  a clearly-labeled subsection, never as an alternative way to run the real service. Be explicit
+  that the desktop OAuth flow and local dry runs still happen on the user's machine; only the
+  long-running classifier service is GCP-only. The GCP path must not make users think local
+  `training.db` / `inbox_sample.db` are deploy prerequisites: be explicit that "no DB upload" is
+  a `state`-backend property (the default/legacy `gcp-deploy` still ships those DBs), so a new
+  user is pointed at `gcp-deploy-state`.
 - Add a short cost/safety note: `e2-micro` should remain in a free-tier-eligible US zone by
   default, but users must still have billing enabled and are responsible for checking their own
   GCP billing page.
@@ -277,11 +288,14 @@ interleave is present:
   testable against the `gcloud` calls with a recording fake / dry-run flag. `make
   gcp-bootstrap` also enables Compute Engine and leaves project creation/billing manual.
 - `doctor`: with a deliberately broken setup (missing `uv`, old read-only-only token, missing
-  `client_secret`, empty project, absent subscription) it exits non-zero and names the fix for
-  each; with a good setup it exits 0. Pure-function checks unit-tested with fakes; no live
-  cloud calls in the test path.
+  `client_secret`, client secret from a different project, empty project, absent subscription)
+  it exits non-zero and names the fix for each; with a good setup it exits 0. `doctor-local` /
+  `doctor --local` skips GCP resource checks but still validates local prerequisites and
+  credentials. Pure-function checks unit-tested with fakes; no live cloud calls in the test path.
 - OAuth docs: setup instructions list the same scopes as `auth.py`; a test or checklist
-  prevents docs from drifting back to `gmail.readonly` only.
+  prevents docs from drifting back to `gmail.readonly` only. The new-user Quick-start names
+  `gcp-deploy-state` explicitly unless the unqualified deploy target has intentionally been
+  changed to state.
 - Legibility: cold-path startup logs the read-only banner and the discovered label set +
   exclusions (assertable in the bootstrap dispatch tests once that code exists). Empty
   trainable-label set fails clearly; too-few-examples state logs a warning.
