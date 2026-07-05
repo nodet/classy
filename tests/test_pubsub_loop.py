@@ -491,6 +491,84 @@ def test_history_expired_acks_after_inbox_poll():
     assert sub.acked == [["ack-777"]]
 
 
+def test_persist_cursor_before_ack():
+    """The durable cursor is persisted with the advanced history id BEFORE the
+    ack (order: process -> persist -> ack), so a state crash before ack replays
+    from the saved cursor."""
+    order = []
+    client = FakeClient(history_result=[object()], history_latest="555")
+    sub = FakeSubscriber(actions=[[Notification("200")]])
+
+    orig_ack = sub.ack
+    def record_ack(ack_ids):
+        order.append(("ack", list(ack_ids)))
+        orig_ack(ack_ids)
+    sub.ack = record_ack
+
+    persisted = []
+    deps, _ = make_deps(client, lambda: sub,
+                        process_events=lambda evs: order.append(("process", None)),
+                        persist_cursor=lambda hid: (
+                            persisted.append(hid), order.append(("persist", hid)))[0])
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+
+    assert order == [("process", None), ("persist", "555"), ("ack", ["ack-200"])]
+    assert persisted == ["555"]  # advanced id, not the notification id
+
+
+def test_persist_cursor_not_called_when_processing_raises():
+    """If processing raises, neither the cursor is persisted nor the batch acked
+    -- so a state restart replays and redelivery is idempotent."""
+    client = FakeClient(history_result=[object()])
+    sub = FakeSubscriber(actions=[[Notification("200")]])
+
+    persisted = []
+    def boom(evs):
+        raise ValueError("processing bug")
+
+    deps, _ = make_deps(client, lambda: sub, process_events=boom,
+                        persist_cursor=lambda hid: persisted.append(hid))
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    with pytest.raises(ValueError):
+        run_iteration(state, deps)
+
+    assert persisted == []
+    assert sub.acked == []
+
+
+def test_history_expired_persists_rewatched_cursor_before_ack():
+    """On expiry, the re-pinned fresh cursor is persisted before the ack, so a
+    state restart resumes from the fresh boundary rather than the expired id."""
+    order = []
+    client = FakeClient(watch_id="REWATCH-555",
+                        history_exc=HistoryExpiredError("too old"))
+    sub = FakeSubscriber(actions=[[Notification("777")]])
+
+    orig_ack = sub.ack
+    def record_ack(ack_ids):
+        order.append(("ack", None))
+        orig_ack(ack_ids)
+    sub.ack = record_ack
+
+    persisted = []
+    deps, _ = make_deps(client, lambda: sub,
+                        check_inbox=lambda: order.append(("check_inbox", None)),
+                        persist_cursor=lambda hid: (
+                            persisted.append(hid), order.append(("persist", hid)))[0])
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+
+    assert order == [("check_inbox", None), ("persist", "REWATCH-555"), ("ack", None)]
+    assert persisted == ["REWATCH-555"]
+
+
 def test_history_expired_no_ack_when_rewatch_fails():
     """If the re-watch fails after an inbox-poll fallback, the batch is NOT
     acked, so Pub/Sub redelivers and the fallback+re-pin path retries. Acking

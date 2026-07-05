@@ -70,6 +70,11 @@ class LoopDeps:
     check_inbox: Callable[[], None]              # full inbox poll (fallback)
     process_events: Callable[[list], None]       # handle events (and heartbeat)
     log: Callable[..., None]                     # status line emitter
+    # Persist the advanced history cursor BEFORE acking. On state this is a
+    # durable write (so a crash-before-ack replays from it); on legacy it is
+    # process-local, so restarts keep fresh-watch. Default no-op preserves the
+    # behavior of callers that don't supply it.
+    persist_cursor: Callable[[str], None] = lambda history_id: None
     sleep: Callable[[float], None] = time.sleep
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000)
 
@@ -141,12 +146,15 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         except HistoryExpiredError:
             deps.log("History expired, falling back to inbox poll")
             deps.check_inbox()
-            # Re-pin to a fresh historyId FIRST, then ack. If watch() fails (or
-            # we die before the new cursor is pinned), the messages stay
-            # un-acked so redelivery retries the fallback + re-pin -- acking
-            # earlier would discard the trigger while the cursor is still the
-            # expired one.
+            # Re-pin to a fresh historyId FIRST, persist it, then ack. If
+            # watch() fails (or we die before the new cursor is pinned), the
+            # messages stay un-acked so redelivery retries the fallback +
+            # re-pin -- acking earlier would discard the trigger while the
+            # cursor is still the expired one. Persisting the re-pinned cursor
+            # (durable on state, no-op on legacy) means a state restart resumes
+            # from the fresh boundary, not the expired id.
             history_id, expiration = deps.watch()
+            deps.persist_cursor(history_id)
             subscriber.ack(ack_ids)
             return LoopState(history_id, expiration, backoff, subscriber)
 
@@ -161,6 +169,11 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         # reports + double index.add). Fall back to the notification id only
         # if the response carried none.
         history_id = latest_history_id or max_history
+
+        # Persist the advanced cursor BEFORE acking (order: process -> persist ->
+        # ack). On state this is durable, so a crash after persist but before ack
+        # replays idempotently from the saved cursor; on legacy it is a no-op.
+        deps.persist_cursor(history_id)
 
         # Ack only now that the batch is fully processed and the pointer has
         # advanced. A crash before this leaves the messages un-acked; Pub/Sub

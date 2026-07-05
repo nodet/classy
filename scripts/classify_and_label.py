@@ -62,6 +62,50 @@ def deployed_version():
         return "unknown"
 
 
+def _build_backend(args, excluded):
+    """Construct the selected StorageBackend. The only place that branches on
+    the backend choice; callers downstream see just a StorageBackend.
+
+    Legacy is today's three-DB adapter. State opens the single state.db and
+    dispatches on its persisted meta: only the **warm** path (a populated,
+    fingerprint-matching store) is wired in this phase -- the Gmail-backed
+    bootstrap/rebuild/reconcile paths fail closed with a clear message rather
+    than silently loading stale state (they land in Phase 4).
+    """
+    if args.storage == "legacy":
+        return LegacyBackend(args.training_db, args.skip_db, excluded)
+
+    from gmail_classifier.state_store import (
+        STATE_SCHEMA_VERSION,
+        StartupDecision,
+        StateBackend,
+        compute_excluded_hash,
+        compute_ml_fingerprint,
+        decide_startup,
+    )
+
+    backend = StateBackend(args.state_db, excluded)
+    embedder = Embedder()
+    decision = decide_startup(
+        backend.store,
+        schema_version=STATE_SCHEMA_VERSION,
+        ml_fingerprint=compute_ml_fingerprint(embedder.model_name, embedder.dimension),
+        excluded_hash=compute_excluded_hash(excluded),
+        # gmail_account_id validation lands with the Gmail-backed paths (Phase 4);
+        # a seeded/bootstrapped store records it then.
+        gmail_account_id=backend.store.get_meta("gmail_account_id"),
+    )
+    if decision is not StartupDecision.WARM:
+        backend.close()
+        print(
+            f"State backend needs the '{decision.value}' path, which is not "
+            "wired yet (Phase 4). Only a populated, fingerprint-matching "
+            "state.db (warm start) is supported in this phase."
+        )
+        sys.exit(1)
+    return backend
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Classify inbox messages and apply labels"
@@ -73,6 +117,10 @@ def main():
     parser.add_argument(
         "--skip-db", default="data/inbox_sample.db",
         help="Path to inbox/skip message store (default: data/inbox_sample.db)",
+    )
+    parser.add_argument(
+        "--state-db", default="data/state.db",
+        help="Path to the state backend's single DB (default: data/state.db)",
     )
     parser.add_argument(
         "--credentials", default="credentials",
@@ -109,12 +157,6 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.storage != "legacy":
-        # Only the legacy backend is wired up in this phase; the state backend
-        # plugs in behind the same StorageBackend seam later.
-        print(f"Storage backend '{args.storage}' is not available yet.")
-        sys.exit(1)
-
     print(f"gmail-classifier version: {deployed_version()}", flush=True)
 
     excluded = set(excluded_labels())
@@ -122,8 +164,9 @@ def main():
         print(f"  Excluded labels: {', '.join(sorted(excluded))}")
 
     # Build the storage backend behind the seam. The runtime below talks only
-    # to this interface, never to a concrete store.
-    backend = LegacyBackend(args.training_db, args.skip_db, excluded)
+    # to this interface, never to a concrete store. Only the selector branches
+    # on which backend to build; everything downstream sees a StorageBackend.
+    backend = _build_backend(args, excluded)
 
     # Build the runtime index (config exclusion + labeled-wins-over-skip dedup +
     # cache-backed embedding). The assembly logic lives in the backend/training
@@ -245,8 +288,17 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
 
     # Register for notifications
     print("Registering Gmail watch...")
-    history_id, expiration = client.watch(PUBSUB_TOPIC)
-    print(f"  Watch active, historyId={history_id}")
+    watch_history_id, expiration = client.watch(PUBSUB_TOPIC)
+    print(f"  Watch active, historyId={watch_history_id}")
+
+    # Resume from the backend's durable cursor if it has one (state backend, warm
+    # restart) so history since the last processed id is replayed rather than
+    # skipped by adopting the fresh watch boundary. Legacy has no durable cursor
+    # (returns None), so it starts from the fresh watch id exactly as before.
+    resume_id = backend.get_last_processed_history_id()
+    history_id = resume_id or watch_history_id
+    if resume_id:
+        print(f"  Resuming from persisted historyId={resume_id}")
 
     # Track messages labeled by the classifier itself (to ignore echoed events)
     self_labeled = set()
@@ -280,6 +332,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         process_events=lambda events: _process_events(
             events, args, client, embedder, index, registry,
             skip_ids, self_labeled, backend),
+        persist_cursor=backend.set_last_processed_history_id,
         log=_log,
     )
 
