@@ -213,7 +213,8 @@ embeddings; one file = one connection, atomic, trivial to reset.)
    - Call `client.watch(PUBSUB_TOPIC)` first and persist both
      `bootstrap_boundary_history_id` and `last_processed_history_id` from the returned
      `historyId`.
-   - `list_user_labels()` minus excluded (XLC/XLE/XLCap).
+   - `list_user_labels()` minus the **configured excluded labels** (see "Excluded-label
+     configuration"; XLC/XLE/XLCap are only *this* deployment's defaults).
    - For each label: `list_message_ids(label_id, max_results=--max-per-label)`.
    - For the skip pool: list recent INBOX ids, **minus any id that already carries a
      user label** (see "Labeled wins over skip" below).
@@ -493,6 +494,33 @@ the full vector rebuild. Folding it into the fingerprint would make that reconci
 code and force a needless ~4000-message re-embed on a pure config change. It is checked
 independently on startup as its own `meta` key.
 
+### Excluded-label configuration
+
+The excluded-label list is **user configuration, not a hardcoded constant** — the state backend
+reads it exactly as the rest of the tool does today, so there is nothing backend-specific to
+learn:
+
+- **Source of truth:** the `[labels].excluded` array of **label *names*** in `config.toml` at
+  the repo root, read via `config.excluded_labels()` (stdlib `tomllib`, no dependency). The
+  values `XLC`/`XLE`/`XLCap` currently in that file are **this deployment's choices**, not
+  built-in defaults; a different user edits the file to list their own labels, or leaves it
+  empty to classify into every user label.
+- **Override for one-off runs:** every entry point takes an `--exclude-labels` flag that
+  defaults to the config value, so an explicit flag overrides the file without editing it. The
+  `state` path honors the same flag/default resolution as the `legacy` path.
+- **How the backend consumes it:** the resolved set is passed to `LabelRegistry(excluded=…)`
+  and used at three points on the `state` path — bootstrap skips excluded labels at the source
+  (no excluded row ever reaches `labels`), `list_user_labels()` minus excluded drives which
+  labels are trained, and the classifier never auto-applies an excluded label.
+- **Change detection:** `excluded_labels_hash` in `meta` is a hash of this resolved set. On
+  startup a mismatch triggers the cheap membership reconcile above — it is what makes "edit
+  `config.toml`, redeploy" apply cleanly without a full re-embed. Because it is config-derived,
+  the hash is recomputed from `config.excluded_labels()` (plus any `--exclude-labels` override)
+  on every boot and compared to the stored value.
+- **Deploy note:** `config.toml` ships with the code on both backends (it is not in `data/`),
+  so `gcp-deploy-state`'s "code + credentials only" tarball already includes it; changing
+  exclusions is a normal code redeploy, and the next boot reconciles membership.
+
 **Design defaults chosen** (flag if you want the alternative):
 - *One file, multiple small tables* (not separate vector/label files) — single atomic reset.
 - *Two-phase auto-rebuild on fingerprint mismatch* (not "wipe first" and not "refuse to start
@@ -659,8 +687,8 @@ proven before the more intricate early-labeling logic lands.
 
 - `bootstrap.py`: `watch()` **first** (pin the boundary + persist the cursor), then
   round-robin over labels + front-loaded skip pool, one-at-a-time fetch→embed→cache→discard,
-  resumable (skip ids already embedded). Excludes XL* at the source; labeled-wins-over-skip at
-  the source.
+  resumable (skip ids already embedded). Excludes the **configured** labels at the source (see
+  "Excluded-label configuration"); labeled-wins-over-skip at the source.
 - **Read-only over pre-existing mail:** the cold path removes the labeling initial inbox check
   entirely — existing mail is only read to embed it, never labeled or archived.
 - Reuse the same fetch/embed primitives for ML-fingerprint rebuilds and excluded-label
@@ -789,6 +817,9 @@ that is the natural stopping point if the `state` backend is deferred.
   from Gmail; document first-boot warm-up time, auto-rebuild-on-ML-change, `make
   gcp-reset-state`, and that switching backends is a redeploy that leaves the other's data intact.
   `make fetch-training`/`fetch-inbox` remain required for legacy, optional (local-only) for state.
+  Document that excluded labels are set in `config.toml` (`[labels].excluded`, or the
+  `--exclude-labels` override) for **both** backends, and that on `state` editing them is a code
+  redeploy that the next boot reconciles without a full re-embed.
 
 ## Costs / wrinkles (accepted, but explicit)
 
@@ -839,7 +870,9 @@ priority because they gate irreversible archive actions on a fresh mailbox.
 - Builds the right index from a fake client/embedder (ids → vectors → labels as expected).
 - **Resumability:** a second run **skips ids already in `embeddings`** — assert
   `get_message` is *not* called for cached ids (not merely that the result is the same).
-- Excludes XL* labels at the source (no excluded-label rows reach `labels`).
+- Excludes the configured labels at the source (no excluded-label row reaches `labels`); with a
+  test config excluding e.g. `XLC`, no `XLC` row appears, and with an empty exclusion list every
+  user label is bootstrapped.
 - Stores/votes by Gmail `label_id`, with `label_name_snapshot` used only for display/status.
 - **One-at-a-time:** the raw message for id *i* is released before id *i+1* is fetched —
   assert no `embed_batch`/bulk path and at most one live body held (e.g. fake records max
