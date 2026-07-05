@@ -104,8 +104,10 @@ persists a cursor, in its own `state.db`.
 which now spans the legacy period, so it ingests the labels legacy applied (including legacy's
 *automated* labels) as training truth. This is **consistent with the existing model** — Gmail
 labels are authoritative and `make fetch-training` already folds the classifier's own auto-labels
-into the training set — so it is accepted, not a new defect. (If the cursor has aged out, the
-"history cursor expired" path does a full reconcile instead.)
+into the training set — so it is accepted, not a new defect. (If the cursor has aged out **or
+the downtime exceeded `WARM_RECOVERY_WINDOW`**, the read-only resync path runs instead — it
+still ingests the label changes as training truth but does **not** classify/archive the
+accumulated backlog. See "Warm path" in startup logic.)
 
 ## Why this works (premise check)
 
@@ -169,6 +171,7 @@ gmail_account_id              # Gmail profile email/id, for seed-state safety
 bootstrap_status              # absent | in_progress | complete
 bootstrap_boundary_history_id
 last_processed_history_id
+last_processed_at             # wall-clock ms of the last cursor advance; bounds warm catch-up
 watch_expiration_ms
 bootstrap_started_at
 bootstrap_completed_at
@@ -218,13 +221,29 @@ embeddings; one file = one connection, atomic, trivial to reset.)
      → `embedder.embed` → `cache.put(id, vec)` + record `id→label_id` (or `__skip__`).
      Discard the raw message. **One at a time** — bounded memory, resumable.
    - Build `TrainingIndex` from the cache + label map.
-4. Warm path:
+4. Warm path — bounded by a **recovery window** (`WARM_RECOVERY_WINDOW`, default 1h):
    - Refresh the Gmail watch, but **do not replace** `last_processed_history_id` with the
      new watch id.
-   - Process Gmail history from the persisted `last_processed_history_id`.
-   - After successful event processing, persist the new Gmail history id.
-   - If `history.list` says the cursor is expired/out of range, run a full sync/reconcile
-     from Gmail, not an inbox-only poll.
+   - Compute the downtime gap from `now - last_processed_at` (wall-clock, not a history-id
+     delta — history ids are not time-proportional).
+   - **Gap ≤ window and cursor still valid** → normal recovery: process Gmail history from the
+     persisted `last_processed_history_id` and classify. This is the genuine
+     crash/short-outage case; the gap is small and bounded. After successful event processing,
+     persist the new history id **and** `last_processed_at`.
+   - **Gap > window, or the cursor is expired/out of range** → **read-only resync + re-pin**
+     (do *not* replay-and-classify the accumulated backlog): reconcile label state from Gmail
+     (ingest label changes since the cursor as training truth, refresh the skip sample),
+     re-pin a fresh watch boundary, and treat all mail currently sitting in the mailbox as
+     *existing = read-only* — never label or archive it. Only mail arriving **after** this
+     restart is classifiable. Then persist the new cursor + `last_processed_at`.
+
+   The two "don't take bulk actions" triggers — *too much wall-clock elapsed* and *cursor
+   aged out of Gmail's history window* — share **one** code path: the read-only resync. The
+   window just makes the boundary explicit ("recover from a failure, not walk a week of
+   history") instead of leaving it to Gmail's opaque, ~1-week retention. A long-gap warm
+   restart therefore behaves like a cold boot's read-only boundary: a lot of un-acted-on mail
+   is present, so it is truth, not a to-do list. This bounds `state`'s one behavioral
+   divergence from legacy to a ≤1h failure-recovery window.
 5. Either path → the pubsub loop. The **cold** (bootstrap) path enters a progressive variant —
    see "Progressive bootstrap" below — so the service is live and safe from the first second
    rather than after a 20-min wait.
@@ -283,10 +302,14 @@ is exactly wrong: the service would wake up and archive hundreds of emails that 
 
 This read-only property is scoped to the **cold first boot** — the mailbox that pre-existed the
 service's very first start. It is *not* a permanent "state never touches the backlog": a **warm
-restart** after downtime does catch up on the gap, but via history replay from the persisted
-`last_processed_history_id` (step 4), not an inbox scan. That replay is post-cursor only, so it
-classifies mail that arrived during the downtime while still never touching pre-first-boot mail;
-if the cursor has aged out of Gmail's history window, it falls back to a full reconcile.
+restart** within the recovery window does catch up on the gap, but via history replay from the
+persisted `last_processed_history_id` (step 4), not an inbox scan. That replay is post-cursor
+only, so it classifies mail that arrived during the *short* downtime while still never touching
+pre-first-boot mail. But a warm restart whose gap **exceeds `WARM_RECOVERY_WINDOW`** (default
+1h) — or whose cursor has aged out of Gmail's history window — takes the read-only resync path
+instead: it re-pins the boundary and treats the accumulated backlog as existing/read-only,
+exactly like a cold boot. So catch-up-and-classify is a bounded failure-recovery behavior, not
+an "on restart, process a week of history" behavior.
 
 Mechanism: call `client.watch(PUBSUB_TOPIC)` **first**, before reading a single message, and
 pin the returned `historyId` as the boundary. Anything at-or-before it = existing = read-only
@@ -439,11 +462,12 @@ when it is stale or explicitly reset**:
 
 | Event | Behavior |
 |---|---|
-| **Service restart** | `state.db` present → validate, load index, refresh watch, process history from durable `last_processed_history_id`. No full Gmail fetch if the cursor is valid. |
+| **Service restart (gap ≤ recovery window)** | `state.db` present, downtime ≤ `WARM_RECOVERY_WINDOW` (default 1h), cursor valid → validate, load index, refresh watch, process history from durable `last_processed_history_id`, classify the small gap. No full Gmail fetch. The genuine failure-recovery case. |
+| **Service restart (gap > recovery window)** | Downtime exceeded the window → **read-only resync**: reconcile labels/skip from Gmail, re-pin the watch boundary, treat the accumulated backlog as existing/read-only (never classify or archive it). Only post-restart mail is classifiable. Bounds `state`'s divergence from legacy to a ≤1h window. |
 | **Code deploy (state backend), ML/config unchanged** | `gcp-deploy-state` builds the tarball with `--exclude='data'` and untars *over* `INSTALL_DIR`; `tar x` never deletes files absent from the archive, so `data/state.db` (and any leftover legacy DBs) is untouched. Deploy + restart → fast, state preserved. |
 | **ML changed** (embedding model or `build_text_representation`) | Startup compares `meta.ml_fingerprint` to the current code. Mismatch ⇒ cached vectors are stale. Build `state.rebuild.db` from Gmail, validate counts/fingerprint, then atomically replace `state.db`. Only vectors are stale — carry the existing `last_processed_history_id` forward rather than re-pinning a fresh boundary, so live changes during the rebuild are not skipped. No silent wrong vectors. |
 | **Excluded-label config changed** | Startup compares `excluded_labels_hash` (checked independently of the ML fingerprint). Reuse all unchanged embeddings: remove now-excluded labels from the index and bootstrap only the newly-included labels' ids — no re-embed of retained ids. The two-phase rebuild path is a last-resort fallback only if incremental reconciliation proves too complex to implement safely, not the expected path. |
-| **History cursor expired** | Run a full sync/reconcile from Gmail: label registry, trainable label ids, labeled-message ids, skip sample, and `last_processed_history_id`. Do not fall back to inbox-only polling as the sole recovery. |
+| **History cursor expired** | Same read-only resync as the over-window restart (shared code path): full sync/reconcile from Gmail — label registry, trainable label ids, labeled-message ids, skip sample, and a fresh `last_processed_history_id` — treating the current mailbox as read-only. Do not fall back to inbox-only polling as the sole recovery. |
 | **Explicit reset** | `make gcp-reset-state` / `make reset-state` — stop, remove `state.db` plus SQLite sidecars (`state.db-wal`, `state.db-shm`, `state.db-journal`, `state.rebuild.db*`), start → next boot bootstraps fresh. Legacy DBs are untouched. The escape hatch "just in case." |
 
 **Fingerprint:** a string or JSON object that includes at least:
@@ -864,7 +888,8 @@ priority because they gate irreversible archive actions on a fresh mailbox.
 - **State after legacy — cursor replay ingests legacy labels:** `state` resumes from its
   persisted cursor across a window in which labels were applied; those labels are folded into the
   index as training truth (asserts the accepted "Gmail is truth" behavior, and that an expired
-  cursor instead triggers full reconcile).
+  cursor **or an over-window gap** instead triggers the read-only resync — labels still ingested,
+  backlog not classified/archived).
 - **No concurrent workers:** switching backends stops the existing service and rewrites the
   selector before restart; tests/VM smoke check verify there is only one `gmail-classifier`
   process and one backend setting in the systemd unit.
@@ -894,8 +919,10 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   the pinned `historyId` boundary reflects start-of-service, not end-of-bootstrap.
 - A notification whose `historyId` is **at-or-before** the pinned boundary is treated as
   existing (not labeled); one **after** it is eligible (subject to the maturity gate).
-- Warm restart processes history from persisted `last_processed_history_id`; it does not
-  replace that cursor with the new watch id and thereby skip backlog.
+- Warm restart **within the recovery window** processes history from persisted
+  `last_processed_history_id`; it does not replace that cursor with the new watch id and thereby
+  skip backlog. (Past the window it takes the read-only resync path — see "Pub/Sub / history
+  cursor safety".)
 - Warm restart runs **no labeling inbox check** — assert `apply_label`/archive is reached only
   via history replay, never via an inbox scan that could touch pre-boundary mail.
 - In the blocking Phase 4 path, post-boundary history accumulated during bootstrap is processed
@@ -921,6 +948,16 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   idempotently.
 - Crash before processing is safe on `state`: persisted cursor causes replay on restart.
 - History expiration/404 schedules full sync/reconcile, not inbox-only fallback.
+- **Warm restart within the window replays-and-classifies:** with `now - last_processed_at ≤
+  WARM_RECOVERY_WINDOW` and a valid cursor, history from the cursor is processed and
+  post-boundary mail is classified (the genuine short-outage recovery).
+- **Warm restart past the window is read-only:** with `now - last_processed_at >
+  WARM_RECOVERY_WINDOW`, the accumulated backlog is **not** classified/archived even though the
+  cursor is still valid — the service reconciles labels/skip read-only and re-pins the boundary
+  (assert `apply_label`/archive is never called for the backlog, and the boundary history id is
+  re-pinned). Same code path as cursor-expired.
+- **`last_processed_at` is advanced with the cursor:** every durable `last_processed_history_id`
+  write also stamps `last_processed_at`, so the gap measurement stays accurate across restarts.
 - The Gmail watch is not filtered to INBOX; label-add/remove events outside INBOX still reach
   the service.
 
