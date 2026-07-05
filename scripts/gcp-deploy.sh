@@ -34,6 +34,23 @@ if [[ ! -f "credentials/client_secret.json" ]]; then
     exit 1
 fi
 
+# Guard against shipping a stale embedding cache. If embeddings.db is missing or
+# older than training.db, the VM re-embeds every uncached message at startup --
+# minutes of 100% CPU on the e2-micro and a peak-RSS spike that has OOM-crashed
+# the service before. Rebuild locally with 'make embed' first (fast, warm cache).
+mtime() {
+    if [[ "$(uname)" == "Darwin" ]]; then stat -f%m "$1"; else stat -c%Y "$1"; fi
+}
+if [[ ! -s "data/embeddings.db" ]]; then
+    echo "Error: data/embeddings.db missing. Run 'make embed' before deploying."
+    exit 1
+fi
+if [[ "$(mtime data/training.db)" -gt "$(mtime data/embeddings.db)" ]]; then
+    echo "Error: data/embeddings.db is older than data/training.db (stale cache)."
+    echo "       Run 'make embed' to rebuild it, then re-deploy."
+    exit 1
+fi
+
 # Helper: run command on the VM
 vm_run() {
     gcloud compute ssh "$GCP_INSTANCE" \
