@@ -167,6 +167,7 @@ Minimum `meta` keys:
 state_schema_version
 ml_fingerprint
 excluded_labels_hash
+excluded_labels_resolution_json # configured name -> Gmail label id/null
 gmail_account_id              # Gmail profile email/id, for seed-state safety
 bootstrap_status              # absent | in_progress | complete
 bootstrap_boundary_history_id
@@ -191,8 +192,8 @@ embeddings; one file = one connection, atomic, trivial to reset.)
 ### Startup logic (`scripts/classify_and_label.py:main`)
 
 1. Open the derived store.
-2. Validate `state_schema_version`, `ml_fingerprint`, `excluded_labels_hash`, and
-   `gmail_account_id`.
+2. Validate `state_schema_version`, `ml_fingerprint`, `excluded_labels_hash`,
+   `excluded_labels_resolution_json`, and `gmail_account_id`.
    - If compatible and the store already has a usable index (`embeddings + id→label`),
      load it and enter the warm path.
    - If the ML fingerprint is incompatible, build `state.rebuild.db` from Gmail and
@@ -231,7 +232,12 @@ embeddings; one file = one connection, atomic, trivial to reset.)
    - **Gap ≤ window and cursor still valid** → normal recovery: process Gmail history from the
      persisted `last_processed_history_id` and classify. This is the genuine
      crash/short-outage case; the gap is small and bounded. After successful event processing,
-     persist the new history id **and** `last_processed_at`.
+     persist the new history id **and** `last_processed_at` in the same SQLite transaction.
+   - While running normally, periodically perform a no-op
+     `history.list(last_processed_history_id)` before `last_processed_at` approaches the
+     recovery window. If the cursor is valid and there are no pending updates, persist the
+     returned history id and `last_processed_at` in the same transaction. Do not refresh the
+     timestamp merely because the process is alive or a Pub/Sub pull timed out.
    - **Gap > window, or the cursor is expired/out of range** → **read-only resync + re-pin**
      (do *not* replay-and-classify the accumulated backlog): reconcile label state from Gmail
      (ingest label changes since the cursor as training truth, refresh the skip sample),
@@ -522,7 +528,10 @@ learn:
   `--exclude-labels` override) and the current `LabelRegistry` on every boot and compared to
   the stored value. Unknown excluded-label names should be reported by `doctor`/status and in
   startup logs; they warn by default rather than failing closed, so a shared/default config does
-  not block a new user's first run.
+  not block a new user's first run. The store also records
+  `excluded_labels_resolution_json` so a previously-resolved exclusion that becomes unresolved
+  after a Gmail rename can keep excluding the old `label_id` while status/doctor emits a
+  stronger warning.
 - **Deploy note:** `config.toml` ships with the code on both backends (it is not in `data/`),
   so `gcp-deploy-state`'s "code + credentials only" tarball already includes it; changing
   exclusions is a normal code redeploy, and the next boot reconciles membership.
@@ -667,10 +676,12 @@ until the cold-path and maturity-safety phases land.
 
 - `state_store.py`: the `state.db` schema (`embeddings`/`labels`/`pending_new`/`meta`), the
   join-based `iter_index()`/`load_index()`, `known_ids`/`skip_vote_ids`, `upsert_label`/
-  `upsert_embedding`, cursor + fingerprint + meta helpers. Opens only `state.db`/
+  `upsert_embedding`, cursor + fingerprint + excluded-label resolution + meta helpers. Opens
+  only `state.db`/
   `state.rebuild.db`.
 - Startup dispatch on the `state` path: validate `state_schema_version` / `ml_fingerprint` /
-  `excluded_labels_hash` / `gmail_account_id`; warm path loads the index from the join and
+  `excluded_labels_hash` / `excluded_labels_resolution_json` / `gmail_account_id`; warm path
+  loads the index from the join and
   processes history from the persisted `last_processed_history_id`; ML/config mismatches are
   detected and fail closed rather than loading stale state. The Gmail-backed
   rebuild/reconcile implementation lands in Phase 4. Wire the `state` adapter's durable cursor
@@ -816,7 +827,7 @@ that is the natural stopping point if the `state` backend is deferred.
   data/state.rebuild.db-shm data/state.rebuild.db-journal`), `gcp-reset-state` (same removal
   under `$INSTALL_DIR/data`, then start), and `gcp-state-status`
   (active backend, schema/fingerprint/bootstrap status/index size/per-label counts/skip count/
-  pending count/history cursor, `last_processed_at`, and unresolved excluded-label names). See
+  pending count/history cursor, `last_processed_at`, and unresolved/stale excluded-label names). See
   "Deployment: two backends, one deployed at a time" for the
   backend-selection targets (`gcp-deploy-legacy` / `gcp-deploy-state`).
 - `README.md` — **needs a pass to document both backends.** Keep the current legacy deploy
@@ -952,6 +963,9 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   newly-included labels are bootstrapped. Assert this takes the cheap reconcile path (no full
   re-embed) since `excluded_labels_hash` is not in the fingerprint — an exclusion-only change
   **does not** call `get_message`/`embed` for unchanged ids.
+- **Previously-resolved excluded label becomes unresolved** → keep the prior label_id excluded
+  if available from `excluded_labels_resolution_json`, and report a stronger status/doctor
+  warning; a fresh config with no prior resolution only warns.
 
 ### Unit — read-only boundary (cold path safety)
 - Bootstrap **never calls `apply_label`/archive** on existing inbox mail — assert
@@ -1002,7 +1016,11 @@ priority because they gate irreversible archive actions on a fresh mailbox.
 - **Invalid timestamp is fail-safe:** a missing, malformed, or future `last_processed_at` takes
   the same read-only resync path rather than replaying-and-classifying an unbounded gap.
 - **`last_processed_at` is advanced with the cursor:** every durable `last_processed_history_id`
-  write also stamps `last_processed_at`, so the gap measurement stays accurate across restarts.
+  write also stamps `last_processed_at` in the same SQLite transaction, so the gap measurement
+  stays accurate across restarts.
+- **Quiet mailbox heartbeat:** before the timestamp approaches the recovery window, a successful
+  no-op `history.list(last_processed_history_id)` with no pending updates persists the returned
+  history id and a fresh `last_processed_at`; a Pub/Sub timeout alone does not.
 - The Gmail watch is not filtered to INBOX; label-add/remove events outside INBOX still reach
   the service.
 
