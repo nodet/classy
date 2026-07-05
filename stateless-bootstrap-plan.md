@@ -212,7 +212,7 @@ embeddings; one file = one connection, atomic, trivial to reset.)
 3. If empty (fresh VM) → **bootstrap from Gmail**:
    - Call `client.watch(PUBSUB_TOPIC)` first and persist both
      `bootstrap_boundary_history_id` and `last_processed_history_id` from the returned
-     `historyId`.
+     `historyId`, and set `last_processed_at` to the current UTC epoch ms.
    - `list_user_labels()` minus the **configured excluded labels** (see "Excluded-label
      configuration"; XLC/XLE/XLCap are only *this* deployment's defaults).
    - For each label: `list_message_ids(label_id, max_results=--max-per-label)`.
@@ -226,7 +226,8 @@ embeddings; one file = one connection, atomic, trivial to reset.)
    - Refresh the Gmail watch, but **do not replace** `last_processed_history_id` with the
      new watch id.
    - Compute the downtime gap from `now - last_processed_at` (wall-clock, not a history-id
-     delta — history ids are not time-proportional).
+     delta — history ids are not time-proportional). If `last_processed_at` is missing,
+     malformed, or implausibly in the future, fail safe and take the read-only resync path.
    - **Gap ≤ window and cursor still valid** → normal recovery: process Gmail history from the
      persisted `last_processed_history_id` and classify. This is the genuine
      crash/short-outage case; the gap is small and bounded. After successful event processing,
@@ -512,11 +513,16 @@ learn:
   and used at three points on the `state` path — bootstrap skips excluded labels at the source
   (no excluded row ever reaches `labels`), `list_user_labels()` minus excluded drives which
   labels are trained, and the classifier never auto-applies an excluded label.
-- **Change detection:** `excluded_labels_hash` in `meta` is a hash of this resolved set. On
-  startup a mismatch triggers the cheap membership reconcile above — it is what makes "edit
-  `config.toml`, redeploy" apply cleanly without a full re-embed. Because it is config-derived,
-  the hash is recomputed from `config.excluded_labels()` (plus any `--exclude-labels` override)
-  on every boot and compared to the stored value.
+- **Change detection:** `excluded_labels_hash` in `meta` is a hash of the normalized configured
+  names **plus** their current resolution to Gmail label ids (including explicit unresolved
+  markers). On startup a mismatch triggers the cheap membership reconcile above — it is what
+  makes "edit `config.toml`, redeploy" apply cleanly without a full re-embed, and it also makes
+  label renames or typos visible instead of silently preserving stale membership. Because it is
+  config-derived, the hash is recomputed from `config.excluded_labels()` (plus any
+  `--exclude-labels` override) and the current `LabelRegistry` on every boot and compared to
+  the stored value. Unknown excluded-label names should be reported by `doctor`/status and in
+  startup logs; they warn by default rather than failing closed, so a shared/default config does
+  not block a new user's first run.
 - **Deploy note:** `config.toml` ships with the code on both backends (it is not in `data/`),
   so `gcp-deploy-state`'s "code + credentials only" tarball already includes it; changing
   exclusions is a normal code redeploy, and the next boot reconciles membership.
@@ -653,8 +659,9 @@ regression net.
 ### Phase 3 — `state_store.py` + warm path (state backend loads, but does not bootstrap)
 
 Make the `state` backend real for the *already-populated* case only. No cold bootstrap yet — a
-`state.db` is seeded for tests (and optionally via `--seed-state`) with an explicit
-`last_processed_history_id`, so this phase is fully testable without a mailbox-sized corpus.
+`state.db` is seeded for tests (and optionally via `--seed-state`) with explicit
+`last_processed_history_id` and `last_processed_at`, so this phase is fully testable without a
+mailbox-sized corpus.
 This phase does not add a deploy target or recommend `state` for a live mailbox; that waits
 until the cold-path and maturity-safety phases land.
 
@@ -801,14 +808,16 @@ that is the natural stopping point if the `state` backend is deferred.
   `--exclude='data'` + untar-over behavior, which never deletes files absent from the archive —
   so **neither deploy removes or rewrites the other backend's database contents**. Optional
   `--seed-state` may upload a prebuilt `state.db` and skip first boot, but only if its meta
-  matches the current mailbox/config and includes a valid cursor; otherwise startup treats it as
-  invalid and bootstraps/rebuilds. It is never required and never implicit.
+  matches the current mailbox/config and includes a valid cursor plus a sane `last_processed_at`;
+  otherwise startup treats it as invalid and bootstraps/rebuilds. It is never required and never
+  implicit.
 - `Makefile` — add `reset-state` (local: stop, `rm -f data/state.db data/state.db-wal
   data/state.db-shm data/state.db-journal data/state.rebuild.db data/state.rebuild.db-wal
   data/state.rebuild.db-shm data/state.rebuild.db-journal`), `gcp-reset-state` (same removal
   under `$INSTALL_DIR/data`, then start), and `gcp-state-status`
   (active backend, schema/fingerprint/bootstrap status/index size/per-label counts/skip count/
-  pending count/history cursor). See "Deployment: two backends, one deployed at a time" for the
+  pending count/history cursor, `last_processed_at`, and unresolved excluded-label names). See
+  "Deployment: two backends, one deployed at a time" for the
   backend-selection targets (`gcp-deploy-legacy` / `gcp-deploy-state`).
 - `README.md` — **needs a pass to document both backends.** Keep the current legacy deploy
   instructions (`make embed`, DB upload) but scope them to `gcp-deploy-legacy`; make clear that
@@ -872,7 +881,8 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   `get_message` is *not* called for cached ids (not merely that the result is the same).
 - Excludes the configured labels at the source (no excluded-label row reaches `labels`); with a
   test config excluding e.g. `XLC`, no `XLC` row appears, and with an empty exclusion list every
-  user label is bootstrapped.
+  user label is bootstrapped. A rename/typo changes `excluded_labels_hash` and is reported in
+  status/doctor as an unresolved excluded-label name.
 - Stores/votes by Gmail `label_id`, with `label_name_snapshot` used only for display/status.
 - **One-at-a-time:** the raw message for id *i* is released before id *i+1* is fetched —
   assert no `embed_batch`/bulk path and at most one live body held (e.g. fake records max
@@ -935,8 +945,8 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   leaves old `state.db` untouched. The rebuilt store **carries the prior
   `last_processed_history_id` forward** (assert the cursor is preserved, not re-pinned to a
   fresh watch id).
-- **Empty store** → call `watch()` first, persist boundary/cursor, bootstrap runs (fingerprint
-  written on completion).
+- **Empty store** → call `watch()` first, persist boundary/cursor and `last_processed_at`,
+  bootstrap runs (fingerprint written on completion).
 - **Excluded-label mismatch** → before Phase 4, fails closed rather than loading stale state;
   from Phase 4 onward, now-excluded rows are removed or a two-phase rebuild is triggered;
   newly-included labels are bootstrapped. Assert this takes the cheap reconcile path (no full
@@ -989,6 +999,8 @@ priority because they gate irreversible archive actions on a fresh mailbox.
   cursor is still valid — the service reconciles labels/skip read-only and re-pins the boundary
   (assert `apply_label`/archive is never called for the backlog, and the boundary history id is
   re-pinned). Same code path as cursor-expired.
+- **Invalid timestamp is fail-safe:** a missing, malformed, or future `last_processed_at` takes
+  the same read-only resync path rather than replaying-and-classifying an unbounded gap.
 - **`last_processed_at` is advanced with the cursor:** every durable `last_processed_history_id`
   write also stamps `last_processed_at`, so the gap measurement stays accurate across restarts.
 - The Gmail watch is not filtered to INBOX; label-add/remove events outside INBOX still reach
