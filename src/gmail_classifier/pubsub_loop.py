@@ -141,10 +141,13 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         except HistoryExpiredError:
             deps.log("History expired, falling back to inbox poll")
             deps.check_inbox()
-            # The pulled notifications have now been serviced (via the inbox
-            # poll), so ack them before re-watching for a fresh historyId.
-            subscriber.ack(ack_ids)
+            # Re-pin to a fresh historyId FIRST, then ack. If watch() fails (or
+            # we die before the new cursor is pinned), the messages stay
+            # un-acked so redelivery retries the fallback + re-pin -- acking
+            # earlier would discard the trigger while the cursor is still the
+            # expired one.
             history_id, expiration = deps.watch()
+            subscriber.ack(ack_ids)
             return LoopState(history_id, expiration, backoff, subscriber)
 
         # process_events handles label changes, new-message classification,

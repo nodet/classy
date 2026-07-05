@@ -474,12 +474,40 @@ def test_history_expired_acks_after_inbox_poll():
         orig_ack(ack_ids)
     sub.ack = record_ack
 
+    def record_watch():
+        order.append("watch")
+        return "REWATCH-555", 10**18
+
     deps, _ = make_deps(client, lambda: sub,
-                        check_inbox=lambda: order.append("check_inbox"))
+                        check_inbox=lambda: order.append("check_inbox"),
+                        watch=record_watch)
 
     state = LoopState(history_id="100", expiration=10**18, backoff=0,
                       subscriber=sub)
     run_iteration(state, deps)
 
-    assert order == ["check_inbox", "ack"]
+    # Ack only after the fresh cursor is re-pinned (watch), not before.
+    assert order == ["check_inbox", "watch", "ack"]
     assert sub.acked == [["ack-777"]]
+
+
+def test_history_expired_no_ack_when_rewatch_fails():
+    """If the re-watch fails after an inbox-poll fallback, the batch is NOT
+    acked, so Pub/Sub redelivers and the fallback+re-pin path retries. Acking
+    before the cursor is re-pinned would discard the trigger permanently."""
+    client = FakeClient(history_exc=HistoryExpiredError("too old"))
+    sub = FakeSubscriber(actions=[[Notification("777")]])
+
+    def failing_watch():
+        raise OSError("re-watch failed")
+
+    deps, _ = make_deps(client, lambda: sub, watch=failing_watch)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    # A network error during re-watch is caught -> backoff, not raised.
+    state = run_iteration(state, deps)
+
+    assert sub.acked == []  # never acked -> redelivery retries the fallback
+    assert state.history_id == "100"  # cursor unchanged (still the expired id)
+    assert state.backoff == 5

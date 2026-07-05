@@ -35,7 +35,15 @@ class PubSubSubscriber:
         try:
             response = self._client.pull(
                 subscription=self._subscription_path,
-                max_messages=100,
+                # Unary pull does not auto-extend ack leases (that's only
+                # automatic in the streaming/high-level client). Since we defer
+                # ack() until after get_history() + process_events(), a large
+                # batch could exceed the subscription ack deadline and be
+                # redelivered before we ack. Pull a small batch so worst-case
+                # time-to-ack stays well inside the deadline. For a single
+                # mailbox, notifications collapse to one get_history() call
+                # regardless, so a small cap costs nothing.
+                max_messages=10,
                 timeout=timeout,
             )
         except DeadlineExceeded:
