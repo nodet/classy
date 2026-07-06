@@ -21,7 +21,7 @@ class Embedder:
 
         Determined by embedding a one-token probe once and caching the result.
         Used by the ``state`` backend's ML fingerprint so a model whose
-        dimension changes is detected as stale (see ``state_store`` fingerprints).
+        dimension changes is detected as stale (see ``storage_state`` fingerprints).
         """
         if self._dimension is None:
             self._dimension = int(self.embed("probe").shape[0])

@@ -151,7 +151,7 @@ def _build_backend(args, excluded, client, embedder):
     if args.storage != "state":
         raise ValueError(f"unknown storage backend: {args.storage!r}")
 
-    from gmail_classifier.state_store import (
+    from gmail_classifier.storage_state import (
         STATE_SCHEMA_VERSION,
         StartupDecision,
         StateBackend,
@@ -261,7 +261,7 @@ def _rebuild_and_swap(args, excluded, client, embedder, backend):
     lacks the completed fingerprint, so it would not validate as WARM anyway).
     """
     from gmail_classifier import bootstrap as _bootstrap
-    from gmail_classifier.state_store import StateBackend
+    from gmail_classifier.storage_state import StateBackend
 
     rebuild_path = _rebuild_db_path(args.state_db)
     # Start the rebuild from a clean file so a stale prior attempt can't leak in.
@@ -669,7 +669,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         # State: decide from the durable cursor + last_processed_at how to
         # recover. A missing/expired/over-window/invalid-timestamp cursor no
         # longer fails closed (Phase 6) -- it takes the read-only resync instead.
-        from gmail_classifier.state_store import GapDecision, classify_gap
+        from gmail_classifier.storage_state import GapDecision, classify_gap
         if classify_gap(backend.store, backend.store.now_ms()) is GapDecision.REPLAY:
             # Genuine short outage: replay-and-classify from the persisted cursor.
             history_id = resume_id

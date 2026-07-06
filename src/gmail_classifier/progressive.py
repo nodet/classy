@@ -31,7 +31,7 @@ import numpy as np
 
 from gmail_classifier import bootstrap as _bootstrap
 from gmail_classifier.maturity import MaturityGate, build_gate
-from gmail_classifier.state_store import StateStore
+from gmail_classifier.storage_state import StateStore
 from gmail_classifier.training_index import TrainingIndex
 
 # Per-batch bounds: process at most this many messages, or run for at most this

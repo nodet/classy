@@ -4,7 +4,7 @@ Guards the plan's "Unit -- maturity gate" drain bullets at the orchestration
 level: pre-maturity new mail is parked (not labelled, not __skip__), and once
 mature it is drained through normal classification and removed idempotently.
 The gate decision itself is tested in test_maturity; the store table in
-test_state_store.
+test_storage_state.
 """
 from gmail_classifier.models import HistoryEvent
 from gmail_classifier.pending_new import (

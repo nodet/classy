@@ -1,7 +1,7 @@
 """Tests for the state backend: StateStore, StateBackend, and startup dispatch.
 
 Drive an on-disk SQLite state.db (tmp_path) with a fake embedder -- no network,
-no FastEmbed. Covers the plan's "Unit -- state_store.py" and "Unit -- startup
+no FastEmbed. Covers the plan's "Unit -- storage_state.py" and "Unit -- startup
 dispatch" gates for Phase 3 (warm path only).
 """
 import numpy as np
@@ -9,7 +9,7 @@ import pytest
 
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.models import Message
-from gmail_classifier.state_store import (
+from gmail_classifier.storage_state import (
     STATE_SCHEMA_VERSION,
     WARM_RECOVERY_WINDOW,
     GapDecision,

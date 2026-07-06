@@ -15,7 +15,7 @@ from gmail_classifier.state_status import (
     gather_status,
     print_report,
 )
-from gmail_classifier.state_store import StateStore
+from gmail_classifier.storage_state import StateStore
 
 
 def _vec(seed, dim=8):

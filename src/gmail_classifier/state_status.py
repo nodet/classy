@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from gmail_classifier.state_store import StateStore
+from gmail_classifier.storage_state import StateStore
 
 
 @dataclass

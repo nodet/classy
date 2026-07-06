@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gmail_classifier.state_store import (
+from gmail_classifier.storage_state import (
     STATE_SCHEMA_VERSION,
     StateStore,
     compute_excluded_hash,

@@ -8,7 +8,7 @@ import numpy as np
 
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.models import Message
-from gmail_classifier.state_store import StateBackend, StateStore
+from gmail_classifier.storage_state import StateBackend, StateStore
 
 LEGACY_NAMES = ("training.db", "inbox_sample.db", "embeddings.db")
 

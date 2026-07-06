@@ -13,7 +13,7 @@ import numpy as np
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.maturity import MATURITY_EXAMPLES_PER_LABEL
 from gmail_classifier.progressive import ProgressiveBootstrap
-from gmail_classifier.state_store import STATE_SCHEMA_VERSION, StateStore
+from gmail_classifier.storage_state import STATE_SCHEMA_VERSION, StateStore
 from gmail_classifier.training_index import TrainingIndex
 
 

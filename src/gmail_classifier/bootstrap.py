@@ -1,6 +1,6 @@
 """Gmail-backed build paths for the ``state`` backend (Phase 4).
 
-Three entry points, all driven by ``decide_startup`` in ``state_store.py`` and
+Three entry points, all driven by ``decide_startup`` in ``storage_state.py`` and
 wired from ``classify_and_label._build_backend``:
 
 - :func:`bootstrap_index` -- cold first boot on an empty/``in_progress`` store:
@@ -34,7 +34,7 @@ import numpy as np
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.gmail_parser import parse_gmail_message
 from gmail_classifier.models import HistoryExpiredError
-from gmail_classifier.state_store import (
+from gmail_classifier.storage_state import (
     STATE_SCHEMA_VERSION,
     WARM_RECOVERY_WINDOW,
     StateStore,

@@ -18,7 +18,7 @@ import pytest
 
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.progressive import ProgressiveBootstrap
-from gmail_classifier.state_store import (
+from gmail_classifier.storage_state import (
     STATE_SCHEMA_VERSION,
     StartupDecision,
     StateStore,
