@@ -6,5 +6,4 @@ dist/
 build/
 data/
 credentials/
-.env
 .deployed_version
