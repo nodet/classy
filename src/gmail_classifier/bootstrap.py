@@ -122,11 +122,18 @@ def _label_buckets(client, labels: List[Tuple[str, str]], max_per_label: int):
 
 
 def _skip_bucket(client, labeled_ids: Set[str], max_per_label: int):
-    """List up to ``max_per_label`` INBOX ids (newest first) and drop any that
-    already carry a user label -- labeled wins over skip *at the source*, so the
-    ``labels`` table never holds ``__skip__`` for a labeled id. Returns
-    ``(id, __skip__, __skip__, "auto")`` tuples."""
-    inbox_ids = client.list_message_ids("INBOX", max_results=max_per_label)
+    """List up to ``max_per_label`` truly-unlabeled INBOX ids (newest first) as
+    skip examples. Returns ``(id, __skip__, __skip__, "auto")`` tuples.
+
+    "Labeled wins over skip" is enforced *at the source* by the server-side
+    ``has:nouserlabels`` filter, so the ``labels`` table never holds ``__skip__``
+    for a user-labeled id -- including a labeled message that falls outside the
+    capped sample for its own label (which a client-side drop against the
+    sampled labeled union would miss). ``labeled_ids`` is kept only as a cheap
+    belt-and-suspenders drop for the ids we did sample; the query is the real
+    guarantee. Paging inside the client continues until ``max_per_label`` true
+    skip examples are collected."""
+    inbox_ids = client.list_unlabeled_inbox_ids(max_results=max_per_label)
     return [
         (mid, SKIP_LABEL, SKIP_LABEL, "auto")
         for mid in inbox_ids if mid not in labeled_ids

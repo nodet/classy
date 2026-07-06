@@ -61,6 +61,16 @@ class _FakeClient:
             ids = self._labels.get(label_id, ("", []))[1]
         return list(ids[:max_results]) if max_results else list(ids)
 
+    def list_unlabeled_inbox_ids(self, max_results=0):
+        # Server-side has:nouserlabels: an INBOX id carrying ANY user label is
+        # excluded, regardless of per-label sample caps. This mirrors the real
+        # Gmail query so tests exercise the actual guarantee.
+        all_labeled = set()
+        for _name, ids in self._labels.values():
+            all_labeled.update(ids)
+        unlabeled = [mid for mid in self._inbox if mid not in all_labeled]
+        return list(unlabeled[:max_results]) if max_results else list(unlabeled)
+
     def get_message(self, mid):
         self.get_calls.append(mid)
         # Track that only one raw body is "live" at a time: bootstrap must embed
@@ -188,6 +198,27 @@ def test_bootstrap_labeled_wins_over_skip(tmp_path):
     by_id = {mid: label for mid, _vec, label in store.iter_index()}
     assert by_id["shared"] == "A"
     assert by_id["i1"] == SKIP_LABEL
+    assert store.skip_vote_ids() == {"i1"}
+    store.close()
+
+
+def test_bootstrap_labeled_wins_even_outside_capped_sample(tmp_path):
+    """A message that is both in INBOX and user-labeled, but falls OUTSIDE the
+    capped sample for its label, must still never be stored as __skip__. The
+    server-side has:nouserlabels filter enforces this; a client-side drop against
+    only the sampled labeled union would miss it."""
+    # max_per_label=1 samples only ["a1"] from label A, so "shared" (also labeled
+    # A) is outside the sample -- but it is in INBOX.
+    client = _FakeClient(
+        labels={"L_A": ("A", ["a1", "shared"])},
+        inbox=["shared", "i1"],
+    )
+    store = _store(tmp_path)
+    bootstrap.bootstrap_index(client, _FakeEmbedder(), store, excluded=set(),
+                              max_per_label=1, topic="topic")
+    # "shared" must NOT be a skip example (it is user-labeled), even though it
+    # was not in label A's capped sample.
+    assert "shared" not in store.skip_vote_ids()
     assert store.skip_vote_ids() == {"i1"}
     store.close()
 

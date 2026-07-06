@@ -91,6 +91,20 @@ def test_list_messages_with_max_results():
     assert ids == ["msg0", "msg1", "msg2"]
 
 
+def test_list_unlabeled_inbox_ids_uses_query():
+    service = MagicMock()
+    service.users().messages().list.return_value.execute.return_value = {
+        "messages": [{"id": "u1"}, {"id": "u2"}],
+    }
+    client = GmailClient(service)
+    ids = client.list_unlabeled_inbox_ids(max_results=10)
+    assert ids == ["u1", "u2"]
+    # The server-side filter is what guarantees no labeled message is a skip.
+    _, kwargs = service.users().messages().list.call_args
+    assert kwargs["q"] == "in:inbox has:nouserlabels"
+    assert "labelIds" not in kwargs
+
+
 def test_get_message():
     service = MagicMock()
     msg_resource = {

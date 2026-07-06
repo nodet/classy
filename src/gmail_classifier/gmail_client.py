@@ -39,10 +39,28 @@ class GmailClient:
             max_results: Maximum number of IDs to return (0 = no limit).
                          Gmail returns most recent first.
         """
-        ids = []
+        return self._list_ids({"labelIds": [label_id]}, max_results)
+
+    def list_unlabeled_inbox_ids(self, max_results: int = 0) -> List[str]:
+        """List INBOX message IDs that carry **no user label** (newest first).
+
+        Uses Gmail's ``has:nouserlabels`` search operator so the filtering
+        happens server-side across the *whole* inbox, not just a capped page.
+        This is what makes "a labeled message is never a skip example" hold: a
+        message that is both in INBOX and user-labeled -- even one outside the
+        capped sample for its label -- is excluded by the query itself, so it
+        can never be persisted as ``__skip__``. Paging continues until
+        ``max_results`` true skip examples are collected.
+        """
+        return self._list_ids({"q": "in:inbox has:nouserlabels"}, max_results)
+
+    def _list_ids(self, list_kwargs: dict, max_results: int) -> List[str]:
+        """Shared pager for messages.list: accumulate ids (newest first) up to
+        ``max_results`` (0 = no limit), following ``nextPageToken``."""
+        ids: List[str] = []
         page_token = None
         while True:
-            kwargs = {"userId": "me", "labelIds": [label_id]}
+            kwargs = {"userId": "me", **list_kwargs}
             if page_token:
                 kwargs["pageToken"] = page_token
             if max_results:

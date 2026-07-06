@@ -65,6 +65,13 @@ class _FakeClient:
         ids = self._inbox if label_id == "INBOX" else self._labels.get(label_id, ("", []))[1]
         return list(ids[:max_results]) if max_results else list(ids)
 
+    def list_unlabeled_inbox_ids(self, max_results=0):
+        all_labeled = set()
+        for _name, ids in self._labels.values():
+            all_labeled.update(ids)
+        unlabeled = [mid for mid in self._inbox if mid not in all_labeled]
+        return list(unlabeled[:max_results]) if max_results else list(unlabeled)
+
     def get_message(self, mid):
         self.get_calls.append(mid)
         return {"id": mid, "payload": {"headers": [], "body": {}}, "labelIds": []}
