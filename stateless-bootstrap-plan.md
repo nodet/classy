@@ -245,10 +245,11 @@ embeddings; one file = one connection, atomic, trivial to reset.)
      timestamp merely because the process is alive or a Pub/Sub pull timed out.
    - **Gap > window, or the cursor is expired/out of range** → **read-only resync + re-pin**
      (do *not* replay-and-classify the accumulated backlog): reconcile label state from Gmail
-     (ingest label changes since the cursor as training truth, refresh the skip sample),
-     re-pin a fresh watch boundary, and treat all mail currently sitting in the mailbox as
-     *existing = read-only* — never label or archive it. Only mail arriving **after** this
-     restart is classifiable. Then persist the new cursor + `last_processed_at`.
+     as a current snapshot (remove stale label rows, rewrite changed labels, reuse unchanged
+     embeddings, refresh the skip sample), re-pin a fresh watch boundary, and treat all mail
+     currently sitting in the mailbox as *existing = read-only* — never label or archive it.
+     Only mail arriving **after the fresh re-pin boundary** is classifiable. Then persist the
+     new cursor + `last_processed_at`.
 
    The two "don't take bulk actions" triggers — *too much wall-clock elapsed* and *cursor
    aged out of Gmail's history window* — share **one** code path: the read-only resync. The
@@ -554,7 +555,7 @@ when it is stale or explicitly reset**:
 | Event | Behavior |
 |---|---|
 | **Service restart (gap ≤ recovery window)** | `state.db` present, downtime ≤ `WARM_RECOVERY_WINDOW` (default 1h), cursor valid → validate, load index, refresh watch, process history from durable `last_processed_history_id`, classify the small gap. No full Gmail fetch. The genuine failure-recovery case. |
-| **Service restart (gap > recovery window)** | Downtime exceeded the window → **read-only resync**: reconcile labels/skip from Gmail, re-pin the watch boundary, treat the accumulated backlog as existing/read-only (never classify or archive it). Only post-restart mail is classifiable. Bounds `state`'s divergence from legacy to a ≤1h window. |
+| **Service restart (gap > recovery window)** | Downtime exceeded the window → **read-only resync**: reconcile labels/skip from Gmail, re-pin the watch boundary, treat the accumulated backlog as existing/read-only (never classify or archive it). Only mail after the fresh re-pin boundary is classifiable. Bounds `state`'s divergence from legacy to a ≤1h window. |
 | **Code deploy (state backend), ML/config unchanged** | `gcp-deploy-state` builds the tarball with `--exclude='data'` and untars *over* `INSTALL_DIR`; `tar x` never deletes files absent from the archive, so `data/state.db` (and any leftover legacy DBs) is untouched. Deploy + restart → fast, state preserved. |
 | **ML changed** (embedding model or `build_text_representation`) | Startup compares `meta.ml_fingerprint` to the current code. Mismatch ⇒ cached vectors are stale. Build `state.rebuild.db` from Gmail, validate counts/fingerprint, then atomically replace `state.db`. Only vectors are stale — carry the existing `last_processed_history_id` forward rather than re-pinning a fresh boundary, so live changes during the rebuild are not skipped. No silent wrong vectors. |
 | **Excluded-label config changed** | Startup compares `excluded_labels_hash` (checked independently of the ML fingerprint). Reuse all unchanged embeddings: remove now-excluded labels from the index and bootstrap only the newly-included labels' ids — no re-embed of retained ids. The two-phase rebuild path is a last-resort fallback only if incremental reconciliation proves too complex to implement safely, not the expected path. |
@@ -698,17 +699,22 @@ deletes, or rewrites the other backend's database contents.
 
 ## Phased delivery
 
-The plan lands in six phases. The ordering is chosen so that **each phase ships on its own,
+The plan lands in seven phases. The ordering is chosen so that **each phase ships on its own,
 keeps the service deployable at every step, and is gated by a concrete, testable outcome** —
 not just "code exists." Phase 1 is a pure refactor that changes *no* observable behavior; it
 only introduces the seam the later phases plug into. The `state` backend is not wired until
 Phase 3, and then only for seeded/tested warm starts; it is not *safe* to point at a live
-mailbox until Phase 5, and not exposed to deploy/ops until Phase 6. Each phase names the
-Verification group(s) that gate it (see "Verification").
+mailbox for the common happy-path (fresh boot, short-outage restart) until Phase 5, does not
+survive an *aged* cursor or long outage without operator intervention until Phase 6, and is
+not exposed to deploy/ops until Phase 7. Each phase names the Verification group(s) that gate
+it (see "Verification").
 
 The through-line: **first make the current behavior expressible through the future
 architecture (Phase 1), then build the new backend behind that seam one safety property at a
-time (Phases 3–5), with the shared plumbing it needs pulled out first (Phase 2).**
+time (Phases 3–6), with the shared plumbing it needs pulled out first (Phase 2).** Phase 6 is
+deliberately the *last* safety property before ops: it removes the two fail-closed stops
+(missing/expired cursor, over-window gap) that Phases 3–5 leave in place, so the service can
+recover unattended from the outages a low-traffic mailbox will actually hit.
 
 ### Phase 1 — `StorageBackend` seam behind the legacy backend (pure refactor, no behavior change)
 
@@ -823,10 +829,172 @@ that keep a still-warming model from over-labeling a fresh mailbox.
 new mail is labeled before both maturity conditions hold; `pending_new` drains idempotently.
 *Gate:* **Unit — maturity gate** and **Unit — progressive interleave**.
 
-### Phase 6 — Deployment, ops, and docs (make it operable and switchable)
+### Phase 6 — History-expiry read-only resync + `WARM_RECOVERY_WINDOW` (unattended recovery)
+
+Phases 3–5 leave the `state` backend correct for the *happy* startup cases — a fresh cold
+boot and a short-outage warm restart whose cursor is still valid — but they punt on the two
+recovery cases a long-lived deployment actually hits, and they punt by **failing closed**:
+
+- **Missing/absent durable cursor** on a warm-looking store → `raise SystemExit` in
+  `_run_pubsub_mode` (`classify_and_label.py:633-639`).
+- **History expiry (`HistoryExpiredError`)** on the state path → `raise NotImplementedError`
+  in `_check_inbox_fallback` (`classify_and_label.py:697-702`); the loop's own expiry handler
+  (`pubsub_loop.py:159-172`) calls `check_inbox`, which is this fail-closed fallback on state.
+- **Over-window / long-outage warm restart** → *not even detected*. The warm path
+  (`classify_and_label.py:641`) unconditionally replays from the persisted cursor with **no
+  gap check at all**; a restart after days of downtime would replay-and-classify (label +
+  **archive**) a week of accumulated backlog — precisely the irreversible-action hazard the
+  read-only boundary was built to prevent. The `last_processed_at` timestamp the store already
+  stamps on every cursor write (`state_store.py:401-413`) exists *for* this check but nothing
+  reads it yet.
+
+Gmail's history retention is roughly one week and opaque; on a quiet mailbox under
+`Restart=on-failure`, hitting an aged-out cursor or a multi-day outage is a *when*, not an
+*if*. This phase implements the plan's already-designed recovery (see "Warm path" step 4 and
+the "History cursor expired" / "gap > recovery window" lifecycle rows) so the service recovers
+**unattended and safely** instead of halting or over-labeling.
+
+The unifying idea, straight from the design: the two "don't take bulk actions" triggers —
+*too much wall-clock elapsed* and *cursor aged out of Gmail's history window* — share **one**
+code path, the **read-only resync + re-pin**. It reconciles label state from Gmail as training
+truth, re-pins a fresh watch boundary, and treats everything currently in the mailbox as
+existing/read-only (never label or archive it); only mail arriving *after the fresh re-pin
+boundary* is classifiable. This bounds `state`'s one behavioral divergence from legacy to a ≤1h
+failure-recovery window.
+
+Concretely:
+
+- **`WARM_RECOVERY_WINDOW` constant** (default `3600_000` ms = 1h) in `state_store.py`
+  alongside the other state constants. Fold it into the ML/schema-independent config; it does
+  **not** enter any fingerprint (it changes recovery behavior, not vector validity or
+  membership).
+- **`classify_gap(store, now_ms)` — a pure decision function** in `state_store.py`, testable
+  with no mailbox. Reads `last_processed_history_id` and `last_processed_at` and returns one of
+  three verdicts:
+  - `REPLAY` — cursor present **and** `0 <= now_ms - last_processed_at <= WARM_RECOVERY_WINDOW`:
+    the genuine short-outage case; replay-and-classify from the cursor.
+  - `RESYNC` — cursor present but the gap exceeds the window, **or** `last_processed_at` is
+    missing / non-integer / in the future (fail-safe): read-only resync + re-pin.
+  - `RESYNC` — cursor **absent** (`last_processed_history_id` is `None`): also read-only resync
+    (this replaces the current `SystemExit`; a warm-looking store with no cursor is now
+    recovered, not rejected).
+
+  Keep it a pure function returning an enum (mirroring `decide_startup`) so the branch logic is
+  unit-tested directly and the wiring stays thin.
+- **`read_only_resync(client, embedder, backend, topic, ...)`** in `bootstrap.py` (it reuses the
+  bootstrap fetch/embed/reconcile primitives already there). Steps, in order:
+  1. **Reconcile labels from Gmail as training truth** — compute a current Gmail snapshot for
+     all included labels plus the skip sample, then update `labels`/the live index to match it:
+     remove stale rows, rewrite changed labels, reuse unchanged embeddings, and re-seed the skip
+     sample. Crucially this path **must not** call `apply_label`/archive on any message: it
+     ingests Gmail's *current* label state, it does not classify. Assert this in tests
+     (`client.apply_label` never called).
+  2. **Re-pin a fresh boundary**: call `client.watch(topic)`, and persist the new
+     `bootstrap_boundary_history_id` + `last_processed_history_id` + `last_processed_at` in one
+     transaction. Add a `StateStore.repin_boundary(history_id)` helper (a sibling of the
+     existing `pin_bootstrap_boundary`, but for an already-`complete` store — it must **not**
+     reset `bootstrap_status` to `in_progress`, or the next boot would re-bootstrap).
+  3. Return the new `(history_id, expiration)` so the loop starts from the fresh boundary.
+
+  Everything the mailbox held at re-pin time is at-or-before the new boundary, so post-cursor
+  history never surfaces it → it stays untouched without an explicit per-message check, exactly
+  as the cold boot's read-only property works.
+- **Wire the warm path** (`_run_pubsub_mode`, replacing the `SystemExit` guard and the
+  unconditional `history_id = resume_id or watch_history_id`): on the state path, call
+  `classify_gap`. On `REPLAY`, behave as today (resume from `resume_id`). On `RESYNC`, run
+  `read_only_resync` and start from its returned fresh boundary. Legacy is untouched (it has no
+  durable cursor; `classify_gap` is state-only).
+- **Wire the expiry fallback** (`_check_inbox_fallback`, replacing the `NotImplementedError`):
+  on the state path, run the *same* `read_only_resync`. The loop already re-pins + persists +
+  acks after `check_inbox` returns (`pubsub_loop.py:169-172`), so `read_only_resync` must be
+  idempotent with that: have it re-pin internally and let the loop's subsequent `watch()` +
+  `persist_cursor` be a harmless second re-pin, **or** (cleaner) refactor the loop's expiry
+  branch to take the boundary the fallback returns instead of re-`watch()`ing itself. Prefer
+  the latter — add an optional `resync: Callable[[], tuple] | None` to `LoopDeps` that, when
+  set (state), *is* the expiry recovery (reconcile + re-pin + return the fresh
+  `(history_id, expiration)`), so the branch does not double-watch. When unset (legacy), the
+  branch keeps today's `check_inbox` + `watch` behavior verbatim.
+- **Quiet-mailbox heartbeat** (so a *live* quiet service never *reaches* the window and forces
+  a resync it didn't need): before `last_processed_at` approaches `WARM_RECOVERY_WINDOW`, do a
+  no-op `history.list(last_processed_history_id)`; if the cursor is still valid and there are no
+  pending updates, persist the returned history id and a fresh `last_processed_at` in one
+  transaction. A Pub/Sub pull timeout alone must **not** refresh the timestamp (liveness ≠
+  progress). This is a small addition to the steady-state loop (`run_iteration`), gated on a
+  `heartbeat`/`now_ms` dep so it is testable with a fake clock; keep it off by default
+  (`heartbeat=None`) so legacy and existing tests are unchanged.
+
+**Tests (all fakes — fake Gmail client recording `apply_label`/`watch`/`get_history` calls, in-
+memory SQLite `StateStore`, injected `now_ms`; no network, no FastEmbed):**
+
+- `tests/test_state_store.py` (extend) — `classify_gap` as a pure decision:
+  - cursor present, `gap == 0` → `REPLAY`.
+  - cursor present, `gap == WARM_RECOVERY_WINDOW` exactly → `REPLAY` (boundary is inclusive).
+  - cursor present, `gap == WARM_RECOVERY_WINDOW + 1` → `RESYNC`.
+  - cursor present, `last_processed_at` missing → `RESYNC` (fail-safe).
+  - cursor present, `last_processed_at` non-integer / malformed → `RESYNC` (reuses
+    `get_last_processed_at`'s `None`-on-`ValueError`).
+  - cursor present, `last_processed_at` in the future (`> now_ms`) → `RESYNC` (clock skew is
+    not a licence to replay an unbounded gap).
+  - cursor **absent** → `RESYNC` (the case that used to `SystemExit`).
+  - `repin_boundary(hid)` writes `bootstrap_boundary_history_id` + `last_processed_history_id`
+    + `last_processed_at` in one transaction and **leaves `bootstrap_status == "complete"`**
+    (assert it is not flipped to `in_progress`, unlike `pin_bootstrap_boundary`).
+- `tests/test_bootstrap.py` (extend) — `read_only_resync`:
+  - **never labels/archives:** with a fake client whose inbox is full of high-confidence mail,
+    assert `client.apply_label` is **never** called during the resync.
+  - **re-pins the boundary:** `client.watch` is called; the returned `(history_id, expiration)`
+    is propagated; the store's `bootstrap_boundary_history_id` and `last_processed_history_id`
+    equal the fresh watch id; `last_processed_at` is stamped from the injected clock.
+  - **ingests label changes as truth:** a label applied in Gmail since the old cursor is folded
+    into the index/store, a stored label removed in Gmail is removed locally, and a stored label
+    A changed to B is rewritten (reuses the reconcile assertion style). A backlog INBOX message
+    with no user label may be sampled as internal `__skip__` training truth, but resync never
+    calls Gmail label/archive actions for it.
+  - **idempotent:** running it twice in a row leaves the same store state (second run re-pins to
+    the same or newer id, no duplicate rows, no crash) — guards the loop's expiry branch which
+    may re-`watch` after the fallback.
+- `tests/test_pubsub_loop.py` (extend) — expiry branch with a `resync` dep:
+  - `HistoryExpiredError` with `resync` set → `resync()` is called, its returned boundary
+    becomes the next `LoopState.history_id`, `check_inbox` is **not** called, and the loop does
+    **not** double-`watch` (assert `watch` call count). Ack happens after resync + persist.
+  - `HistoryExpiredError` with `resync=None` (legacy) → today's behavior verbatim:
+    `check_inbox` then `watch` then persist then ack (regression guard on the existing
+    `test_history_expired_*` cases).
+  - **quiet-mailbox heartbeat:** with an injected clock advanced to near the window and a fake
+    `history.list` returning no pending updates, `run_iteration` persists the returned history
+    id + a fresh `last_processed_at`; a plain idle pull (no heartbeat due) does **not** touch
+    the timestamp.
+- `tests/test_pubsub_mode_startup.py` (extend) — warm-path wiring in `_run_pubsub_mode`:
+  - **within window** (`_CursorBackend` seeded with a recent `last_processed_at`) → resumes
+    from `resume_id`; no resync, no re-pin (assert `watch`-for-repin not called beyond the
+    initial watch).
+  - **past window** → `read_only_resync` runs; loop starts from the fresh boundary; the
+    accumulated inbox is never `apply_label`-ed.
+  - **absent cursor** → **no longer `SystemExit`**; takes the resync path and starts cleanly
+    (this test replaces `test_state_without_cursor_fails_closed`, which is removed/rewritten
+    since the fail-closed behavior it guards is intentionally deleted in this phase).
+  - legacy path unchanged (`test_legacy_without_cursor_uses_watch_boundary` still passes).
+
+Note: `test_state_without_cursor_fails_closed` (`test_pubsub_mode_startup.py:84-96`) and the
+state-path `NotImplementedError` expiry assertion must be **updated, not left**, because Phase 6
+deliberately removes the two fail-closed stops. Flag this in the commit so the deletion of a
+safety `raise` is visible in review.
+
+**Done when:** a warm restart within the window replays-and-classifies from the cursor; a
+restart past the window (or with a missing/invalid `last_processed_at`, or an absent cursor)
+takes the read-only resync — reconciling labels, re-pinning the boundary, and **never**
+labeling/archiving the accumulated backlog; a `HistoryExpiredError` mid-run triggers the same
+resync rather than a `NotImplementedError` or a labeling inbox sweep; and a live quiet service
+advances its heartbeat before the window so it never resyncs needlessly. *Gate:* the
+window/expiry/heartbeat/fail-safe cases under **Unit — Pub/Sub / history cursor safety** and
+the over-window read-only case under **Unit — read-only boundary (cold path safety)**, plus
+the **State after legacy — cursor replay** case under **Unit — switching backends** (an
+over-window gap ingests labels but does not classify the backlog).
+
+### Phase 7 — Deployment, ops, and docs (make it operable and switchable)
 
 Only now expose the backend choice to deploy/ops, since the `state` backend is finally safe to
-point at a real mailbox.
+point at a real mailbox *and* recovers unattended from the outages one will hit (Phase 6).
 
 - `gcp-deploy-state` (code + credentials only) / `gcp-deploy-legacy` (today's deploy, with
   `gcp-deploy` as its alias); backend persisted in the service env; explicit per-backend sync
@@ -844,14 +1012,18 @@ classifier with no DB upload; a redeploy preserves `state.db`; `gcp-deploy-legac
 ### Phase dependency summary
 
 ```text
-Phase 1 (seam, no behavior change) ──┬──> Phase 3 (state warm path) ──> Phase 4 (cold bootstrap) ──> Phase 5 (progressive+maturity) ──> Phase 6 (deploy/ops/docs)
+Phase 1 (seam, no behavior change) ──┬──> Phase 3 (state warm path) ──> Phase 4 (cold bootstrap) ──> Phase 5 (progressive+maturity) ──> Phase 6 (resync + recovery window) ──> Phase 7 (deploy/ops/docs)
 Phase 2 (pull/ack split) ────────────┘
 ```
 
 Phases 1 and 2 are independent and can land in either order (both are legacy-only; Phase 1 is
 behavior-preserving and Phase 2 preserves successful-run behavior while improving ack ordering);
 Phase 3 depends on both. After Phase 1 the architecture is in place with no behavior change —
-that is the natural stopping point if the `state` backend is deferred.
+that is the natural stopping point if the `state` backend is deferred. Phase 6 depends on
+Phase 5 (it removes the fail-closed stops the earlier phases install and relies on the
+bootstrap/reconcile primitives from Phase 4); Phase 7 depends on Phase 6, because deploying the
+`state` backend to a real, long-lived VM without unattended recovery would strand it on the
+first aged cursor.
 
 ## Files
 
