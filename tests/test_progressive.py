@@ -219,8 +219,8 @@ def test_maturity_progresses_as_index_grows(tmp_path):
 
 
 def test_logs_periodic_progress(tmp_path):
-    # 250 messages so the count crosses the 100-message interval twice while
-    # embedding (100, 200), but the final 250 is left to the completion line.
+    # 250 messages so the worklist position crosses the 100-item interval twice
+    # (100, 200), but the final 250 is left to the completion line.
     client = _FakeClient(
         labels={"L_A": ("A", [f"a{i}" for i in range(250)])}, inbox=[])
     lines = []
@@ -239,10 +239,60 @@ def test_logs_periodic_progress(tmp_path):
                 and "embedded" in ln and "/" in ln]
     # One line per crossed interval (100, 200) -- not per batch, and not the
     # final total (that is the separate "Bootstrap complete" completion line).
-    assert progress == ["Bootstrap: 100/250 embedded",
-                        "Bootstrap: 200/250 embedded"]
-    # The completion line still fires once, with the full count.
-    assert any(ln.startswith("Bootstrap complete: 250") for ln in lines)
+    # Fresh embeds equal the position here (nothing was pre-cached).
+    assert progress == ["Bootstrap: 100/250 (100 embedded)",
+                        "Bootstrap: 200/250 (200 embedded)"]
+    # The completion line still fires once, with the full count. With no
+    # pre-cached ids, fresh == total so it renders as the plain form.
+    assert any(ln == "Bootstrap complete: 250 messages embedded" for ln in lines)
+    store.close()
+
+
+def test_resumed_progress_meter_reaches_total(tmp_path):
+    """A resumed bootstrap (most ids already embedded) must still count up to the
+    planned total, not to the smaller freshly-embedded count.
+
+    Regression for the live symptom: an interrupted first boot left ~1054 ids
+    cached; the resume re-planned the full 1863-item worklist but only freshly
+    embedded 809, and the meter (which counted fresh embeds) reported
+    ``809/1863`` then ``complete: 809`` -- reading as if the corpus shrank."""
+    # 250-message corpus; pre-embed 150 of them as if a prior boot got that far.
+    ids = [f"a{i}" for i in range(250)]
+    client = _FakeClient(labels={"L_A": ("A", ids)}, inbox=[])
+    store = StateStore(str(tmp_path / "state.db"))
+    for mid in ids[:150]:
+        store.upsert_label(mid, "L_A", "A", source="user")
+        store.upsert_embedding(mid, np.full(8, 1.0, dtype=np.float32))
+
+    lines = []
+    driver = ProgressiveBootstrap(
+        client=client, embedder=_FakeEmbedder(), store=store,
+        index=_empty_index(), excluded=set(), max_per_label=300,
+        gmail_account_id="me@x.com", batch_max_messages=25, log=lines.append)
+
+    guard = 0
+    while not driver.done:
+        driver.run_batch()
+        guard += 1
+        assert guard < 100
+
+    progress = [ln for ln in lines if ln.startswith("Bootstrap: ")
+                and "/" in ln and "embedded" in ln]
+    # Meter counts worklist position (converges to 250). Cached ids don't count
+    # against the batch budget, so batch 1 skips all 150 cached then embeds 25
+    # fresh (pos 175, snapped to 100/250, 25 embedded); batch 2 embeds 25 more
+    # (pos 200, 50 embedded). The parenthetical fresh count lags the meter -- as
+    # it should, since it counts only real embedding work this run.
+    assert progress == ["Bootstrap: 100/250 (25 embedded)",
+                        "Bootstrap: 200/250 (50 embedded)"]
+    # Completion reports the full corpus with the smaller fresh count in parens,
+    # NOT a bare "complete: 100" that would look like a shrunken corpus.
+    assert any(
+        ln == "Bootstrap complete: 250 messages (100 freshly embedded this run)"
+        for ln in lines)
+    # And the in-memory index actually holds only the 100 freshly added rows
+    # (the 150 pre-cached were embedded by the prior boot, not re-added here).
+    assert len(driver.index) == 100
     store.close()
 
 

@@ -250,6 +250,7 @@ def plan_bootstrap_worklist(client, excluded: Set[str], max_per_label: int):
 
 def finalize_bootstrap(store: StateStore, embedder, *, excluded: Set[str],
                        gmail_account_id: Optional[str], n: int,
+                       n_embedded: Optional[int] = None,
                        log: Callable[..., None] = _noop) -> None:
     """Stamp the store as a complete, WARM-eligible store.
 
@@ -258,7 +259,14 @@ def finalize_bootstrap(store: StateStore, embedder, *, excluded: Set[str],
     a store marked complete without it would read back as INCOMPATIBLE on the
     very next boot. bootstrap_status="complete" is written LAST, after every
     fingerprint/hash/account key, so a crash before it leaves the store
-    ``in_progress`` (re-bootstrapped next boot) rather than complete-but-unbound."""
+    ``in_progress`` (re-bootstrapped next boot) rather than complete-but-unbound.
+
+    ``n`` is the corpus size the bootstrap covered (the worklist total).
+    ``n_embedded``, when it differs from ``n``, is how many of those were freshly
+    fetched + embedded *this run* -- smaller on a resumed bootstrap where most ids
+    were already cached. Reporting both keeps the completion line honest: a resume
+    that embeds 809 of a 1863-message corpus reads as ``1863 (809 freshly embedded
+    this run)`` rather than a misleading bare ``809``."""
     store.set_meta("state_schema_version", STATE_SCHEMA_VERSION)
     if gmail_account_id is not None:
         store.set_meta("gmail_account_id", gmail_account_id)
@@ -267,7 +275,11 @@ def finalize_bootstrap(store: StateStore, embedder, *, excluded: Set[str],
     store.set_meta("excluded_labels_hash", compute_excluded_hash(excluded))
     store.set_meta("bootstrap_completed_at", str(store.now_ms()))
     store.set_meta("bootstrap_status", "complete")
-    log(f"Bootstrap complete: {n} messages embedded")
+    if n_embedded is not None and n_embedded != n:
+        log(f"Bootstrap complete: {n} messages "
+            f"({n_embedded} freshly embedded this run)")
+    else:
+        log(f"Bootstrap complete: {n} messages embedded")
 
 
 def bootstrap_index(

@@ -40,10 +40,13 @@ from gmail_classifier.training_index import TrainingIndex
 BATCH_MAX_MESSAGES = 25
 BATCH_MAX_SECONDS = 5.0
 
-# Emit a "Bootstrap: N/total embedded" progress line each time the cumulative
-# count crosses a multiple of this. The blocking path logs every 100; matching
-# it here gives the ~10-20 min first-boot tail visible movement in the log
-# instead of silence between the plan line and the completion line.
+# Emit a "Bootstrap: processed/total (N embedded)" progress line each time the
+# count of worklist items handled crosses a multiple of this. The blocking path
+# logs every 100; matching it here gives the ~10-20 min first-boot tail visible
+# movement in the log instead of silence between the plan line and the
+# completion line. The meter tracks worklist *position*, not freshly-embedded
+# count, so it converges to the planned total even on a resumed bootstrap where
+# most ids are already cached (see :meth:`_maybe_log_progress`).
 PROGRESS_LOG_INTERVAL = 100
 
 
@@ -79,7 +82,7 @@ class ProgressiveBootstrap:
     _worklist: List[Tuple[str, str, Optional[str], str]] = field(default=None, repr=False)
     _pos: int = 0
     _built: int = 0
-    _last_logged: int = 0  # highest _built already reported by a progress line
+    _last_logged: int = 0  # highest worklist position reported by a progress line
     gate: Optional[MaturityGate] = None
     done: bool = False
     _finalized: bool = False
@@ -134,7 +137,8 @@ class ProgressiveBootstrap:
         if additions:
             self.index.add_many(additions)
             self._built += len(additions)
-            self._maybe_log_progress()
+
+        self._maybe_log_progress()
 
         if self._pos >= len(self._worklist):
             self._finalize()
@@ -142,27 +146,47 @@ class ProgressiveBootstrap:
         return len(additions)
 
     def _maybe_log_progress(self) -> None:
-        """Log ``Bootstrap: N/total embedded`` when the cumulative count crosses
-        the next ``PROGRESS_LOG_INTERVAL`` boundary. Batched work can jump the
-        count by up to ``batch_max_messages`` at once, so gate on crossing the
-        boundary (not equality) and remember the last reported count so a single
-        line fires per interval regardless of batch size. The completion line is
-        emitted separately by ``finalize_bootstrap``, so skip the final total
-        here to avoid a duplicate."""
+        """Log ``Bootstrap: processed/total (N embedded)`` when the count of
+        worklist items handled crosses the next ``PROGRESS_LOG_INTERVAL``.
+
+        The meter tracks worklist *position* (``_pos``), not the freshly-embedded
+        count: on a **resumed** bootstrap most ids are already cached and skipped
+        without a fetch, so a fresh-embed numerator could never reach the planned
+        total -- the meter would stall and the completion line would read as if
+        the corpus shrank. Position advances over cached and freshly-embedded ids
+        alike, so it always converges to ``total``. The parenthetical fresh count
+        still shows how much real embedding this run did.
+
+        Batched work can jump the position by up to ``batch_max_messages`` at
+        once, so gate on crossing the boundary (not equality) and remember the
+        last reported multiple so exactly one line fires per interval regardless
+        of batch size. The final total is left to ``finalize_bootstrap``'s
+        completion line, so skip it here to avoid a duplicate."""
         total = len(self._worklist)
-        if self._built >= total:
+        if self._pos >= total:
             return  # completion handled by _finalize's log
-        if self._built - self._last_logged >= PROGRESS_LOG_INTERVAL:
-            self._last_logged = self._built - (self._built % PROGRESS_LOG_INTERVAL)
-            self.log(f"Bootstrap: {self._built}/{total} embedded")
+        if self._pos - self._last_logged >= PROGRESS_LOG_INTERVAL:
+            # Snap the reported numerator to the interval multiple so the meter
+            # reads "100/250", "200/250" even when a batch (or a run of cached
+            # ids on resume) jumps _pos to a non-round value like 175.
+            self._last_logged = self._pos - (self._pos % PROGRESS_LOG_INTERVAL)
+            self.log(f"Bootstrap: {self._last_logged}/{total} "
+                     f"({self._built} embedded)")
 
     def _finalize(self) -> None:
-        """Stamp the store complete exactly once, when the work-list is drained."""
+        """Stamp the store complete exactly once, when the work-list is drained.
+
+        Report the full corpus size (worklist length), not just what this run
+        freshly embedded: on a resumed bootstrap ``_built`` counts only the ids
+        fetched this run, so passing it as the total would make the completion
+        line read as if the corpus shrank. ``finalize_bootstrap`` shows the
+        fresh-embed count parenthetically when the two differ."""
         if self._finalized:
             return
         _bootstrap.finalize_bootstrap(
             self.store, self.embedder, excluded=self.excluded,
-            gmail_account_id=self.gmail_account_id, n=self._built, log=self.log)
+            gmail_account_id=self.gmail_account_id,
+            n=len(self._worklist), n_embedded=self._built, log=self.log)
         self._finalized = True
         self.done = True
 
