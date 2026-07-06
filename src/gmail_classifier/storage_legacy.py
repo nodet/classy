@@ -117,6 +117,19 @@ class LegacyBackend:
         separate ``upsert_label`` for the new label)."""
         self._training().delete_messages([message_id])
 
+    # --- pending_new (state-only maturity gate; no-ops on legacy) --------
+
+    def park_pending(self, message_id: str, history_id: str) -> None:
+        # Legacy has no maturity gate: new mail is classified immediately, so
+        # there is nothing to park.
+        pass
+
+    def get_pending(self):
+        return []
+
+    def remove_pending(self, message_id: str) -> None:
+        pass
+
     # --- history cursor (process-local, never persisted) ----------------
 
     def get_last_processed_history_id(self) -> Optional[str]:

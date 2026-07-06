@@ -17,7 +17,7 @@ adapters are plain classes that satisfy it, and tests use fakes that do too.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol, Set, runtime_checkable
+from typing import List, Optional, Protocol, Set, Tuple, runtime_checkable
 
 import numpy as np
 
@@ -71,6 +71,22 @@ class StorageBackend(Protocol):
 
     def remove(self, message_id: str) -> None:
         """Drop a message from the labeled set (no-op if absent)."""
+        ...
+
+    def park_pending(self, message_id: str, history_id: str) -> None:
+        """Park a genuinely-new, pre-maturity message: record it as awaiting a
+        mature model, with no label row and no archive. Idempotent. On legacy
+        this is a no-op (legacy has no maturity gate)."""
+        ...
+
+    def get_pending(self) -> List[Tuple[str, str, str]]:
+        """The parked ``(message_id, first_seen_history_id, reason)`` rows to
+        drain once the model matures. Empty on legacy."""
+        ...
+
+    def remove_pending(self, message_id: str) -> None:
+        """Drop one parked row after it has been drained. Idempotent no-op on
+        legacy."""
         ...
 
     def get_last_processed_history_id(self) -> Optional[str]:

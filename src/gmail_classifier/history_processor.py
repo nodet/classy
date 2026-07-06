@@ -12,6 +12,23 @@ from gmail_classifier.models import HistoryEvent
 from gmail_classifier.preprocessing import preprocess_email_body, build_text_representation, html_cap_note
 
 
+def collect_new_inbox_ids(events: List[HistoryEvent], skip_ids: Set[str]) -> List[str]:
+    """Unique message ids added to INBOX by ``events`` that are not already
+    known (in ``skip_ids``). Order-preserving, deduplicated.
+
+    Shared by the classification path (below) and the maturity-gate parking
+    path, so both agree on exactly which ids count as genuinely-new inbox mail.
+    """
+    new_message_ids: List[str] = []
+    seen: Set[str] = set()
+    for event in events:
+        if event.type == "messagesAdded" and "INBOX" in event.label_ids:
+            if event.message_id not in seen and event.message_id not in skip_ids:
+                new_message_ids.append(event.message_id)
+                seen.add(event.message_id)
+    return new_message_ids
+
+
 def process_history_events(
     events: List[HistoryEvent],
     client: GmailClient,
@@ -40,13 +57,7 @@ def process_history_events(
         user_label_ids = registry.user_label_ids
 
     # Collect unique new-message IDs from events
-    new_message_ids = []
-    seen = set()
-    for event in events:
-        if event.type == "messagesAdded" and "INBOX" in event.label_ids:
-            if event.message_id not in seen and event.message_id not in skip_ids:
-                new_message_ids.append(event.message_id)
-                seen.add(event.message_id)
+    new_message_ids = collect_new_inbox_ids(events, skip_ids)
 
     results = []
     for mid in new_message_ids:

@@ -512,6 +512,20 @@ class StateBackend:
         excluded from the join until a new label row is written)."""
         self._store.remove_label(message_id)
 
+    # --- pending_new (pre-maturity parking) -----------------------------
+
+    def park_pending(self, message_id: str, history_id: str) -> None:
+        """Park genuinely-new mail seen before the model matured -- no label, no
+        archive, no ``__skip__`` (which would be a premature final verdict).
+        Idempotent (``INSERT OR IGNORE``)."""
+        self._store.add_pending(message_id, history_id, reason="immature")
+
+    def get_pending(self) -> List[Tuple[str, str, str]]:
+        return self._store.get_pending()
+
+    def remove_pending(self, message_id: str) -> None:
+        self._store.remove_pending(message_id)
+
     # --- durable history cursor -----------------------------------------
 
     def get_last_processed_history_id(self) -> Optional[str]:
