@@ -28,8 +28,13 @@ class TrainingIndex:
             self.embeddings[idx] = embedding
             self.labels[idx] = label
         else:
-            # Append
-            self.embeddings = np.vstack([self.embeddings, embedding.reshape(1, -1)])
+            # Append. A freshly-empty index has shape (0, 0), which cannot
+            # vstack with a (1, d) row -- seed it from the row's own width.
+            row = embedding.reshape(1, -1)
+            if self.embeddings.shape[0] == 0:
+                self.embeddings = row.astype(self.embeddings.dtype, copy=True)
+            else:
+                self.embeddings = np.vstack([self.embeddings, row])
             self.labels.append(label)
             self._ids.append(message_id)
             self._id_to_idx[message_id] = len(self._ids) - 1
@@ -74,7 +79,13 @@ class TrainingIndex:
         if not new_rows:
             return
 
-        self.embeddings = np.vstack([self.embeddings, *new_rows])
+        # A freshly-empty index has shape (0, 0), which cannot vstack with the
+        # (1, d) rows -- stack only the new rows in that case (they define the
+        # width). Otherwise append to the existing matrix as before.
+        if self.embeddings.shape[0] == 0:
+            self.embeddings = np.vstack(new_rows)
+        else:
+            self.embeddings = np.vstack([self.embeddings, *new_rows])
         base = len(self._ids)
         for offset, (message_id, label) in enumerate(zip(new_ids, new_labels)):
             self._ids.append(message_id)

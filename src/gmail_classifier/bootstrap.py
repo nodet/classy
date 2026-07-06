@@ -81,10 +81,11 @@ def _round_robin(buckets: List[List]):
                 yield item
 
 
-def _persist_one(client, embedder, store: StateStore, mid: str,
-                 label_id: str, label_name: Optional[str], source: str) -> bool:
+def _fetch_embed_persist(client, embedder, store: StateStore, mid: str,
+                         label_id: str, label_name: Optional[str], source: str):
     """Record one message under ``label_id``, fetching + embedding only if its
-    vector is not already cached.
+    vector is not already cached. Returns the freshly computed vector, or
+    ``None`` if the id was already embedded (nothing fetched this call).
 
     The label row is **always** upserted (cheap, idempotent). This is what makes
     exclusion reconcile cheap: a re-included label whose id was removed from
@@ -93,19 +94,35 @@ def _persist_one(client, embedder, store: StateStore, mid: str,
     when ``has_embedding`` is already true -- the resumability fast-path (a
     crashed bootstrap re-runs but does not re-fetch cached ids).
 
-    Returns ``True`` iff the message was actually fetched + embedded this call
-    (so callers count real work). The embedding is written **last**, so a crash
-    between the label and embedding writes just re-does this one message's embed
-    next boot rather than leaving a permanent labeled row with no vector."""
+    The embedding is written **last**, so a crash between the label and embedding
+    writes just re-does this one message's embed next boot rather than leaving a
+    permanent labeled row with no vector. Returning the vector lets the
+    progressive driver add it to the live in-memory index without a re-read."""
     store.upsert_label(mid, label_id, label_name, source=source)
     if store.has_embedding(mid):
-        return False
+        return None
     raw = client.get_message(mid)
     msg = parse_gmail_message(raw)
     vec = embedder.embed(_message_text(msg))
     store.upsert_embedding(mid, vec)
-    # `raw`/`msg`/`vec` fall out of scope here -- one body held at a time.
-    return True
+    # `raw`/`msg` fall out of scope here -- one body held at a time.
+    return vec
+
+
+def _persist_one(client, embedder, store: StateStore, mid: str,
+                 label_id: str, label_name: Optional[str], source: str) -> bool:
+    """Blocking-path wrapper: ``True`` iff a vector was fetched + embedded this
+    call (so callers count real work)."""
+    return _fetch_embed_persist(
+        client, embedder, store, mid, label_id, label_name, source) is not None
+
+
+def index_label_for(label_id: str, label_name: Optional[str]) -> str:
+    """The label the runtime index/classifier votes on for a stored row:
+    ``SKIP_LABEL`` for skip rows, else the label-name snapshot (falling back to
+    the id). Mirrors ``StateStore.iter_index`` so a row added live to the
+    in-memory index matches the same row loaded from the join."""
+    return SKIP_LABEL if label_id == SKIP_LABEL else (label_name or label_id)
 
 
 def _label_buckets(client, labels: List[Tuple[str, str]], max_per_label: int):
@@ -140,46 +157,30 @@ def _skip_bucket(client, labeled_ids: Set[str], max_per_label: int):
     ]
 
 
-def bootstrap_index(
-    client, embedder, store: StateStore, *,
-    excluded: Set[str], max_per_label: int, topic: str,
-    gmail_account_id: Optional[str] = None,
-    log: Callable[..., None] = _noop,
-) -> None:
-    """Cold bootstrap an empty (or ``in_progress``) ``state.db`` from Gmail.
+def ensure_boundary(client, store: StateStore, topic: str,
+                    log: Callable[..., None] = _noop) -> str:
+    """Pin (or reuse) the read-only boundary and return its historyId.
 
-    Order (see the plan's "First-boot summary"):
-    ``watch()`` → pin boundary + cursor → front-load ~50 skip seeds →
-    round-robin labels + remaining skip, committing each vector (resumable).
-    Never labels or archives existing mail. On completion the store is a WARM
-    store: schema/fingerprint/account/exclusion meta are all written so the next
-    boot loads the join directly.
+    watch() runs FIRST, before reading a single message, so the pinned historyId
+    boundary reflects start-of-service: anything at-or-before it is existing =
+    read-only; only mail after it is classifiable.
 
-    ``gmail_account_id`` binds the store to this mailbox. It is written before
-    ``bootstrap_status=complete`` so that on the next boot ``decide_startup`` --
-    which requires a non-empty stored account equal to the live one -- reads the
-    freshly built store as WARM rather than INCOMPATIBLE.
-    """
-    # watch() FIRST, before reading a single message, so the pinned historyId
-    # boundary reflects start-of-service. Anything at-or-before it is existing =
-    # read-only; only mail after it is classifiable.
-    #
-    # A pinned boundary is the ONLY reason to skip watch(): once a boundary
-    # exists we must never re-watch, because that would move it past mail that
-    # arrived during the first attempt and silently skip it. Do NOT gate on
-    # bootstrap_status here -- pin_bootstrap_boundary writes the boundary,
-    # cursor, and status in one transaction, but if we keyed off status a crash
-    # (or any future partial write) that left a boundary without a status would
-    # re-watch and lose the boundary. If a boundary exists but status is missing,
-    # just (re)mark in-progress and continue from the existing boundary.
-    #
-    # A store written by the pre-atomic code path could have persisted the
-    # boundary before set_last_processed_history_id() completed, leaving a
-    # boundary with no cursor. decide_startup does not check cursor presence, so
-    # such a store can finish bootstrap and look WARM, yet Pub/Sub startup then
-    # fails closed on the missing resume cursor -- a complete-looking DB that
-    # cannot run. So when reusing an existing boundary, repair the cursor to that
-    # boundary if it is missing before continuing.
+    A pinned boundary is the ONLY reason to skip watch(): once a boundary exists
+    we must never re-watch, because that would move it past mail that arrived
+    during the first attempt and silently skip it. Do NOT gate on
+    bootstrap_status here -- pin_bootstrap_boundary writes the boundary, cursor,
+    and status in one transaction, but if we keyed off status a crash (or any
+    future partial write) that left a boundary without a status would re-watch
+    and lose the boundary. If a boundary exists but status is missing, just
+    (re)mark in-progress and continue from the existing boundary.
+
+    A store written by the pre-atomic code path could have persisted the boundary
+    before set_last_processed_history_id() completed, leaving a boundary with no
+    cursor. decide_startup does not check cursor presence, so such a store can
+    finish bootstrap and look WARM, yet Pub/Sub startup then fails closed on the
+    missing resume cursor -- a complete-looking DB that cannot run. So when
+    reusing an existing boundary, repair the cursor to that boundary if it is
+    missing before continuing."""
     boundary = store.get_meta("bootstrap_boundary_history_id")
     if boundary is None:
         boundary, _expiration = client.watch(topic)
@@ -191,9 +192,23 @@ def bootstrap_index(
             store.set_last_processed_history_id(boundary)
             log(f"Bootstrap: repaired missing cursor to boundary historyId={boundary}")
         store.set_meta("bootstrap_status", "in_progress")
+    return boundary
 
-    # User labels minus the CONFIGURED excluded names -- excluded at the source,
-    # so no excluded-label row ever reaches the labels table.
+
+def plan_bootstrap_worklist(client, excluded: Set[str], max_per_label: int):
+    """List Gmail and return the ordered ``(id, label_id, label_name, source)``
+    work-list plus the per-label / skip availability counts the maturity gate
+    needs.
+
+    Order matches the plan's "First-boot summary": front-load a slice of the
+    skip pool (the safety mass the confidence denominator needs early), then
+    round-robin the user labels with the rest of the skip pool as one more set,
+    so every label crosses the eligibility line together. Configured labels are
+    excluded at the source, so no excluded-label row is ever planned.
+
+    Returns ``(worklist, available_label_counts, available_skip_count)``. The
+    counts are the *available* corpus sizes (bucket lengths), which
+    ``maturity.build_gate`` clamps its finite targets to."""
     user_labels = [
         (lid, name) for lid, name in client.list_user_labels()
         if name not in excluded
@@ -201,23 +216,27 @@ def bootstrap_index(
     buckets, labeled_ids = _label_buckets(client, user_labels, max_per_label)
     skip_items = _skip_bucket(client, labeled_ids, max_per_label)
 
-    # Front-load a slice of the skip pool, then round-robin the labels with the
-    # rest of the skip pool as one more set.
-    skip_front, skip_rest = skip_items[:SKIP_FRONTLOAD], skip_items[SKIP_FRONTLOAD:]
-    n = 0
-    for mid, label_id, label_name, source in skip_front:
-        if _persist_one(client, embedder, store, mid, label_id, label_name, source):
-            n += 1
-    for mid, label_id, label_name, source in _round_robin(buckets + [skip_rest]):
-        if _persist_one(client, embedder, store, mid, label_id, label_name, source):
-            n += 1
-            if n % 100 == 0:
-                log(f"Bootstrap: {n} messages embedded")
+    available_label_counts = {
+        name: len(bucket) for (_, name), bucket in zip(user_labels, buckets)
+    }
+    available_skip_count = len(skip_items)
 
-    # Stamp the store as a complete, WARM-eligible store. gmail_account_id must
-    # be written before bootstrap_status=complete: decide_startup requires a
-    # non-empty stored account equal to the live one, so a store marked complete
-    # without it would read back as INCOMPATIBLE on the very next boot.
+    skip_front, skip_rest = skip_items[:SKIP_FRONTLOAD], skip_items[SKIP_FRONTLOAD:]
+    worklist = list(skip_front) + list(_round_robin(buckets + [skip_rest]))
+    return worklist, available_label_counts, available_skip_count
+
+
+def finalize_bootstrap(store: StateStore, embedder, *, excluded: Set[str],
+                       gmail_account_id: Optional[str], n: int,
+                       log: Callable[..., None] = _noop) -> None:
+    """Stamp the store as a complete, WARM-eligible store.
+
+    gmail_account_id must be written before bootstrap_status=complete:
+    decide_startup requires a non-empty stored account equal to the live one, so
+    a store marked complete without it would read back as INCOMPATIBLE on the
+    very next boot. bootstrap_status="complete" is written LAST, after every
+    fingerprint/hash/account key, so a crash before it leaves the store
+    ``in_progress`` (re-bootstrapped next boot) rather than complete-but-unbound."""
     store.set_meta("state_schema_version", STATE_SCHEMA_VERSION)
     if gmail_account_id is not None:
         store.set_meta("gmail_account_id", gmail_account_id)
@@ -227,6 +246,41 @@ def bootstrap_index(
     store.set_meta("bootstrap_completed_at", str(store.now_ms()))
     store.set_meta("bootstrap_status", "complete")
     log(f"Bootstrap complete: {n} messages embedded")
+
+
+def bootstrap_index(
+    client, embedder, store: StateStore, *,
+    excluded: Set[str], max_per_label: int, topic: str,
+    gmail_account_id: Optional[str] = None,
+    log: Callable[..., None] = _noop,
+) -> None:
+    """Cold bootstrap an empty (or ``in_progress``) ``state.db`` from Gmail,
+    **blocking** until the whole corpus is embedded.
+
+    Order (see the plan's "First-boot summary"):
+    ``watch()`` → pin boundary + cursor → front-load ~50 skip seeds →
+    round-robin labels + remaining skip, committing each vector (resumable).
+    Never labels or archives existing mail. On completion the store is a WARM
+    store: schema/fingerprint/account/exclusion meta are all written so the next
+    boot loads the join directly.
+
+    This is the Phase-4 simplest-correct cold path; the Phase-5 progressive
+    driver (``ProgressiveBootstrap``) reuses the same primitives to interleave
+    the work with the live loop instead of blocking.
+    """
+    ensure_boundary(client, store, topic, log=log)
+    worklist, _labels, _skip = plan_bootstrap_worklist(
+        client, excluded, max_per_label)
+
+    n = 0
+    for mid, label_id, label_name, source in worklist:
+        if _persist_one(client, embedder, store, mid, label_id, label_name, source):
+            n += 1
+            if n % 100 == 0:
+                log(f"Bootstrap: {n} messages embedded")
+
+    finalize_bootstrap(store, embedder, excluded=excluded,
+                       gmail_account_id=gmail_account_id, n=n, log=log)
 
 
 def rebuild_index(
