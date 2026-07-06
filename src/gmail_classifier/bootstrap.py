@@ -82,7 +82,8 @@ def _round_robin(buckets: List[List]):
 
 
 def _fetch_embed_persist(client, embedder, store: StateStore, mid: str,
-                         label_id: str, label_name: Optional[str], source: str):
+                         label_id: str, label_name: Optional[str], source: str,
+                         overwrite_label: bool = True):
     """Record one message under ``label_id``, fetching + embedding only if its
     vector is not already cached. Returns the freshly computed vector, or
     ``None`` if the id was already embedded (nothing fetched this call).
@@ -97,7 +98,17 @@ def _fetch_embed_persist(client, embedder, store: StateStore, mid: str,
     The embedding is written **last**, so a crash between the label and embedding
     writes just re-does this one message's embed next boot rather than leaving a
     permanent labeled row with no vector. Returning the vector lets the
-    progressive driver add it to the live in-memory index without a re-read."""
+    progressive driver add it to the live in-memory index without a re-read.
+
+    ``overwrite_label=False`` is the progressive driver's guard against clobbering
+    a live correction: while the worklist is still pending, a user label-change
+    event can already have recorded this id (writing its label **and**
+    embedding). In that case the worklist snapshot is stale, so an already-
+    embedded id is left exactly as the live path stored it -- neither the label
+    re-upserted nor the vector recomputed. (The blocking/reconcile paths keep the
+    always-upsert default, which they rely on to restore dropped rows.)"""
+    if not overwrite_label and store.has_embedding(mid):
+        return None
     store.upsert_label(mid, label_id, label_name, source=source)
     if store.has_embedding(mid):
         return None

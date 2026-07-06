@@ -48,6 +48,8 @@ class _CursorBackend:
         return self._cursor
     def set_last_processed_history_id(self, hid):
         self._cursor = hid
+    def get_pending(self):
+        return []  # no stranded pending_new rows in these sweep tests
 
 
 def _pubsub_args(storage):

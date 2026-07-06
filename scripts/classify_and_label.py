@@ -425,6 +425,17 @@ def _classify_new_ids(new_ids, args, client, embedder, index, registry,
     Returns the result dicts (for the caller to fold into its trim decision)."""
     from gmail_classifier.pending_new import events_for_ids
 
+    # These ids are to be classified as new. The drain path passes ids that were
+    # parked during warmup, and parking added them to skip_ids -- so drop them
+    # here, or collect_new_inbox_ids (inside process_history_events) would filter
+    # them straight back out and the drain would classify nothing while still
+    # clearing the pending rows. process_history_events re-adds each id to
+    # skip_ids after classifying, so a duplicate event in the same session is
+    # still ignored. In the live path these ids are already absent from skip_ids,
+    # so the discard is a no-op.
+    for mid in new_ids:
+        skip_ids.discard(mid)
+
     results = process_history_events(
         events=events_for_ids(new_ids),
         client=client,
@@ -550,6 +561,21 @@ class _MaturityController:
         self._drained = True
 
 
+def _make_drain(args, client, embedder, index, registry, skip_ids,
+                self_labeled, backend):
+    """A closure that classifies and clears every parked ``pending_new`` row
+    through the normal classifier. Reused by the bootstrap controller (drained
+    when the gate opens) and by the warm-startup drain below."""
+    from gmail_classifier.pending_new import drain_pending
+
+    def _drain():
+        drain_pending(backend, process_ids=lambda ids: _classify_new_ids(
+            ids, args, client, embedder, index, registry,
+            skip_ids, self_labeled, backend))
+
+    return _drain
+
+
 def _build_controller(plan, args, client, embedder, index, registry, skip_ids,
                       self_labeled, backend, log):
     """Construct the progressive-bootstrap maturity controller, or ``None`` when
@@ -557,7 +583,6 @@ def _build_controller(plan, args, client, embedder, index, registry, skip_ids,
     if plan is None:
         return None
 
-    from gmail_classifier.pending_new import drain_pending
     from gmail_classifier.progressive import ProgressiveBootstrap
 
     driver = ProgressiveBootstrap(
@@ -566,13 +591,9 @@ def _build_controller(plan, args, client, embedder, index, registry, skip_ids,
         gmail_account_id=plan.gmail_account_id,
         log=lambda m: print(f"  {m}", flush=True),
     )
-
-    def _drain():
-        drain_pending(backend, process_ids=lambda ids: _classify_new_ids(
-            ids, args, client, embedder, index, registry,
-            skip_ids, self_labeled, backend))
-
-    return _MaturityController(driver, _drain, log)
+    drain = _make_drain(args, client, embedder, index, registry, skip_ids,
+                        self_labeled, backend)
+    return _MaturityController(driver, drain, log)
 
 
 def _run_pubsub_mode(args, client, credentials, embedder, index,
@@ -640,6 +661,19 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         print("Initial inbox check...")
         _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
                      self_labeled)
+
+    # Drain any pending_new rows stranded by a crash that happened after
+    # bootstrap wrote bootstrap_status="complete" but before all parked mail was
+    # drained. On the next boot that store reads WARM (plan is None), so no
+    # bootstrap controller is built and the controller's maybe_drain never runs
+    # -- the rows would sit forever. A warm store is by definition mature, so
+    # classify + clear them here at startup. A cold boot (plan set) instead lets
+    # the controller drain once its gate opens; legacy's get_pending() is a
+    # no-op, so this is empty there. Runs before the once-return so a --once
+    # restart still recovers stranded rows.
+    if plan is None:
+        _make_drain(args, client, embedder, index, registry, skip_ids,
+                    self_labeled, backend)()
 
     if args.once:
         return

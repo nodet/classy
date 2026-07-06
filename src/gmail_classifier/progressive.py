@@ -118,7 +118,7 @@ class ProgressiveBootstrap:
             self._pos += 1
             vec = _bootstrap._fetch_embed_persist(
                 self.client, self.embedder, self.store,
-                mid, label_id, label_name, source)
+                mid, label_id, label_name, source, overwrite_label=False)
             if vec is None:
                 continue  # already embedded (resume / raced with a live label)
             additions.append(

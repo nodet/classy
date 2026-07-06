@@ -167,6 +167,32 @@ def test_grows_index_via_add_many_single_batch(tmp_path, monkeypatch):
     store.close()
 
 
+def test_live_label_change_not_clobbered_by_stale_worklist(tmp_path):
+    """A live correction that lands before the worklist reaches an id must win.
+
+    While the worklist still has ``a1`` pending as label A, a user moves it to B
+    (recorded live: label row + embedding). When the batch later reaches the
+    stale A row for ``a1``, it must NOT overwrite the store back to A -- the id is
+    already embedded, so the driver leaves the live B row untouched and does not
+    re-fetch it."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1", "a2"])}, inbox=[])
+    driver, store = _driver(tmp_path, client, batch_max_messages=50)
+
+    # Live correction arrives first: a1 is now B, with a vector.
+    store.upsert_label("a1", "L_B", "B", source="user")
+    store.upsert_embedding("a1", np.full(8, 2.0, dtype=np.float32))
+
+    while not driver.done:
+        driver.run_batch()
+
+    # The stale worklist row for a1 (label A) did not overwrite the live B row,
+    # and a1 was never re-fetched (only a2 hit the network).
+    by_id = {mid: label for mid, _v, label in store.iter_index()}
+    assert by_id["a1"] == "B"
+    assert client.get_calls == ["a2"]
+    store.close()
+
+
 def test_maturity_progresses_as_index_grows(tmp_path):
     # 6 examples of A (>= MIN_EXAMPLES_PER_LABEL=5) and a big skip pool, so the
     # gate has a real label target and a skip target.
