@@ -695,3 +695,126 @@ def test_history_expired_no_ack_when_rewatch_fails():
     assert sub.acked == []  # never acked -> redelivery retries the fallback
     assert state.history_id == "100"  # cursor unchanged (still the expired id)
     assert state.backoff == 5
+
+
+# --------------------------------------------------------------------------
+# Case 11: history expiry with a resync dep (Phase 6, state backend).
+# --------------------------------------------------------------------------
+
+def test_history_expired_runs_resync_when_dep_set():
+    """With a `resync` dep (state), history expiry runs the read-only resync,
+    NOT check_inbox, and does NOT double-watch: resync itself re-pins and returns
+    the fresh boundary, which becomes the next history_id. Ack after resync."""
+    order = []
+    client = FakeClient(history_exc=HistoryExpiredError("too old"))
+    sub = FakeSubscriber(actions=[[Notification("777")]])
+
+    orig_ack = sub.ack
+    def record_ack(ack_ids):
+        order.append(("ack", None))
+        orig_ack(ack_ids)
+    sub.ack = record_ack
+
+    def resync():
+        order.append(("resync", None))
+        return "RESYNC-900", 10**18
+
+    deps, logs = make_deps(client, lambda: sub,
+                           check_inbox=lambda: order.append(("check_inbox", None)),
+                           resync=resync)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    state = run_iteration(state, deps)
+
+    assert order == [("resync", None), ("ack", None)]  # resync then ack
+    assert ("check_inbox", None) not in order          # no inbox sweep
+    assert client.watch_calls == 0                     # loop did NOT re-watch
+    assert state.history_id == "RESYNC-900"            # started from resync boundary
+    assert sub.acked == [["ack-777"]]
+
+
+def test_history_expired_legacy_path_unchanged_without_resync():
+    """With resync=None (legacy), history expiry keeps today's behavior verbatim:
+    check_inbox, then watch, then persist, then ack."""
+    order = []
+    client = FakeClient(watch_id="REWATCH-555",
+                        history_exc=HistoryExpiredError("too old"))
+    sub = FakeSubscriber(actions=[[Notification("777")]])
+
+    orig_ack = sub.ack
+    def record_ack(ack_ids):
+        order.append("ack")
+        orig_ack(ack_ids)
+    sub.ack = record_ack
+
+    def record_watch():
+        order.append("watch")
+        return "REWATCH-555", 10**18
+
+    deps, _ = make_deps(client, lambda: sub,
+                        check_inbox=lambda: order.append("check_inbox"),
+                        watch=record_watch,
+                        persist_cursor=lambda hid: order.append("persist"))
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    state = run_iteration(state, deps)
+
+    assert order == ["check_inbox", "watch", "persist", "ack"]
+    assert state.history_id == "REWATCH-555"
+
+
+def test_history_expired_resync_failure_leaves_unacked():
+    """If resync raises a network error, the batch is NOT acked (redelivery
+    retries the recovery) and the cursor is unchanged."""
+    client = FakeClient(history_exc=HistoryExpiredError("too old"))
+    sub = FakeSubscriber(actions=[[Notification("777")]])
+
+    def failing_resync():
+        raise OSError("resync watch failed")
+
+    deps, _ = make_deps(client, lambda: sub, resync=failing_resync)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    state = run_iteration(state, deps)  # network error -> backoff, not raised
+
+    assert sub.acked == []
+    assert state.history_id == "100"
+    assert state.backoff == 5
+
+
+# --------------------------------------------------------------------------
+# Case 12: quiet-mailbox heartbeat on idle pulls (Phase 6).
+# --------------------------------------------------------------------------
+
+def test_idle_pull_calls_heartbeat_with_now():
+    """An idle (empty) pull calls the heartbeat dep with the current clock, so a
+    live-but-idle state service can refresh its cursor timestamp."""
+    seen = []
+    client = FakeClient()
+    sub = FakeSubscriber(actions=[[]])
+    deps, _ = make_deps(client, lambda: sub,
+                        now_ms=lambda: 4242,
+                        heartbeat=lambda now_ms: seen.append(now_ms))
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+    assert seen == [4242]
+
+
+def test_non_idle_pull_does_not_call_heartbeat():
+    """A pull that returns notifications processes history instead; the heartbeat
+    (which only matters on a quiet mailbox) is not invoked."""
+    seen = []
+    client = FakeClient(history_result=[object()], history_latest="200")
+    sub = FakeSubscriber(actions=[[Notification("200")]])
+    deps, _ = make_deps(client, lambda: sub,
+                        heartbeat=lambda now_ms: seen.append(now_ms))
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+    assert seen == []

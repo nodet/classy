@@ -53,6 +53,15 @@ STATE_SCHEMA_VERSION = "1"
 # changes in a way that alters embeddings (see the plan's fingerprint section).
 TEXTREPR_VERSION = "textrepr-v1"
 
+# How long a warm restart may replay-and-classify from the durable cursor before
+# it is treated as a long outage instead of a genuine crash/short-outage. A gap
+# within this window is the real failure-recovery case (replay the small
+# backlog); a gap beyond it takes the read-only resync + re-pin path, which
+# reconciles labels but never labels/archives the accumulated backlog. This is
+# recovery config only: it governs *behavior*, not vector validity or
+# membership, so it enters no fingerprint. 1h in milliseconds.
+WARM_RECOVERY_WINDOW = 3600_000
+
 
 # --------------------------------------------------------------------------
 # Fingerprints (vector validity vs. membership -- kept orthogonal on purpose)
@@ -160,6 +169,45 @@ def decide_startup(
         return StartupDecision.RECONCILE
 
     return StartupDecision.WARM
+
+
+class GapDecision(Enum):
+    """What a warm ``state`` restart should do with its durable cursor.
+
+    A pure verdict (mirroring :class:`StartupDecision`) so the branch logic is
+    unit-tested directly and the wiring stays thin.
+    """
+    REPLAY = "replay"    # cursor valid + gap within the window -> replay+classify
+    RESYNC = "resync"    # gap too large / cursor missing / bad timestamp -> read-only resync
+
+
+def classify_gap(store: "StateStore", now_ms: int) -> GapDecision:
+    """Decide whether a warm restart may replay-and-classify from the cursor, or
+    must fall back to the read-only resync + re-pin.
+
+    ``REPLAY`` only when a durable cursor exists **and** the wall-clock gap since
+    the cursor last advanced is a non-negative value within
+    ``WARM_RECOVERY_WINDOW`` (the boundary is inclusive -- an exact-window gap is
+    still the genuine short-outage case). Everything else is ``RESYNC``:
+
+    - cursor absent (a warm-looking store with no ``last_processed_history_id``:
+      replaying from an arbitrary fresh watch boundary would silently skip all
+      prior history -- recover it read-only rather than reject it);
+    - ``last_processed_at`` missing / malformed (``get_last_processed_at`` returns
+      ``None`` on a ``ValueError``) -- no trustworthy gap, so fail safe;
+    - ``last_processed_at`` in the future relative to ``now_ms`` (clock skew is
+      not a licence to replay an unbounded gap);
+    - the gap exceeds the window (a long outage -- treat the backlog as existing).
+    """
+    if store.get_last_processed_history_id() is None:
+        return GapDecision.RESYNC
+    last_at = store.get_last_processed_at()
+    if last_at is None:
+        return GapDecision.RESYNC
+    gap = now_ms - last_at
+    if gap < 0 or gap > WARM_RECOVERY_WINDOW:
+        return GapDecision.RESYNC
+    return GapDecision.REPLAY
 
 
 # --------------------------------------------------------------------------
@@ -390,6 +438,28 @@ class StateStore:
                     ("last_processed_at", now),
                     ("bootstrap_started_at", now),
                     ("bootstrap_status", "in_progress"),
+                ],
+            )
+
+    def repin_boundary(self, boundary_history_id: str) -> None:
+        """Re-pin the read-only boundary + cursor on an **already-complete** store
+        (the read-only resync path, Phase 6).
+
+        A sibling of :meth:`pin_bootstrap_boundary`, but for a store that has
+        finished bootstrap: it writes the fresh boundary, cursor, and timestamp
+        atomically **without** touching ``bootstrap_status``. If it reset the
+        status to ``in_progress`` (as ``pin_bootstrap_boundary`` does), the next
+        boot would decide BOOTSTRAP and re-fetch the whole corpus. The resync
+        only moves the boundary forward so post-boundary history stays untouched;
+        the store is still complete/WARM."""
+        now = str(self._now_ms())
+        with self._conn:  # one transaction across all three keys
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                [
+                    ("bootstrap_boundary_history_id", boundary_history_id),
+                    ("last_processed_history_id", boundary_history_id),
+                    ("last_processed_at", now),
                 ],
             )
 

@@ -10,11 +10,14 @@ import pytest
 
 from gmail_classifier import bootstrap
 from gmail_classifier.classifier import SKIP_LABEL
+from gmail_classifier.models import HistoryExpiredError
 from gmail_classifier.state_store import (
     STATE_SCHEMA_VERSION,
+    WARM_RECOVERY_WINDOW,
     StateStore,
     compute_ml_fingerprint,
 )
+from gmail_classifier.training_index import TrainingIndex
 
 
 class _FakeEmbedder:
@@ -462,3 +465,232 @@ def test_round_robin_interleaves_labels():
     c = [("c1",)]
     order = [item[0] for item in bootstrap._round_robin([a, b, c])]
     assert order == ["a1", "b1", "c1", "a2", "b2", "a3"]
+
+
+# --------------------------------------------------------------------------
+# read_only_resync (Phase 6): reconcile labels as truth, re-pin, never label
+# --------------------------------------------------------------------------
+
+def _complete_store(tmp_path, name="state.db", *, boundary="100", cursor="100"):
+    """A complete/WARM store with a pinned boundary + cursor, as a resync sees."""
+    store = _store(tmp_path, name)
+    store.set_meta("bootstrap_status", "complete")
+    store.set_meta("bootstrap_boundary_history_id", boundary)
+    store.set_last_processed_history_id(cursor)
+    return store
+
+
+def test_resync_never_labels_or_archives(tmp_path):
+    """Resync ingests Gmail's current label state; it must never apply_label /
+    archive, even with a backlog of high-confidence-looking inbox mail."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1"])}, inbox=["i1", "i2", "i3"])
+    client.apply_label = lambda *a, **k: pytest.fail("resync must not label")
+    store = _complete_store(tmp_path)
+    bootstrap.read_only_resync(client, _FakeEmbedder(), store, topic="topic",
+                               excluded=set(), max_per_label=200)
+    store.close()
+
+
+def test_resync_repins_fresh_boundary(tmp_path):
+    """watch() is called; the fresh id becomes both the boundary and the cursor,
+    with last_processed_at stamped, and the store stays complete (no re-bootstrap)."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1"])}, inbox=["i1"],
+                         watch_id="900")
+    store = _complete_store(tmp_path, boundary="100", cursor="100")
+    hid, expiration = bootstrap.read_only_resync(
+        client, _FakeEmbedder(), store, topic="topic",
+        excluded=set(), max_per_label=200)
+
+    assert client.watch_calls == 1
+    assert hid == "900" and expiration == 10**18
+    assert store.get_meta("bootstrap_boundary_history_id") == "900"
+    assert store.get_last_processed_history_id() == "900"
+    assert store.get_last_processed_at() is not None
+    assert store.get_bootstrap_status() == "complete"  # NOT reset to in_progress
+    store.close()
+
+
+def test_resync_ingests_label_added_since_cursor(tmp_path):
+    """A label present in Gmail but absent from the store is folded in."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1", "a2"])}, inbox=[])
+    store = _complete_store(tmp_path)
+    # Store only knew a1 before.
+    store.upsert_label("a1", "L_A", "A", source="user")
+    store.upsert_embedding("a1", np.full(8, 1.0, dtype=np.float32))
+
+    bootstrap.read_only_resync(client, _FakeEmbedder(), store, topic="topic",
+                               excluded=set(), max_per_label=200)
+    by_id = {mid: label for mid, _v, label in store.iter_index()}
+    assert by_id == {"a1": "A", "a2": "A"}  # a2 ingested
+    store.close()
+
+
+def test_resync_removes_label_deleted_in_gmail(tmp_path):
+    """A stored labeled id that is no longer in Gmail's snapshot is removed."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1"])}, inbox=[])
+    store = _complete_store(tmp_path)
+    store.upsert_label("a1", "L_A", "A", source="user")
+    store.upsert_embedding("a1", np.full(8, 1.0, dtype=np.float32))
+    # 'gone' was labeled locally but Gmail no longer returns it.
+    store.upsert_label("gone", "L_A", "A", source="user")
+    store.upsert_embedding("gone", np.full(8, 1.0, dtype=np.float32))
+
+    bootstrap.read_only_resync(client, _FakeEmbedder(), store, topic="topic",
+                               excluded=set(), max_per_label=200)
+    assert store.known_ids() == {"a1"}
+    assert "gone" not in {mid for mid, _v, _l in store.iter_index()}
+    store.close()
+
+
+def test_resync_rewrites_changed_label(tmp_path):
+    """A stored id whose Gmail label changed from A to B is rewritten to B."""
+    client = _FakeClient(labels={"L_B": ("B", ["m1"])}, inbox=[])
+    store = _complete_store(tmp_path)
+    store.upsert_label("m1", "L_A", "A", source="user")
+    store.upsert_embedding("m1", np.full(8, 1.0, dtype=np.float32))
+
+    bootstrap.read_only_resync(client, _FakeEmbedder(), store, topic="topic",
+                               excluded=set(), max_per_label=200)
+    by_id = {mid: label for mid, _v, label in store.iter_index()}
+    assert by_id == {"m1": "B"}
+    store.close()
+
+
+def test_resync_reuses_cached_embeddings(tmp_path):
+    """An unchanged id keeps its cached vector -- no re-fetch, no re-embed."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1"])}, inbox=[])
+    emb = _FakeEmbedder()
+    store = _complete_store(tmp_path)
+    store.upsert_label("a1", "L_A", "A", source="user")
+    store.upsert_embedding("a1", np.full(8, 1.0, dtype=np.float32))
+
+    bootstrap.read_only_resync(client, emb, store, topic="topic",
+                               excluded=set(), max_per_label=200)
+    assert client.get_calls == []   # a1 not re-fetched
+    assert emb.embed_calls == 0     # a1 not re-embedded
+    store.close()
+
+
+def test_resync_rebuilds_live_index_and_skip_ids(tmp_path):
+    """When passed the live index + skip_ids, resync rebuilds them in place from
+    the reconciled store."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1"])}, inbox=["i1"])
+    store = _complete_store(tmp_path)
+    index = TrainingIndex(np.empty((0, 0), dtype=np.float32), [], [])
+    skip_ids = {"stale-id"}
+
+    bootstrap.read_only_resync(client, _FakeEmbedder(), store, topic="topic",
+                               excluded=set(), max_per_label=200,
+                               index=index, skip_ids=skip_ids)
+    by_id = {mid: lbl for mid, lbl in zip(index.ids, index.labels)}
+    assert by_id == {"a1": "A", "i1": SKIP_LABEL}
+    assert skip_ids == {"a1", "i1"}   # rebuilt from known_ids; stale entry gone
+    store.close()
+
+
+def test_resync_is_idempotent(tmp_path):
+    """Running resync twice leaves the same store state (no duplicate rows, no
+    crash) -- guards the loop's expiry branch that may re-run recovery."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1"])}, inbox=["i1"],
+                         watch_id="900")
+    store = _complete_store(tmp_path)
+    bootstrap.read_only_resync(client, _FakeEmbedder(), store, topic="topic",
+                               excluded=set(), max_per_label=200)
+    first = {mid: label for mid, _v, label in store.iter_index()}
+
+    bootstrap.read_only_resync(client, _FakeEmbedder(), store, topic="topic",
+                               excluded=set(), max_per_label=200)
+    second = {mid: label for mid, _v, label in store.iter_index()}
+    assert first == second
+    assert store.get_bootstrap_status() == "complete"
+    store.close()
+
+
+# --------------------------------------------------------------------------
+# heartbeat_cursor (Phase 6): keep a live-idle cursor out of the resync window
+# --------------------------------------------------------------------------
+
+class _HistoryClient:
+    """Records get_history calls; returns scripted (events, latest) or raises."""
+    def __init__(self, events=None, latest=None, exc=None):
+        self._events = events or []
+        self._latest = latest
+        self._exc = exc
+        self.get_history_calls = []
+
+    def get_history(self, cursor):
+        self.get_history_calls.append(cursor)
+        if self._exc is not None:
+            raise self._exc
+        return self._events, self._latest
+
+
+def _heartbeat_store(tmp_path, *, cursor="500", last_at=0):
+    store = _store(tmp_path)
+    if cursor is not None:
+        store.set_last_processed_history_id(cursor)
+        store.set_meta("last_processed_at", str(last_at))
+    return store
+
+
+def test_heartbeat_refreshes_idle_cursor_when_due(tmp_path):
+    """Once the cursor's age reaches the interval, an empty history read persists
+    the returned id + a fresh timestamp."""
+    clock = [0]
+    store = _store(tmp_path)
+    store._now_ms = lambda: clock[0]
+    store.set_last_processed_history_id("500")  # stamps last_at = 0
+    client = _HistoryClient(events=[], latest="600")
+
+    clock[0] = bootstrap.HEARTBEAT_INTERVAL   # now due
+    advanced = bootstrap.heartbeat_cursor(client, store, now_ms=clock[0])
+    assert advanced is True
+    assert client.get_history_calls == ["500"]
+    assert store.get_last_processed_history_id() == "600"
+    assert store.get_last_processed_at() == bootstrap.HEARTBEAT_INTERVAL
+    store.close()
+
+
+def test_heartbeat_noop_before_interval(tmp_path):
+    """A cursor younger than the interval is left alone (no history call)."""
+    store = _heartbeat_store(tmp_path, last_at=0)
+    client = _HistoryClient(events=[], latest="600")
+    advanced = bootstrap.heartbeat_cursor(client, store,
+                                          now_ms=bootstrap.HEARTBEAT_INTERVAL - 1)
+    assert advanced is False
+    assert client.get_history_calls == []
+    assert store.get_last_processed_history_id() == "500"  # unchanged
+    store.close()
+
+
+def test_heartbeat_does_not_advance_when_events_pending(tmp_path):
+    """If history has real updates, the heartbeat leaves the cursor for the
+    normal loop to process + advance -- it must not skip past them."""
+    store = _heartbeat_store(tmp_path, last_at=0)
+    client = _HistoryClient(events=[object()], latest="600")
+    advanced = bootstrap.heartbeat_cursor(client, store,
+                                          now_ms=bootstrap.HEARTBEAT_INTERVAL)
+    assert advanced is False
+    assert store.get_last_processed_history_id() == "500"  # unchanged
+    store.close()
+
+
+def test_heartbeat_swallows_expired_history_for_the_resync_path(tmp_path):
+    """An expired cursor during the heartbeat is left for the expiry -> resync
+    path, not raised out of the idle pull."""
+    store = _heartbeat_store(tmp_path, last_at=0)
+    client = _HistoryClient(exc=HistoryExpiredError("too old"))
+    advanced = bootstrap.heartbeat_cursor(client, store,
+                                          now_ms=bootstrap.HEARTBEAT_INTERVAL)
+    assert advanced is False
+    assert store.get_last_processed_history_id() == "500"  # unchanged
+    store.close()
+
+
+def test_heartbeat_noop_without_cursor(tmp_path):
+    store = _store(tmp_path)  # no cursor at all
+    client = _HistoryClient(events=[], latest="600")
+    assert bootstrap.heartbeat_cursor(client, store,
+                                      now_ms=WARM_RECOVERY_WINDOW) is False
+    assert client.get_history_calls == []
+    store.close()

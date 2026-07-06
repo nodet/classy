@@ -66,6 +66,20 @@ class _PendingBackend:
         self.pending = dict(pending or {})
         self.skipped = []          # ids handed to upsert_skip
         self._cursor = "400"       # a durable cursor so state won't fail closed
+        self._last_at = 0          # recent timestamp -> classify_gap = REPLAY
+
+    # The state startup path reaches the cursor/clock via ``backend.store``;
+    # a recent last_processed_at keeps these drain tests on the REPLAY path
+    # (resume from the cursor, no read-only resync).
+    @property
+    def store(self):
+        return self
+
+    def now_ms(self):
+        return 0
+
+    def get_last_processed_at(self):
+        return self._last_at
 
     # pending_new
     def park_pending(self, message_id, history_id):

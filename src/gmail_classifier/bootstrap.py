@@ -29,10 +29,14 @@ import os
 from itertools import zip_longest
 from typing import Callable, List, Optional, Set, Tuple
 
+import numpy as np
+
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.gmail_parser import parse_gmail_message
+from gmail_classifier.models import HistoryExpiredError
 from gmail_classifier.state_store import (
     STATE_SCHEMA_VERSION,
+    WARM_RECOVERY_WINDOW,
     StateStore,
     compute_excluded_hash,
     compute_ml_fingerprint,
@@ -44,6 +48,13 @@ from gmail_classifier.training import _message_text
 # needs (see the plan's "Two gates"). The maturity gate that consumes it lands
 # in Phase 5; here it only shapes the order work is committed in.
 SKIP_FRONTLOAD = 50
+
+# The quiet-mailbox heartbeat (see :func:`heartbeat_cursor`) refreshes the
+# durable cursor's timestamp once its age reaches this, so a live-but-idle
+# service never *reaches* WARM_RECOVERY_WINDOW and forces a resync it did not
+# need. Half the window leaves ample margin before the read-only boundary would
+# otherwise kick in.
+HEARTBEAT_INTERVAL = WARM_RECOVERY_WINDOW // 2
 
 # Meta keys copied verbatim from the old store into a rebuild. The ML
 # fingerprint is deliberately NOT here (the rebuild writes the *new* one), and
@@ -384,3 +395,135 @@ def reconcile_exclusions(
 
     store.set_meta("excluded_labels_hash", compute_excluded_hash(excluded))
     return removed, added
+
+
+def _reload_index(store: StateStore, index, skip_ids: Optional[Set[str]]) -> None:
+    """Rebuild the *live* in-memory ``index`` (and ``skip_ids``) from the store's
+    current ``embeddings ⋈ labels`` join, in place.
+
+    The resync reconciles the store to Gmail's current label snapshot; the loop
+    still holds a reference to the index it was classifying against, so we swap
+    that index's contents rather than the reference (see
+    :meth:`TrainingIndex.reset`). ``skip_ids`` is the full ``known_ids`` set, so
+    the loop won't re-classify anything already in the store."""
+    ids: List[str] = []
+    vectors: List[np.ndarray] = []
+    labels: List[str] = []
+    for message_id, vec, index_label in store.iter_index():
+        ids.append(message_id)
+        vectors.append(vec)
+        labels.append(index_label)
+    if ids:
+        embeddings = np.vstack([v.reshape(1, -1) for v in vectors])
+    else:
+        embeddings = np.empty((0, 0), dtype=np.float32)
+    index.reset(embeddings, labels, ids)
+    if skip_ids is not None:
+        skip_ids.clear()
+        skip_ids.update(store.known_ids())
+
+
+def read_only_resync(
+    client, embedder, store: StateStore, topic: str, *,
+    excluded: Set[str], max_per_label: int,
+    index=None, skip_ids: Optional[Set[str]] = None,
+    log: Callable[..., None] = _noop,
+) -> Tuple[str, int]:
+    """Recover from a long outage / expired cursor **without** touching the
+    accumulated backlog (Phase 6). Returns the fresh ``(history_id, expiration)``.
+
+    The two "don't take bulk actions" triggers -- too much wall-clock elapsed and
+    a cursor aged out of Gmail's history window -- share this one path. It:
+
+    1. **Reconciles labels from Gmail as training truth.** Compute the current
+       Gmail snapshot (included labels + a fresh skip sample, the same listing
+       bootstrap uses), then reconcile the store to it: drop rows no longer in
+       the snapshot (a label removed in Gmail, or a message that fell out of the
+       sample), rewrite rows whose label changed, and reuse cached embeddings --
+       re-fetching + embedding only ids never embedded before. It **never** calls
+       ``apply_label``/archive: it ingests Gmail's *current* label state, it does
+       not classify.
+    2. **Re-pins a fresh boundary.** ``watch()`` returns a new historyId;
+       :meth:`StateStore.repin_boundary` persists boundary + cursor + timestamp
+       in one transaction, leaving ``bootstrap_status`` complete (so the next
+       boot stays WARM, not BOOTSTRAP).
+
+    Everything the mailbox holds at re-pin time is at-or-before the new boundary,
+    so post-cursor history never surfaces it -> it stays untouched with no
+    per-message check, exactly like the cold boot's read-only property.
+
+    ``index``/``skip_ids``, when supplied, are the live runtime state; they are
+    rebuilt in place from the reconciled store so the loop classifies against the
+    current label truth. Idempotent: a second run re-derives the same snapshot,
+    re-pins to the same (or a newer) id, and leaves no duplicate rows."""
+    worklist, _labels, _skip = plan_bootstrap_worklist(
+        client, excluded, max_per_label)
+    desired = {
+        mid: (label_id, label_name, source)
+        for mid, label_id, label_name, source in worklist
+    }
+
+    # Drop stale rows first (their embeddings stay cached for possible reuse).
+    stale = store.known_ids() - set(desired)
+    for mid in stale:
+        store.remove_label(mid)
+    if stale:
+        log(f"Resync: removed {len(stale)} stale label row(s)")
+
+    # Upsert the current snapshot: rewrite changed labels, reuse cached vectors,
+    # fetch+embed only never-seen ids. overwrite_label defaults True so a
+    # changed label is actually rewritten.
+    added = 0
+    for mid, (label_id, label_name, source) in desired.items():
+        if _persist_one(client, embedder, store, mid, label_id, label_name, source):
+            added += 1
+    log(f"Resync: reconciled {len(desired)} snapshot row(s) "
+        f"({added} newly embedded)")
+
+    # Re-pin a fresh boundary AFTER reconciling, so the current mailbox is all
+    # at-or-before the new boundary and stays read-only.
+    history_id, expiration = client.watch(topic)
+    store.repin_boundary(history_id)
+    log(f"Resync: re-pinned boundary historyId={history_id}")
+
+    if index is not None:
+        _reload_index(store, index, skip_ids)
+
+    return history_id, expiration
+
+
+def heartbeat_cursor(
+    client, store: StateStore, now_ms: int,
+    log: Callable[..., None] = _noop,
+) -> bool:
+    """Refresh the durable cursor's timestamp on a quiet-but-live mailbox so it
+    never *reaches* ``WARM_RECOVERY_WINDOW`` and forces a resync it did not need
+    (Phase 6). Returns ``True`` iff it advanced the cursor.
+
+    Only acts once the cursor's age reaches ``HEARTBEAT_INTERVAL``: does a no-op
+    ``get_history`` from the current cursor and, **only if it is still valid and
+    returns no pending updates**, persists the returned history id + a fresh
+    ``last_processed_at`` (one transaction, via
+    :meth:`StateStore.set_last_processed_history_id`).
+
+    Liveness is not progress: a Pub/Sub pull timing out must not refresh the
+    timestamp -- only a confirmed-empty history read does. If ``get_history``
+    raises ``HistoryExpiredError`` the cursor has already aged out; leave it for
+    the expiry -> read-only resync path rather than swallowing it here. If it
+    returns real events, do nothing -- the normal loop will process them and
+    advance the cursor itself."""
+    cursor = store.get_last_processed_history_id()
+    last_at = store.get_last_processed_at()
+    if cursor is None or last_at is None:
+        return False
+    if now_ms - last_at < HEARTBEAT_INTERVAL:
+        return False
+    try:
+        events, latest = client.get_history(cursor)
+    except HistoryExpiredError:
+        return False
+    if events:
+        return False
+    store.set_last_processed_history_id(latest or cursor)
+    log("Heartbeat: refreshed idle cursor timestamp")
+    return True

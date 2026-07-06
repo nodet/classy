@@ -20,6 +20,25 @@ class TrainingIndex:
     def __contains__(self, message_id: str) -> bool:
         return message_id in self._id_to_idx
 
+    @property
+    def ids(self) -> List[str]:
+        """The message ids in index order (a copy, so callers can't mutate the
+        internal ordering)."""
+        return list(self._ids)
+
+    def reset(self, embeddings: np.ndarray, labels: List[str], ids: List[str]):
+        """Replace the entire index contents in place.
+
+        The read-only resync (Phase 6) reconciles the store to Gmail's current
+        label snapshot, then rebuilds the *live* index the loop already holds a
+        reference to. Rather than reach into the internals from outside, this
+        swaps embeddings/labels/ids atomically and rebuilds the id lookup."""
+        assert len(embeddings) == len(labels) == len(ids)
+        self.embeddings = embeddings
+        self.labels = list(labels)
+        self._ids = list(ids)
+        self._id_to_idx = {mid: i for i, mid in enumerate(ids)}
+
     def add(self, message_id: str, embedding: np.ndarray, label: str):
         """Add or replace a message in the index."""
         if message_id in self._id_to_idx:

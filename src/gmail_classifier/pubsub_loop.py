@@ -70,6 +70,20 @@ class LoopDeps:
     check_inbox: Callable[[], None]              # full inbox poll (fallback)
     process_events: Callable[[list], None]       # handle events (and heartbeat)
     log: Callable[..., None]                     # status line emitter
+    # Read-only resync recovery for the state backend's history expiry (Phase 6).
+    # When set, it *is* the expiry recovery: reconcile labels + re-pin a fresh
+    # boundary + return the fresh (history_id, expiration). The loop then starts
+    # from that boundary instead of calling check_inbox + watch itself, so it
+    # never double-watches and never sweeps the inbox (which could archive
+    # pre-boundary backlog). When None (legacy), the expiry branch keeps today's
+    # check_inbox + watch behavior verbatim.
+    resync: Optional[Callable[[], tuple]] = None
+    # Quiet-mailbox heartbeat (Phase 6, state only): called with the current
+    # wall-clock ms on an idle pull. It refreshes the durable cursor's timestamp
+    # once the cursor's age nears WARM_RECOVERY_WINDOW so a live-but-idle service
+    # never forces a needless read-only resync. Default no-op keeps legacy and
+    # existing tests unchanged.
+    heartbeat: Callable[[int], None] = lambda now_ms: None
     # Persist the advanced history cursor BEFORE acking. On state this is a
     # durable write (so a crash-before-ack replays from it); on legacy it is
     # process-local, so restarts keep fresh-watch. Default no-op preserves the
@@ -149,6 +163,13 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
             # ratchets toward the worst-case peak (~600MB) over a quiet stretch.
             # Trimming here keeps idle steady-state flat (~250MB).
             trim_memory()
+            # Quiet-mailbox heartbeat (state only; no-op on legacy): refresh the
+            # durable cursor's timestamp if it is nearing the recovery window, so
+            # a live-but-idle service never forces a needless read-only resync.
+            # An idle pull is genuine liveness -- but the heartbeat only advances
+            # the cursor after a confirmed-empty history read, not merely because
+            # the pull returned nothing (liveness != progress).
+            deps.heartbeat(deps.now_ms())
             return LoopState(history_id, expiration, backoff, subscriber)
 
         # Fallback pointer if the history response carries no id of its own.
@@ -157,15 +178,26 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         try:
             events, latest_history_id = deps.get_history(history_id)
         except HistoryExpiredError:
+            if deps.resync is not None:
+                # State backend (Phase 6): the read-only resync IS the recovery.
+                # It reconciles labels from Gmail and re-pins a fresh boundary
+                # itself, returning it -- so we neither sweep the inbox (which
+                # could archive pre-boundary backlog) nor watch() a second time
+                # (which would move the boundary past the resync's). resync()
+                # already persisted the re-pinned cursor durably; ack only after
+                # it succeeds, so a crash/failure mid-resync leaves the messages
+                # un-acked for redelivery rather than discarding the trigger.
+                deps.log("History expired, running read-only resync")
+                history_id, expiration = deps.resync()
+                subscriber.ack(ack_ids)
+                return LoopState(history_id, expiration, backoff, subscriber)
+            # Legacy: fall back to the inbox poll, then re-pin to a fresh
+            # historyId FIRST, persist it, then ack. If watch() fails (or we die
+            # before the new cursor is pinned), the messages stay un-acked so
+            # redelivery retries the fallback + re-pin -- acking earlier would
+            # discard the trigger while the cursor is still the expired one.
             deps.log("History expired, falling back to inbox poll")
             deps.check_inbox()
-            # Re-pin to a fresh historyId FIRST, persist it, then ack. If
-            # watch() fails (or we die before the new cursor is pinned), the
-            # messages stay un-acked so redelivery retries the fallback +
-            # re-pin -- acking earlier would discard the trigger while the
-            # cursor is still the expired one. Persisting the re-pinned cursor
-            # (durable on state, no-op on legacy) means a state restart resumes
-            # from the fresh boundary, not the expired id.
             history_id, expiration = deps.watch()
             deps.persist_cursor(history_id)
             subscriber.ack(ack_ids)

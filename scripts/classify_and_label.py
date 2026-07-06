@@ -75,9 +75,10 @@ def _validate_storage_mode(args):
     work) but unsafe for the state backend, which must only advance via history
     replay from its durable cursor and never label/archive pre-boundary backlog.
     ``--mode`` defaults to poll while ``--storage``/``$CLASSY_STORAGE`` can be
-    state, so guard here rather than trusting the pubsub-only sweep gate. Fail
-    closed until the read-only resync path lands (a later increment, not in
-    Phase 4).
+    state, so guard here rather than trusting the pubsub-only sweep gate. This is
+    permanent: the state backend advances only via history replay (and, on an
+    aged cursor, the read-only resync), never a labeling poll -- so poll mode has
+    no safe meaning for it.
 
     Also validate the storage value itself: argparse only enforces ``choices``
     for values typed on the command line, not for the default -- and the default
@@ -622,25 +623,38 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     is_legacy = args.storage == "legacy"
     resume_id = backend.get_last_processed_history_id()
 
-    # Only legacy may adopt the fresh watch id as its starting cursor. For state,
-    # a missing cursor means every history event before this watch would be
-    # silently skipped -- and because the state path also skips the startup inbox
-    # sweep, that mail would never be seen at all. A warm-looking state.db with no
-    # last_processed_history_id is therefore a bug (bootstrap should have pinned
-    # one); fail closed rather than start from an arbitrary boundary. The
-    # read-only resync that recovers a missing/expired cursor is a later
-    # increment (not in Phase 4).
-    if not is_legacy and not resume_id:
-        raise SystemExit(
-            "state backend has no durable history cursor to resume from; "
-            "starting at the fresh watch boundary would silently skip all "
-            "prior history. Bootstrap must pin last_processed_history_id; "
-            "refusing to start."
-        )
+    # The state read-only resync recovery (Phase 6): the shared recovery for both
+    # a long-outage warm restart (classify_gap -> RESYNC just below) and a mid-run
+    # history expiry (wired as the loop's `resync` dep). It reconciles labels from
+    # Gmail as truth, re-pins a fresh boundary, rebuilds the live index/skip_ids
+    # in place, and returns the fresh (history_id, expiration). It NEVER labels or
+    # archives the accumulated backlog. None on legacy (no durable cursor).
+    def _resync():
+        from gmail_classifier import bootstrap as _bootstrap
+        return _bootstrap.read_only_resync(
+            client, embedder, backend.store, PUBSUB_TOPIC,
+            excluded=registry._excluded, max_per_label=args.max_per_label,
+            index=index, skip_ids=skip_ids,
+            log=lambda m: print(f"  {m}", flush=True))
 
-    history_id = resume_id or watch_history_id
-    if resume_id:
-        print(f"  Resuming from persisted historyId={resume_id}")
+    if is_legacy:
+        # Legacy adopts the fresh watch id as its starting cursor, as today.
+        history_id = watch_history_id
+    else:
+        # State: decide from the durable cursor + last_processed_at how to
+        # recover. A missing/expired/over-window/invalid-timestamp cursor no
+        # longer fails closed (Phase 6) -- it takes the read-only resync instead.
+        from gmail_classifier.state_store import GapDecision, classify_gap
+        if classify_gap(backend.store, backend.store.now_ms()) is GapDecision.REPLAY:
+            # Genuine short outage: replay-and-classify from the persisted cursor.
+            history_id = resume_id
+            print(f"  Resuming from persisted historyId={resume_id}")
+        else:
+            # Long outage, or missing/invalid cursor/timestamp: read-only resync
+            # + re-pin. Never labels/archives the backlog; only mail after the
+            # fresh boundary is classifiable.
+            print("State backend: history gap too large; running read-only resync...")
+            history_id, expiration = _resync()
 
     # Track messages labeled by the classifier itself (to ignore echoed events)
     self_labeled = set()
@@ -652,10 +666,9 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     # no per-message historyId, so it cannot enforce the read-only boundary, and
     # known_ids is incomplete when the skip pool is only sampled -- so a sweep
     # could label/archive pre-boundary backlog. State catches up via history
-    # replay from its durable cursor instead; the read-only resync (for expired /
-    # out-of-window cursors, gated on WARM_RECOVERY_WINDOW) is a later increment,
-    # so until then state fails closed rather than falling back to a labeling
-    # inbox poll.
+    # replay from its durable cursor instead; when the cursor is expired or the
+    # gap exceeds WARM_RECOVERY_WINDOW it takes the read-only resync + re-pin
+    # (reconcile labels, never label/archive the backlog), never an inbox sweep.
     if is_legacy:
         # Do an initial inbox check to catch anything missed.
         print("Initial inbox check...")
@@ -690,16 +703,11 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         print(f"{prefix}{now()} {message}")
 
     def _check_inbox_fallback():
-        # The loop calls this on HistoryExpiredError. On legacy it's the inbox
-        # poll; on state it must NOT label the backlog (see note above), and the
-        # read-only resync that should run instead is not implemented yet, so we
-        # fail closed by raising rather than silently sweeping the inbox.
-        if not is_legacy:
-            raise NotImplementedError(
-                "state backend history-expiry recovery (read-only resync + "
-                "re-pin) is not implemented yet; refusing to fall back to a "
-                "labeling inbox poll that could archive backlog."
-            )
+        # The loop calls this on HistoryExpiredError only on legacy (state
+        # supplies the `resync` dep instead, so its expiry branch never reaches
+        # here). On legacy it's the inbox poll -- catch-up-after-downtime, as
+        # today. On state a labeling inbox sweep would archive pre-boundary
+        # backlog, which is exactly what the read-only resync avoids.
         _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
                      self_labeled)
 
@@ -717,6 +725,17 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                         skip_ids, self_labeled, backend,
                         controller=controller, history_id=state.history_id)
 
+    # State-only recovery hooks (None/no-op on legacy). The resync is the history-
+    # expiry recovery (reconcile + re-pin, never label the backlog); the heartbeat
+    # keeps a live-but-idle cursor from aging into the recovery window. Both are
+    # gated off while the progressive bootstrap runs: the boundary is fresh and
+    # the store not yet complete, so neither applies.
+    def _heartbeat(now_ms):
+        if is_legacy or (controller is not None and not controller.done):
+            return
+        from gmail_classifier import bootstrap as _bootstrap
+        _bootstrap.heartbeat_cursor(client, backend.store, now_ms, log=_log)
+
     deps = LoopDeps(
         make_subscriber=_make_subscriber,
         watch=lambda: client.watch(PUBSUB_TOPIC),
@@ -726,6 +745,8 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         persist_cursor=backend.set_last_processed_history_id,
         log=_log,
         is_bootstrapping=lambda: controller is not None and not controller.done,
+        resync=None if is_legacy else _resync,
+        heartbeat=_heartbeat,
     )
 
     state = LoopState(

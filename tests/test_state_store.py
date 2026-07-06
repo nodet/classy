@@ -11,9 +11,12 @@ from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.models import Message
 from gmail_classifier.state_store import (
     STATE_SCHEMA_VERSION,
+    WARM_RECOVERY_WINDOW,
+    GapDecision,
     StartupDecision,
     StateBackend,
     StateStore,
+    classify_gap,
     compute_excluded_hash,
     compute_ml_fingerprint,
     decide_startup,
@@ -413,6 +416,92 @@ def test_backend_cursor_is_durable(tmp_path):
     fresh = StateBackend(path, excluded=set())
     assert fresh.get_last_processed_history_id() == "999"
     fresh.close()
+
+
+# --------------------------------------------------------------------------
+# classify_gap: pure warm-restart recovery decision (Phase 6)
+# --------------------------------------------------------------------------
+
+def _warm_store_with_cursor(tmp_path, *, cursor="500", last_at=1000):
+    """A store with a durable cursor + explicit last_processed_at, for the
+    gap-decision cases (classify_gap reads only those two meta keys)."""
+    store = StateStore(str(tmp_path / "state.db"))
+    if cursor is not None:
+        store.set_meta("last_processed_history_id", cursor)
+    if last_at is not None:
+        store.set_meta("last_processed_at", str(last_at))
+    return store
+
+
+def test_classify_gap_zero_is_replay(tmp_path):
+    store = _warm_store_with_cursor(tmp_path, last_at=1000)
+    assert classify_gap(store, now_ms=1000) is GapDecision.REPLAY
+    store.close()
+
+
+def test_classify_gap_at_window_boundary_is_replay(tmp_path):
+    """The window boundary is inclusive: an exact-window gap is still the genuine
+    short-outage case."""
+    store = _warm_store_with_cursor(tmp_path, last_at=0)
+    assert classify_gap(store, now_ms=WARM_RECOVERY_WINDOW) is GapDecision.REPLAY
+    store.close()
+
+
+def test_classify_gap_just_past_window_is_resync(tmp_path):
+    store = _warm_store_with_cursor(tmp_path, last_at=0)
+    assert classify_gap(store, now_ms=WARM_RECOVERY_WINDOW + 1) is GapDecision.RESYNC
+    store.close()
+
+
+def test_classify_gap_missing_timestamp_is_resync(tmp_path):
+    """Cursor present but no last_processed_at -> no trustworthy gap -> fail safe."""
+    store = _warm_store_with_cursor(tmp_path, last_at=None)
+    assert store.get_last_processed_at() is None
+    assert classify_gap(store, now_ms=1000) is GapDecision.RESYNC
+    store.close()
+
+
+def test_classify_gap_malformed_timestamp_is_resync(tmp_path):
+    store = _warm_store_with_cursor(tmp_path, last_at=None)
+    store.set_meta("last_processed_at", "not-a-number")
+    assert classify_gap(store, now_ms=1000) is GapDecision.RESYNC
+    store.close()
+
+
+def test_classify_gap_future_timestamp_is_resync(tmp_path):
+    """A last_processed_at ahead of now (clock skew) must not license replaying
+    an unbounded gap."""
+    store = _warm_store_with_cursor(tmp_path, last_at=5000)
+    assert classify_gap(store, now_ms=1000) is GapDecision.RESYNC
+    store.close()
+
+
+def test_classify_gap_absent_cursor_is_resync(tmp_path):
+    """The case that used to SystemExit: a warm-looking store with no cursor is
+    now recovered read-only, not rejected."""
+    store = _warm_store_with_cursor(tmp_path, cursor=None, last_at=1000)
+    assert store.get_last_processed_history_id() is None
+    assert classify_gap(store, now_ms=1000) is GapDecision.RESYNC
+    store.close()
+
+
+def test_repin_boundary_atomic_and_keeps_complete(tmp_path):
+    """repin_boundary writes boundary + cursor + timestamp together and, unlike
+    pin_bootstrap_boundary, leaves bootstrap_status == 'complete' (a re-pin on a
+    finished store must not trigger a re-bootstrap on the next boot)."""
+    clock = [7777]
+    store = StateStore(str(tmp_path / "state.db"), now_ms=lambda: clock[0])
+    store.set_meta("bootstrap_status", "complete")
+    store.set_meta("bootstrap_boundary_history_id", "100")
+    store.set_last_processed_history_id("100")
+
+    store.repin_boundary("900")
+    assert store.get_meta("bootstrap_boundary_history_id") == "900"
+    assert store.get_last_processed_history_id() == "900"
+    assert store.get_last_processed_at() == 7777
+    # Crucially NOT flipped to in_progress.
+    assert store.get_bootstrap_status() == "complete"
+    store.close()
 
 
 def test_backend_satisfies_storage_backend_protocol(tmp_path):
