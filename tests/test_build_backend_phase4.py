@@ -197,6 +197,38 @@ def test_rebuild_decision_swaps_in_reembedded_store(tmp_path):
     backend.close()
 
 
+def test_rebuild_and_exclusion_change_together_reconciles(tmp_path):
+    """A deploy that changes BOTH the ML fingerprint and the excluded set returns
+    REBUILD (ML is checked first). The rebuild carries the old excluded hash, so
+    membership must be reconciled in the same process -- else now-excluded labels
+    keep loading until a later restart."""
+    path = str(tmp_path / "state.db")
+    emb = _FakeEmbedder()
+    store = _seed(
+        path,
+        bootstrap_status="complete",
+        state_schema_version=STATE_SCHEMA_VERSION,
+        ml_fingerprint="stale-fingerprint",          # != current -> REBUILD
+        gmail_account_id="me@x.com",
+        excluded_labels_hash=compute_excluded_hash(set()),  # nothing excluded before
+    )
+    store.upsert_label("a1", "L_A", "A", source="user")
+    store.upsert_embedding("a1", np.full(8, 9.0, dtype=np.float32))
+    store.upsert_label("b1", "L_B", "B", source="user")
+    store.upsert_embedding("b1", np.full(8, 9.0, dtype=np.float32))
+    store.close()
+
+    client = _FakeClient(labels={"L_A": ("A", ["a1"]), "L_B": ("B", ["b1"])})
+    # Now exclude B *and* the fingerprint has changed.
+    backend = cal._build_backend(_args(tmp_path), {"B"}, client, emb)
+
+    # Rebuilt with current vectors AND B dropped from the join in the same boot.
+    assert backend.store.get_meta("ml_fingerprint") == _ml(emb)
+    assert backend.store.known_ids() == {"a1"}
+    assert backend.store.get_meta("excluded_labels_hash") == compute_excluded_hash({"B"})
+    backend.close()
+
+
 # --------------------------------------------------------------------------
 # INCOMPATIBLE: still fails closed
 # --------------------------------------------------------------------------

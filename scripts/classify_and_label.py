@@ -194,7 +194,23 @@ def _build_backend(args, excluded, client, embedder):
         # ML fingerprint changed: vectors are stale, label map + cursor are not.
         # Build state.rebuild.db, then atomically swap it in.
         print("State backend: ML changed, rebuilding embeddings from Gmail...")
-        return _rebuild_and_swap(args, excluded, client, embedder, backend)
+        rebuilt = _rebuild_and_swap(args, excluded, client, embedder, backend)
+        # A single deploy can change BOTH the ML fingerprint and the excluded
+        # set. decide_startup checks ML before exclusions, so it returned REBUILD
+        # and the rebuild carried the OLD excluded_labels_hash forward. Fold the
+        # membership change in now -- otherwise a long-running daemon keeps using
+        # now-excluded labels (and omits newly-included ones) until some later
+        # restart happens to hit RECONCILE. reconcile_exclusions rewrites the hash
+        # so the next boot sees WARM.
+        current_hash = compute_excluded_hash(excluded)
+        if rebuilt.store.get_meta("excluded_labels_hash") != current_hash:
+            print("State backend: exclusions also changed, reconciling...")
+            _bootstrap.reconcile_exclusions(
+                client, embedder, rebuilt.store,
+                excluded=excluded, max_per_label=args.max_per_label,
+                log=lambda m: print(f"  {m}", flush=True),
+            )
+        return rebuilt
 
     # Defensive: decide_startup returns only the enum members handled above.
     backend.close()
