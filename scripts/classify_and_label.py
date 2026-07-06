@@ -336,7 +336,23 @@ def main():
         help="State backend: max messages to bootstrap per label and for the "
              "skip pool (default: 200). Bounds first-boot fetch size.",
     )
+    parser.add_argument(
+        "--report", action="store_true",
+        help="State backend: print a status report of the local state.db "
+             "(schema, fingerprint, bootstrap status, index/label/skip/pending "
+             "counts, history cursor) and exit. Reads only state.db -- no Gmail "
+             "call, no model load -- so it is safe to run alongside the service.",
+    )
     args = parser.parse_args()
+
+    # --report is a read-only status dump; it never authenticates or loads the
+    # model, so handle it before the storage/mode validation (which is about the
+    # *running* service) and before any Gmail connection.
+    if args.report:
+        from gmail_classifier.state_status import print_report
+        print_report(args.state_db, excluded_config=list(excluded_labels()))
+        return
+
     _validate_storage_mode(args)
 
     print(f"gmail-classifier version: {deployed_version()}", flush=True)

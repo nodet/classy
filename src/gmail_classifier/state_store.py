@@ -375,6 +375,37 @@ class StateStore:
             index_label = SKIP_LABEL if label_id == SKIP_LABEL else (label_name or label_id)
             yield message_id, _blob_to_vec(blob), index_label
 
+    def index_label_counts(self) -> Tuple[dict, int, int]:
+        """Summarize the runtime index (the ``embeddings ⋈ labels`` join) for
+        status reporting: ``(per_label_counts, skip_count, index_size)``.
+
+        Only join rows count -- an embedded id with no label, or a label with no
+        embedding, is excluded exactly as :meth:`iter_index` excludes it, so the
+        numbers match what the classifier actually votes with. ``per_label_counts``
+        is keyed by the display label name (falling back to ``label_id``), skip
+        rows are tallied separately, and ``index_size`` is their sum."""
+        per_label: dict = {}
+        skip_count = 0
+        index_size = 0
+        rows = self._conn.execute(
+            """SELECT l.label_id, l.label_name
+               FROM embeddings e JOIN labels l ON e.message_id = l.message_id"""
+        )
+        for label_id, label_name in rows:
+            index_size += 1
+            if label_id == SKIP_LABEL:
+                skip_count += 1
+            else:
+                key = label_name or label_id
+                per_label[key] = per_label.get(key, 0) + 1
+        return per_label, skip_count, index_size
+
+    def pending_count(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM pending_new"
+        ).fetchone()
+        return row[0] if row else 0
+
     # --- pending_new (drained in Phase 5; helpers land now) --------------
 
     def add_pending(self, message_id: str, history_id: str, reason: str = "immature") -> None:
