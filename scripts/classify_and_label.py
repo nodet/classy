@@ -343,6 +343,12 @@ def main():
              "counts, history cursor) and exit. Reads only state.db -- no Gmail "
              "call, no model load -- so it is safe to run alongside the service.",
     )
+    parser.add_argument(
+        "--test-alert", action="store_true",
+        help="Send a test crash-alert email and exit. Exercises the full "
+             "production alert path (auth + Gmail send) without starting the "
+             "service. Run to verify crash notifications will work.",
+    )
     args = parser.parse_args()
 
     # --report is a read-only status dump; it never authenticates or loads the
@@ -352,6 +358,9 @@ def main():
         from gmail_classifier.state_status import print_report
         print_report(args.state_db, excluded_config=list(excluded_labels()))
         return
+
+    if args.test_alert:
+        raise RuntimeError("Test alert: crash notification is working")
 
     _validate_storage_mode(args)
 
@@ -853,9 +862,10 @@ def _send_crash_alert(exc):
 
     service = get_gmail_service(Path("credentials"))
     client = GmailClient(service)
+    to = client.get_profile_email()
     body = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     client.send_message(
-        to="me",
+        to=to,
         subject="gmail-classifier crashed",
         body=body,
     )
@@ -892,4 +902,10 @@ def _run_with_shutdown_handling(main_fn):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _sigterm_handler)
-    _run_with_shutdown_handling(main)
+    try:
+        _run_with_shutdown_handling(main)
+    except RuntimeError as e:
+        if "Test alert" in str(e):
+            print("Test alert sent.")
+        else:
+            raise
