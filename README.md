@@ -253,9 +253,11 @@ and rebuilds `state.db` from Gmail automatically (carrying the history cursor
 forward, no live mail skipped). A pure `config.toml` exclusion change is cheaper —
 it reconciles membership without re-embedding.
 
-To wipe and re-bootstrap from scratch: `make gcp-reset-state` (stops the service,
-removes `state.db` + its SQLite sidecars — the legacy DBs are untouched — and
-starts again). Locally, `make reset-state` does the same to `data/state.db`.
+To wipe and re-bootstrap from scratch: `make gcp-reset-state` (stops the service
+and removes `state.db` + its SQLite sidecars — the legacy DBs are untouched). It
+leaves the service **stopped**, like `make gcp-stop`; run `make gcp-start` when
+you want it to bootstrap fresh from Gmail. Locally, `make reset-state` does the
+same to `data/state.db`.
 
 `state.db` is private derived data: it holds no bodies/subjects/senders but does
 contain message ids, label ids/names, and embeddings. It is never uploaded from

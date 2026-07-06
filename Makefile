@@ -130,10 +130,16 @@ gcp-state-status: ## Show the state backend's state.db report on GCP (no service
 	@# as the service user so it can read the file under the strict install dir.
 	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo -u gmail-classifier -H bash -c 'cd $(GCP_INSTALL_DIR) && \$$HOME/.local/bin/uv run --locked -- python scripts/classify_and_label.py --report'"
 
-gcp-reset-state: ## Delete the VM's state.db, then start (next boot bootstraps fresh)
-	@# Backend-scoped, mirrors `make reset-state`: stop, remove state.db + sidecars
-	@# ONLY (legacy DBs untouched), then start so the next boot bootstraps.
-	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl stop gmail-classifier; sudo rm -f $(GCP_INSTALL_DIR)/data/state.db $(GCP_INSTALL_DIR)/data/state.db-wal $(GCP_INSTALL_DIR)/data/state.db-shm $(GCP_INSTALL_DIR)/data/state.db-journal $(GCP_INSTALL_DIR)/data/state.rebuild.db $(GCP_INSTALL_DIR)/data/state.rebuild.db-wal $(GCP_INSTALL_DIR)/data/state.rebuild.db-shm $(GCP_INSTALL_DIR)/data/state.rebuild.db-journal; sudo systemctl start gmail-classifier"
+gcp-reset-state: ## Delete the VM's state.db and leave the service stopped
+	@# Backend-scoped, mirrors `make reset-state`: stop, then remove state.db +
+	@# sidecars ONLY (legacy DBs untouched). Leaves the service STOPPED -- like
+	@# gcp-stop -- so the operator starts it deliberately (make gcp-start); the
+	@# next boot then bootstraps fresh from Gmail.
+	@# Fail-closed with && (not ;): if the stop fails we do NOT delete the DB, so
+	@# a delete never races a live writer. A manual `systemctl stop` is a clean
+	@# stop, so the unit's Restart=on-failure does not re-launch it.
+	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl stop gmail-classifier && sudo rm -f $(GCP_INSTALL_DIR)/data/state.db $(GCP_INSTALL_DIR)/data/state.db-wal $(GCP_INSTALL_DIR)/data/state.db-shm $(GCP_INSTALL_DIR)/data/state.db-journal $(GCP_INSTALL_DIR)/data/state.rebuild.db $(GCP_INSTALL_DIR)/data/state.rebuild.db-wal $(GCP_INSTALL_DIR)/data/state.rebuild.db-shm $(GCP_INSTALL_DIR)/data/state.rebuild.db-journal"
+	@echo "VM state.db reset; service left stopped. Run 'make gcp-start' to bootstrap fresh."
 
 gcp-logs: ## Tail service logs on GCP (last 20 + follow)
 	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo journalctl -u gmail-classifier -n 20 -f"
