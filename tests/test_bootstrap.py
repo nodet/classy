@@ -297,6 +297,30 @@ def test_bootstrap_does_not_rewatch_when_boundary_set_but_status_missing(tmp_pat
     store.close()
 
 
+def test_bootstrap_repairs_missing_cursor_when_boundary_set(tmp_path):
+    """Pre-atomic crash state: only bootstrap_boundary_history_id was persisted
+    (the cursor write never completed). Reusing the boundary must NOT re-watch,
+    and must repair the cursor to that boundary -- otherwise the completed store
+    looks WARM but Pub/Sub startup fails closed on the missing resume cursor."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1"])}, inbox=[], watch_id="222")
+    store = _store(tmp_path)
+    # Only the boundary is set: no cursor, no status.
+    store.set_meta("bootstrap_boundary_history_id", "111")
+    assert store.get_last_processed_history_id() is None
+    assert store.get_bootstrap_status() is None
+
+    bootstrap.bootstrap_index(client, _FakeEmbedder(), store, excluded=set(),
+                              max_per_label=200, topic="topic",
+                              gmail_account_id="me@x.com")
+
+    assert client.watch_calls == 0  # existing boundary reused, not re-pinned
+    assert store.get_meta("bootstrap_boundary_history_id") == "111"  # unchanged
+    # Cursor repaired to the boundary, so the completed store can actually resume.
+    assert store.get_last_processed_history_id() == "111"
+    assert store.get_bootstrap_status() == "complete"
+    store.close()
+
+
 def test_pin_bootstrap_boundary_is_atomic(tmp_path):
     """pin_bootstrap_boundary writes boundary, cursor, and status together."""
     store = _store(tmp_path)

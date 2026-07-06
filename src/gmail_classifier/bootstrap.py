@@ -172,6 +172,14 @@ def bootstrap_index(
     # (or any future partial write) that left a boundary without a status would
     # re-watch and lose the boundary. If a boundary exists but status is missing,
     # just (re)mark in-progress and continue from the existing boundary.
+    #
+    # A store written by the pre-atomic code path could have persisted the
+    # boundary before set_last_processed_history_id() completed, leaving a
+    # boundary with no cursor. decide_startup does not check cursor presence, so
+    # such a store can finish bootstrap and look WARM, yet Pub/Sub startup then
+    # fails closed on the missing resume cursor -- a complete-looking DB that
+    # cannot run. So when reusing an existing boundary, repair the cursor to that
+    # boundary if it is missing before continuing.
     boundary = store.get_meta("bootstrap_boundary_history_id")
     if boundary is None:
         boundary, _expiration = client.watch(topic)
@@ -179,6 +187,9 @@ def bootstrap_index(
         store.pin_bootstrap_boundary(boundary)
         log(f"Bootstrap: watch pinned boundary historyId={boundary}")
     else:
+        if store.get_last_processed_history_id() is None:
+            store.set_last_processed_history_id(boundary)
+            log(f"Bootstrap: repaired missing cursor to boundary historyId={boundary}")
         store.set_meta("bootstrap_status", "in_progress")
 
     # User labels minus the CONFIGURED excluded names -- excluded at the source,
