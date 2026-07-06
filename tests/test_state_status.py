@@ -7,6 +7,8 @@ counts, skip count, pending count, and the history cursor + last_processed_at.
 """
 import numpy as np
 
+import pytest
+
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.state_status import (
     format_report,
@@ -129,3 +131,55 @@ def test_print_report_existing_db(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Storage backend: state" in out
     assert "Banque" in out
+
+
+def test_print_report_does_not_write(tmp_path, capsys):
+    """A status dump must not write to the DB. Prove it two ways: the file mtime
+    is unchanged, and the report still succeeds when the file is chmod'd
+    read-only (a writable-open would fail with 'attempt to write a readonly
+    database')."""
+    import os
+
+    db = tmp_path / "state.db"
+    _seed_store(db).close()
+
+    # Make the file (and its directory) read-only so any write attempt -- opening
+    # writable, creating a -journal, or committing CREATE TABLE -- would raise.
+    before_mtime = db.stat().st_mtime_ns
+    os.chmod(db, 0o444)
+    try:
+        print_report(str(db), excluded_config=["XLC"])
+    finally:
+        os.chmod(db, 0o644)  # restore so tmp cleanup can remove it
+
+    out = capsys.readouterr().out
+    assert "Storage backend: state" in out
+    assert "Banque" in out
+    # No write happened: mtime is untouched and no journal sidecar was created.
+    assert db.stat().st_mtime_ns == before_mtime
+    assert not (tmp_path / "state.db-journal").exists()
+
+
+def test_read_only_store_refuses_writes(tmp_path):
+    """The read_only StateStore mode opens `mode=ro`, so a write raises at the
+    SQLite layer rather than silently succeeding."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    StateStore(str(db), now_ms=lambda: 1).close()  # create + populate schema
+
+    ro = StateStore(str(db), read_only=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            ro.upsert_embedding("x", _vec(1))
+    finally:
+        ro.close()
+
+
+def test_read_only_store_missing_file_raises(tmp_path):
+    """`mode=ro` fails loudly on a missing file instead of creating an empty DB
+    -- which is exactly why print_report guards existence first."""
+    import sqlite3
+
+    with pytest.raises(sqlite3.OperationalError):
+        StateStore(str(tmp_path / "nope.db"), read_only=True)

@@ -233,12 +233,24 @@ class StateStore:
     cursor key-value). One connection per instance.
     """
 
-    def __init__(self, db_path: str, now_ms: Optional[Callable[[], int]] = None):
+    def __init__(self, db_path: str, now_ms: Optional[Callable[[], int]] = None,
+                 read_only: bool = False):
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path)
+        self.read_only = read_only
+        if read_only:
+            # A genuine read-only connection: never creates tables, never takes a
+            # write lock, and refuses any write at the SQLite layer. This is what
+            # a status dump (make gcp-state-status) needs -- it must not touch a
+            # state.db the live service is using, nor materialize/mutate an
+            # incomplete file. `mode=ro` also fails loudly if the file is absent,
+            # so callers guard existence first (see state_status.print_report).
+            self._conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        else:
+            self._conn = sqlite3.connect(db_path)
         # Injected clock keeps last_processed_at deterministic in tests.
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
-        self._create_tables()
+        if not read_only:
+            self._create_tables()
 
     def now_ms(self) -> int:
         """The store's clock (injected in tests). Bootstrap stamps its own meta

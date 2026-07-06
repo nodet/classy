@@ -141,7 +141,10 @@ def print_report(state_db: str, excluded_config: Optional[List[str]] = None) -> 
         print(f"No state database at {state_db} "
               "(the state backend has not bootstrapped here yet).")
         return
-    store = StateStore(state_db)
+    # Open read-only: the status dump must never write to (or take a write lock
+    # on) a state.db the live service may be using, nor materialize tables in an
+    # incomplete file. read_only=True skips CREATE TABLE and opens `mode=ro`.
+    store = StateStore(state_db, read_only=True)
     try:
         status = gather_status(store, excluded_config)
     finally:
