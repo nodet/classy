@@ -138,8 +138,10 @@ gcp-reset-state: ## Delete the VM's state.db and leave the service stopped
 	@# Fail-closed with && (not ;): if the stop fails we do NOT delete the DB, so
 	@# a delete never races a live writer. A manual `systemctl stop` is a clean
 	@# stop, so the unit's Restart=on-failure does not re-launch it.
-	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl stop gmail-classifier && sudo rm -f $(GCP_INSTALL_DIR)/data/state.db $(GCP_INSTALL_DIR)/data/state.db-wal $(GCP_INSTALL_DIR)/data/state.db-shm $(GCP_INSTALL_DIR)/data/state.db-journal $(GCP_INSTALL_DIR)/data/state.rebuild.db $(GCP_INSTALL_DIR)/data/state.rebuild.db-wal $(GCP_INSTALL_DIR)/data/state.rebuild.db-shm $(GCP_INSTALL_DIR)/data/state.rebuild.db-journal"
-	@echo "VM state.db reset; service left stopped. Run 'make gcp-start' to bootstrap fresh."
+	@# rm -v names each file actually removed (nothing for absent sidecars), and
+	@# the trailing echo confirms the service is left stopped -- so the log shows
+	@# exactly what the reset did, not just that the command ran.
+	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo systemctl stop gmail-classifier && sudo rm -vf $(GCP_INSTALL_DIR)/data/state.db $(GCP_INSTALL_DIR)/data/state.db-wal $(GCP_INSTALL_DIR)/data/state.db-shm $(GCP_INSTALL_DIR)/data/state.db-journal $(GCP_INSTALL_DIR)/data/state.rebuild.db $(GCP_INSTALL_DIR)/data/state.rebuild.db-wal $(GCP_INSTALL_DIR)/data/state.rebuild.db-shm $(GCP_INSTALL_DIR)/data/state.rebuild.db-journal && echo \"state.db reset; service is now \$$(systemctl is-active gmail-classifier || true). Run 'make gcp-start' to bootstrap fresh.\""
 
 gcp-logs: ## Tail service logs on GCP (last 20 + follow)
 	@gcloud compute ssh $(GCP_INSTANCE) --project=$(GCP_PROJECT) --zone=$(GCP_ZONE) --command="sudo journalctl -u gmail-classifier -n 20 -f"
