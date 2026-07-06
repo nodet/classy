@@ -216,3 +216,44 @@ def test_maturity_progresses_as_index_grows(tmp_path):
     assert driver.gate.skip_target == 50
     assert driver.is_mature() is True
     store.close()
+
+
+def test_logs_periodic_progress(tmp_path):
+    # 250 messages so the count crosses the 100-message interval twice while
+    # embedding (100, 200), but the final 250 is left to the completion line.
+    client = _FakeClient(
+        labels={"L_A": ("A", [f"a{i}" for i in range(250)])}, inbox=[])
+    lines = []
+    # max_per_label above the corpus size so all 250 land in the worklist
+    # (the default 200 cap would otherwise plan only 200).
+    driver, store = _driver(tmp_path, client, batch_max_messages=25,
+                            max_per_label=300, log=lines.append)
+
+    guard = 0
+    while not driver.done:
+        driver.run_batch()
+        guard += 1
+        assert guard < 100
+
+    progress = [ln for ln in lines if ln.startswith("Bootstrap: ")
+                and "embedded" in ln and "/" in ln]
+    # One line per crossed interval (100, 200) -- not per batch, and not the
+    # final total (that is the separate "Bootstrap complete" completion line).
+    assert progress == ["Bootstrap: 100/250 embedded",
+                        "Bootstrap: 200/250 embedded"]
+    # The completion line still fires once, with the full count.
+    assert any(ln.startswith("Bootstrap complete: 250") for ln in lines)
+    store.close()
+
+
+def test_no_progress_log_below_interval(tmp_path):
+    # A small corpus that never reaches the 100 interval logs no progress line;
+    # only the plan line and the completion line appear.
+    client = _FakeClient(labels={"L_A": ("A", ["a1", "a2", "a3"])}, inbox=[])
+    lines = []
+    driver, store = _driver(tmp_path, client, batch_max_messages=25,
+                            log=lines.append)
+    while not driver.done:
+        driver.run_batch()
+    assert not any(ln.startswith("Bootstrap: ") and "/" in ln for ln in lines)
+    store.close()

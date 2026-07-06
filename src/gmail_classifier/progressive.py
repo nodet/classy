@@ -40,6 +40,12 @@ from gmail_classifier.training_index import TrainingIndex
 BATCH_MAX_MESSAGES = 25
 BATCH_MAX_SECONDS = 5.0
 
+# Emit a "Bootstrap: N/total embedded" progress line each time the cumulative
+# count crosses a multiple of this. The blocking path logs every 100; matching
+# it here gives the ~10-20 min first-boot tail visible movement in the log
+# instead of silence between the plan line and the completion line.
+PROGRESS_LOG_INTERVAL = 100
+
 
 def _noop(*_args, **_kwargs) -> None:
     pass
@@ -73,6 +79,7 @@ class ProgressiveBootstrap:
     _worklist: List[Tuple[str, str, Optional[str], str]] = field(default=None, repr=False)
     _pos: int = 0
     _built: int = 0
+    _last_logged: int = 0  # highest _built already reported by a progress line
     gate: Optional[MaturityGate] = None
     done: bool = False
     _finalized: bool = False
@@ -127,11 +134,27 @@ class ProgressiveBootstrap:
         if additions:
             self.index.add_many(additions)
             self._built += len(additions)
+            self._maybe_log_progress()
 
         if self._pos >= len(self._worklist):
             self._finalize()
 
         return len(additions)
+
+    def _maybe_log_progress(self) -> None:
+        """Log ``Bootstrap: N/total embedded`` when the cumulative count crosses
+        the next ``PROGRESS_LOG_INTERVAL`` boundary. Batched work can jump the
+        count by up to ``batch_max_messages`` at once, so gate on crossing the
+        boundary (not equality) and remember the last reported count so a single
+        line fires per interval regardless of batch size. The completion line is
+        emitted separately by ``finalize_bootstrap``, so skip the final total
+        here to avoid a duplicate."""
+        total = len(self._worklist)
+        if self._built >= total:
+            return  # completion handled by _finalize's log
+        if self._built - self._last_logged >= PROGRESS_LOG_INTERVAL:
+            self._last_logged = self._built - (self._built % PROGRESS_LOG_INTERVAL)
+            self.log(f"Bootstrap: {self._built}/{total} embedded")
 
     def _finalize(self) -> None:
         """Stamp the store complete exactly once, when the work-list is drained."""
