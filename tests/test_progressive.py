@@ -240,8 +240,8 @@ def test_logs_periodic_progress(tmp_path):
     # One line per crossed interval (100, 200) -- not per batch, and not the
     # final total (that is the separate "Bootstrap complete" completion line).
     # Fresh embeds equal the position here (nothing was pre-cached).
-    assert progress == ["Bootstrap: 100/250 (100 embedded)",
-                        "Bootstrap: 200/250 (200 embedded)"]
+    assert progress == ["Bootstrap: 100/250 (100 embedded since restart)",
+                        "Bootstrap: 200/250 (200 embedded since restart)"]
     # The completion line still fires once, with the full count. With no
     # pre-cached ids, fresh == total so it renders as the plain form.
     assert any(ln == "Bootstrap complete: 250 messages embedded" for ln in lines)
@@ -283,8 +283,8 @@ def test_resumed_progress_meter_reaches_total(tmp_path):
     # fresh (pos 175, snapped to 100/250, 25 embedded); batch 2 embeds 25 more
     # (pos 200, 50 embedded). The parenthetical fresh count lags the meter -- as
     # it should, since it counts only real embedding work this run.
-    assert progress == ["Bootstrap: 100/250 (25 embedded)",
-                        "Bootstrap: 200/250 (50 embedded)"]
+    assert progress == ["Bootstrap: 100/250 (25 embedded since restart)",
+                        "Bootstrap: 200/250 (50 embedded since restart)"]
     # Completion reports the full corpus with the smaller fresh count in parens,
     # NOT a bare "complete: 100" that would look like a shrunken corpus.
     assert any(
