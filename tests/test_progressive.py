@@ -4,8 +4,9 @@ Guards the plan's "Unit -- progressive interleave": batches obey the
 message/time budget, the index grows via add_many, the bootstrap is resumable
 and idempotent, and the store is finalized exactly once when the work-list
 drains. The "notification serviced between batches" case is proven at the
-pubsub-loop wiring layer (test_pubsub_mode_startup) where run_iteration and
-run_batch actually interleave; here we prove the driver primitives.
+pubsub-loop wiring layer (test_pubsub_loop::test_bootstrap_iteration_*) where
+run_iteration and run_batch actually interleave; here we prove the driver
+primitives.
 """
 import numpy as np
 

@@ -66,8 +66,9 @@ def test_state_warm_start_accepts_matching_account(tmp_path):
     _seed_warm(path, account="me@gmail.com")
     client = _FakeClient("me@gmail.com")
 
-    backend = cal._build_backend(_args(path), set(), client, _FakeEmbedder())
+    backend, plan = cal._build_backend(_args(path), set(), client, _FakeEmbedder())
     assert client.profile_calls == 1  # the ACTUAL mailbox was queried
+    assert plan is None               # warm store: no bootstrap deferred
     backend.close()
 
 
@@ -94,6 +95,7 @@ def test_legacy_path_ignores_client(tmp_path):
         state_db=str(tmp_path / "state.db"),
     )
     client = _FakeClient("me@gmail.com")
-    backend = cal._build_backend(args, set(), client, _FakeEmbedder())
+    backend, plan = cal._build_backend(args, set(), client, _FakeEmbedder())
     assert client.profile_calls == 0
+    assert plan is None
     backend.close()

@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from gmail_classifier.classifier import SKIP_LABEL
+from gmail_classifier.progressive import ProgressiveBootstrap
 from gmail_classifier.state_store import (
     STATE_SCHEMA_VERSION,
     StartupDecision,
@@ -25,6 +26,28 @@ from gmail_classifier.state_store import (
     compute_ml_fingerprint,
     decide_startup,
 )
+from gmail_classifier.training_index import TrainingIndex
+
+
+def _drive_bootstrap(backend, plan, client, emb):
+    """Run the deferred progressive bootstrap to completion against ``backend``.
+
+    Phase 5 defers the cold fetch: ``_build_backend`` pins the boundary and
+    returns a plan over an empty store. The pubsub loop would pump the driver
+    between notifications; here we drive it straight through so the state-after-
+    bootstrap assertions match the old blocking contract."""
+    index = TrainingIndex(np.empty((0, 0), dtype=np.float32), [], [])
+    driver = ProgressiveBootstrap(
+        client=client, embedder=emb, store=backend.store, index=index,
+        excluded=plan.excluded, max_per_label=plan.max_per_label,
+        gmail_account_id=plan.gmail_account_id,
+    )
+    guard = 0
+    while not driver.done:
+        driver.run_batch()
+        guard += 1
+        assert guard < 1000
+    return index
 
 _SPEC = importlib.util.spec_from_file_location(
     "classify_and_label",
@@ -103,12 +126,23 @@ def _seed(path, **meta):
 # BOOTSTRAP: empty store -> cold fetch
 # --------------------------------------------------------------------------
 
-def test_bootstrap_decision_fetches_and_warms(tmp_path):
+def test_bootstrap_decision_defers_fetch_and_pins_boundary(tmp_path):
+    """Phase 5: BOOTSTRAP no longer blocks. ``_build_backend`` pins the read-only
+    boundary (watch first) and returns a non-None plan over an EMPTY store; the
+    fetch is deferred to the progressive driver. Driving that driver to
+    completion fills the store exactly as the old blocking path did."""
     client = _FakeClient(labels={"L_A": ("A", ["a1", "a2"])}, inbox=["i1"])
     emb = _FakeEmbedder()
-    backend = cal._build_backend(_args(tmp_path), set(), client, emb)
+    backend, plan = cal._build_backend(_args(tmp_path), set(), client, emb)
 
-    assert client.watch_calls == 1  # boundary pinned
+    assert client.watch_calls == 1  # boundary pinned synchronously
+    assert plan is not None         # bootstrap deferred to the loop
+    assert client.get_calls == []   # nothing fetched yet
+    assert list(backend.store.iter_index()) == []  # store still empty
+
+    # The pubsub loop would pump this driver; drive it straight through here.
+    _drive_bootstrap(backend, plan, client, emb)
+
     by_id = {mid: label for mid, _v, label in backend.store.iter_index()}
     assert by_id == {"a1": "A", "a2": "A", "i1": SKIP_LABEL}
     assert backend.store.get_bootstrap_status() == "complete"
@@ -123,7 +157,8 @@ def test_bootstrap_then_reopen_is_warm(tmp_path):
     emb = _FakeEmbedder()
     args = _args(tmp_path)
 
-    backend = cal._build_backend(args, set(), client, emb)
+    backend, plan = cal._build_backend(args, set(), client, emb)
+    _drive_bootstrap(backend, plan, client, emb)
     assert backend.store.get_meta("gmail_account_id") == "me@x.com"
     backend.close()
 
@@ -163,8 +198,9 @@ def test_reconcile_decision_updates_membership_in_place(tmp_path):
 
     client = _FakeClient(labels={"L_A": ("A", ["a1"]), "L_B": ("B", ["b1"])})
     # Now exclude B -> excluded hash changes -> RECONCILE.
-    backend = cal._build_backend(_args(tmp_path), {"B"}, client, emb)
+    backend, plan = cal._build_backend(_args(tmp_path), {"B"}, client, emb)
 
+    assert plan is None  # reconcile finishes synchronously
     assert backend.store.known_ids() == {"a1"}
     assert client.get_calls == []  # retained id not re-fetched
     assert backend.store.get_meta("excluded_labels_hash") == compute_excluded_hash({"B"})
@@ -192,8 +228,9 @@ def test_rebuild_decision_swaps_in_reembedded_store(tmp_path):
     store.close()
 
     client = _FakeClient(labels={"L_A": ("A", ["a1"])})
-    backend = cal._build_backend(_args(tmp_path), set(), client, emb)
+    backend, plan = cal._build_backend(_args(tmp_path), set(), client, emb)
 
+    assert plan is None  # rebuild finishes synchronously
     # Swapped-in store has the current fingerprint and carried the cursor.
     assert backend.store.get_meta("ml_fingerprint") == _ml(emb)
     assert backend.store.get_last_processed_history_id() == "4242"
@@ -227,8 +264,9 @@ def test_rebuild_and_exclusion_change_together_reconciles(tmp_path):
 
     client = _FakeClient(labels={"L_A": ("A", ["a1"]), "L_B": ("B", ["b1"])})
     # Now exclude B *and* the fingerprint has changed.
-    backend = cal._build_backend(_args(tmp_path), {"B"}, client, emb)
+    backend, plan = cal._build_backend(_args(tmp_path), {"B"}, client, emb)
 
+    assert plan is None  # rebuild + reconcile finish synchronously
     # Rebuilt with current vectors AND B dropped from the join in the same boot.
     assert backend.store.get_meta("ml_fingerprint") == _ml(emb)
     assert backend.store.known_ids() == {"a1"}

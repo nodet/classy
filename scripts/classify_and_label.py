@@ -13,8 +13,10 @@ import os
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Set
 
 from gmail_classifier.auth import get_credentials, get_gmail_service
 from gmail_classifier.classifier import Action
@@ -101,15 +103,34 @@ def _validate_storage_mode(args):
         sys.exit(1)
 
 
+@dataclass
+class BootstrapPlan:
+    """A deferred progressive cold bootstrap (Phase 5).
+
+    The BOOTSTRAP path no longer blocks: ``_build_backend`` pins the read-only
+    boundary (so the durable cursor exists and Pub/Sub can resume) and returns
+    this plan instead of fetching the whole corpus. The caller loads the empty
+    index, then hands the plan to ``_run_pubsub_mode``, which builds a
+    ``ProgressiveBootstrap`` over the *live* index and interleaves batches with
+    notification servicing. ``None`` everywhere else (warm/reconcile/rebuild
+    finish synchronously, and legacy has no bootstrap)."""
+    excluded: Set[str]
+    max_per_label: int
+    gmail_account_id: Optional[str]
+
+
 def _build_backend(args, excluded, client, embedder):
-    """Construct the selected StorageBackend. The only place that branches on
-    the backend choice; callers downstream see just a StorageBackend.
+    """Construct the selected StorageBackend and, for a cold state boot, a
+    deferred :class:`BootstrapPlan`. Returns ``(backend, plan)`` where ``plan``
+    is ``None`` unless a progressive bootstrap must run. The only place that
+    branches on the backend choice; callers downstream see just a StorageBackend.
 
     Legacy is today's three-DB adapter. State opens the single state.db and
     dispatches on its persisted meta:
 
     - WARM -> load the join directly.
-    - BOOTSTRAP -> cold-fetch from Gmail into the (empty) store, then warm.
+    - BOOTSTRAP -> pin the boundary now, defer the fetch to a progressive
+      driver that runs interleaved with the live loop (Phase 5).
     - REBUILD -> ML fingerprint changed; re-embed into state.rebuild.db and
       atomically swap it in (carrying the cursor forward).
     - RECONCILE -> excluded-label set changed; cheap membership fix in place.
@@ -120,7 +141,7 @@ def _build_backend(args, excluded, client, embedder):
     mailbox account id and current ML fingerprint.
     """
     if args.storage == "legacy":
-        return LegacyBackend(args.training_db, args.skip_db, excluded)
+        return LegacyBackend(args.training_db, args.skip_db, excluded), None
 
     # Explicit: anything that isn't a known backend is a bug or an unvalidated
     # value slipping past _validate_storage_mode -- never silently fall through
@@ -152,7 +173,7 @@ def _build_backend(args, excluded, client, embedder):
     )
 
     if decision is StartupDecision.WARM:
-        return backend
+        return backend, None
 
     if decision is StartupDecision.INCOMPATIBLE:
         # Schema or account mismatch: the file is unusable as-is and there is no
@@ -169,16 +190,21 @@ def _build_backend(args, excluded, client, embedder):
     from gmail_classifier import bootstrap as _bootstrap
 
     if decision is StartupDecision.BOOTSTRAP:
-        # Empty/interrupted store: cold-fetch from Gmail. watch() is pinned
-        # first inside bootstrap_index so pre-existing mail stays read-only.
-        print("State backend: bootstrapping from Gmail (first boot)...")
-        _bootstrap.bootstrap_index(
-            client, embedder, backend.store,
+        # Empty/interrupted store: progressive cold bootstrap (Phase 5). Pin the
+        # read-only boundary NOW -- watch() first, before any message is read, so
+        # pre-existing mail stays read-only and the durable cursor exists for the
+        # loop to resume from. The actual fetch is deferred to a
+        # ProgressiveBootstrap that the pubsub loop pumps between notifications,
+        # so the service is live from the first second rather than blocking on a
+        # ~10-20 min cold fetch.
+        print("State backend: bootstrapping from Gmail (progressive)...")
+        _bootstrap.ensure_boundary(
+            client, backend.store, PUBSUB_TOPIC,
+            log=lambda m: print(f"  {m}", flush=True))
+        plan = BootstrapPlan(
             excluded=excluded, max_per_label=args.max_per_label,
-            topic=PUBSUB_TOPIC, gmail_account_id=gmail_account_id,
-            log=lambda m: print(f"  {m}", flush=True),
-        )
-        return backend
+            gmail_account_id=gmail_account_id)
+        return backend, plan
 
     if decision is StartupDecision.RECONCILE:
         # Excluded-label config changed: cheap membership fix, no re-embed of
@@ -189,7 +215,7 @@ def _build_backend(args, excluded, client, embedder):
             excluded=excluded, max_per_label=args.max_per_label,
             log=lambda m: print(f"  {m}", flush=True),
         )
-        return backend
+        return backend, None
 
     if decision is StartupDecision.REBUILD:
         # ML fingerprint changed: vectors are stale, label map + cursor are not.
@@ -211,7 +237,7 @@ def _build_backend(args, excluded, client, embedder):
                 excluded=excluded, max_per_label=args.max_per_label,
                 log=lambda m: print(f"  {m}", flush=True),
             )
-        return rebuilt
+        return rebuilt, None
 
     # Defensive: decide_startup returns only the enum members handled above.
     backend.close()
@@ -335,7 +361,9 @@ def main():
     # Build the storage backend behind the seam. The runtime below talks only
     # to this interface, never to a concrete store. Only the selector branches
     # on which backend to build; everything downstream sees a StorageBackend.
-    backend = _build_backend(args, excluded, client, embedder)
+    # ``plan`` is a deferred progressive bootstrap on a cold state boot, else
+    # None.
+    backend, plan = _build_backend(args, excluded, client, embedder)
 
     # Build the runtime index (config exclusion + labeled-wins-over-skip dedup +
     # cache-backed embedding). The assembly logic lives in the backend/training
@@ -344,13 +372,20 @@ def main():
     loaded = backend.load_index(embedder)
     index, skip_ids, stats = loaded.index, loaded.skip_ids, loaded.stats
 
-    if stats.n_train == 0:
+    # A cold progressive boot legitimately starts with an EMPTY index -- the
+    # ProgressiveBootstrap fills it in the loop. Only treat an empty index as
+    # fatal when there is no bootstrap plan to populate it (a warm store that
+    # somehow has nothing is a real error).
+    if stats.n_train == 0 and plan is None:
         print("No training messages found.")
         sys.exit(1)
 
-    print(f"  {stats.n_train} training messages")
-    note = f" ({stats.n_dropped} also labeled, kept as labeled)" if stats.n_dropped else ""
-    print(f"  {stats.n_skip} skip examples{note}")
+    if plan is not None:
+        print("  starting with an empty index; bootstrapping progressively")
+    else:
+        print(f"  {stats.n_train} training messages")
+        note = f" ({stats.n_dropped} also labeled, kept as labeled)" if stats.n_dropped else ""
+        print(f"  {stats.n_skip} skip examples{note}")
     trim_memory()
     print(f"  {index.embeddings.shape[0]} embeddings, {index.embeddings.shape[1]} dimensions")
 
@@ -360,7 +395,7 @@ def main():
     try:
         if args.mode == "pubsub":
             _run_pubsub_mode(args, client, _credentials, embedder, index,
-                             registry, skip_ids, backend)
+                             registry, skip_ids, backend, plan=plan)
         else:
             _run_poll_mode(args, client, embedder, index,
                            registry, skip_ids, backend)
@@ -381,13 +416,65 @@ def _run_poll_mode(args, client, embedder, index,
         time.sleep(args.interval)
 
 
+def _classify_new_ids(new_ids, args, client, embedder, index, registry,
+                      skip_ids, self_labeled, backend):
+    """Fetch, classify, and label/skip a list of new inbox message ids.
+
+    Reuses ``process_history_events`` by synthesizing ``messagesAdded`` events
+    for the ids, so the drain path and the live path share one classifier.
+    Returns the result dicts (for the caller to fold into its trim decision)."""
+    from gmail_classifier.pending_new import events_for_ids
+
+    results = process_history_events(
+        events=events_for_ids(new_ids),
+        client=client,
+        embedder=embedder,
+        train_embeddings=index.embeddings,
+        train_labels=index.labels,
+        label_name_to_id=registry.name_to_id,
+        user_label_ids=registry.user_label_ids,
+        excluded_labels=registry._excluded,
+        skip_ids=skip_ids,
+        k=args.k,
+        dry_run=args.dry_run,
+        registry=registry,
+    )
+    w = registry.max_label_width
+    for r in results:
+        sender = r["sender"]
+        subject = r["subject"]
+        if r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
+            print(truncate(f"{now()} {r['label']:{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
+            if r.get("applied"):
+                self_labeled.add(r["message_id"])
+        else:
+            print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
+            if not args.dry_run:
+                msg = r["message"]
+                backend.upsert_skip(msg, r.get("embedding"))
+    return results
+
+
 def _process_events(events, args, client, embedder, index, registry,
-                    skip_ids, self_labeled, backend):
-    """Handle a batch of history events: label changes, classification, output."""
+                    skip_ids, self_labeled, backend, controller=None,
+                    history_id=None):
+    """Handle a batch of history events: label changes, classification, output.
+
+    ``controller`` is the progressive-bootstrap maturity controller, or ``None``
+    on warm/legacy (where new mail is always classified immediately). While a
+    controller exists and the index is not yet mature, genuinely-new inbox mail
+    is **parked** in ``pending_new`` (no label, no archive) rather than
+    classified -- guarding a still-warming model from over-labeling a fresh
+    mailbox. Label-change events are always processed, so user corrections keep
+    growing the index even before maturity."""
     if not events:
         return
 
-    # Process label changes (persist via the backend + update in-memory index)
+    from gmail_classifier.history_processor import collect_new_inbox_ids
+    from gmail_classifier.pending_new import park_immature_mail
+
+    # Process label changes (persist via the backend + update in-memory index).
+    # This runs regardless of maturity -- corrections are always learned.
     movements = process_label_changes(
         events=events,
         client=client,
@@ -401,37 +488,24 @@ def _process_events(events, args, client, embedder, index, registry,
         ignore_ids=self_labeled,
     )
 
-    # Process new inbox messages
-    results = process_history_events(
-        events=events,
-        client=client,
-        embedder=embedder,
-        train_embeddings=index.embeddings,
-        train_labels=index.labels,
-        label_name_to_id=registry.name_to_id,
-        user_label_ids=registry.user_label_ids,
-        excluded_labels=registry._excluded,
-        skip_ids=skip_ids,
-        k=args.k,
-        dry_run=args.dry_run,
-        registry=registry,
-    )
-
     for src, dst, count in movements:
         print(f"{now()} {count} {'email' if count == 1 else 'emails'} moved from {src} to {dst}")
-    for r in results:
-        sender = r["sender"]
-        subject = r["subject"]
-        w = registry.max_label_width
-        if r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
-            print(truncate(f"{now()} {r['label']:{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
-            if r.get("applied"):
-                self_labeled.add(r["message_id"])
-        else:
-            print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
-            if not args.dry_run:
-                msg = r["message"]
-                backend.upsert_skip(msg, r.get("embedding"))
+
+    results = []
+    if controller is not None and not controller.is_mature():
+        # Pre-maturity: park new inbox mail; do NOT classify or archive it. It
+        # is drained through the normal classifier once the gate opens.
+        parked = park_immature_mail(events, skip_ids, backend,
+                                    history_id=history_id or "")
+        if parked:
+            print(f"{now()} parked {len(parked)} new message(s) until the "
+                  f"index matures")
+    else:
+        new_ids = collect_new_inbox_ids(events, skip_ids)
+        if new_ids:
+            results = _classify_new_ids(
+                new_ids, args, client, embedder, index, registry,
+                skip_ids, self_labeled, backend)
 
     # Only reclaim when the batch did real work. Hand back the heap a heavy
     # message (big HTML parse + embed) just grew, so RSS falls back to idle
@@ -440,11 +514,80 @@ def _process_events(events, args, client, embedder, index, registry,
         trim_memory()
 
 
+class _MaturityController:
+    """Owns the progressive bootstrap driver and the maturity transition.
+
+    The loop consults :meth:`is_mature` to decide whether new mail is labelled
+    or parked, and calls :meth:`maybe_drain` after each step so that the moment
+    the gate opens, the mail parked while the model was warming is classified
+    through the normal path and cleared -- exactly once."""
+
+    def __init__(self, driver, drain_fn, log):
+        self._driver = driver
+        self._drain_fn = drain_fn  # () -> classify+clear pending_new
+        self._log = log
+        self._drained = False
+
+    @property
+    def done(self):
+        return self._driver.done
+
+    def run_batch(self):
+        return self._driver.run_batch()
+
+    def is_mature(self):
+        return self._driver.is_mature()
+
+    def maybe_drain(self):
+        """Drain pending_new once, the first time the gate is open. Idempotent:
+        a second call after draining is a no-op, and a crash mid-drain leaves
+        the survivors for the next call (drain_pending removes rows only after
+        they are processed)."""
+        if self._drained or not self._driver.is_mature():
+            return
+        self._log("Index matured; draining parked mail through the classifier")
+        self._drain_fn()
+        self._drained = True
+
+
+def _build_controller(plan, args, client, embedder, index, registry, skip_ids,
+                      self_labeled, backend, log):
+    """Construct the progressive-bootstrap maturity controller, or ``None`` when
+    there is no cold bootstrap to run (warm/reconcile/rebuild/legacy)."""
+    if plan is None:
+        return None
+
+    from gmail_classifier.pending_new import drain_pending
+    from gmail_classifier.progressive import ProgressiveBootstrap
+
+    driver = ProgressiveBootstrap(
+        client=client, embedder=embedder, store=backend.store, index=index,
+        excluded=plan.excluded, max_per_label=plan.max_per_label,
+        gmail_account_id=plan.gmail_account_id,
+        log=lambda m: print(f"  {m}", flush=True),
+    )
+
+    def _drain():
+        drain_pending(backend, process_ids=lambda ids: _classify_new_ids(
+            ids, args, client, embedder, index, registry,
+            skip_ids, self_labeled, backend))
+
+    return _MaturityController(driver, _drain, log)
+
+
 def _run_pubsub_mode(args, client, credentials, embedder, index,
-                     registry, skip_ids, backend):
-    """Wait for Pub/Sub notifications and process via history API."""
+                     registry, skip_ids, backend, plan=None):
+    """Wait for Pub/Sub notifications and process via history API.
+
+    When ``plan`` is set (a cold state boot), the index starts empty and is
+    filled by a ``ProgressiveBootstrap`` interleaved with notification
+    servicing: one bounded batch per loop step until the corpus is embedded.
+    New mail arriving before the index matures is parked; it is drained the
+    moment the maturity gate opens."""
     from gmail_classifier.pubsub import PubSubSubscriber
-    from gmail_classifier.pubsub_loop import LoopState, LoopDeps, run_iteration
+    from gmail_classifier.pubsub_loop import (
+        LoopState, LoopDeps, run_bootstrap_iteration, run_iteration,
+    )
 
     # Register for notifications
     print("Registering Gmail watch...")
@@ -526,16 +669,29 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
                      self_labeled)
 
+    # Progressive bootstrap controller (cold state boot only). None on warm/
+    # legacy, where _process_events classifies new mail immediately.
+    controller = _build_controller(
+        plan, args, client, embedder, index, registry, skip_ids, self_labeled,
+        backend, _log)
+
+    def _process(events):
+        # The loop advances its own history_id AFTER process_events; pass the
+        # current cursor so parked rows record the historyId they were first
+        # seen at.
+        _process_events(events, args, client, embedder, index, registry,
+                        skip_ids, self_labeled, backend,
+                        controller=controller, history_id=state.history_id)
+
     deps = LoopDeps(
         make_subscriber=_make_subscriber,
         watch=lambda: client.watch(PUBSUB_TOPIC),
         get_history=client.get_history,
         check_inbox=_check_inbox_fallback,
-        process_events=lambda events: _process_events(
-            events, args, client, embedder, index, registry,
-            skip_ids, self_labeled, backend),
+        process_events=_process,
         persist_cursor=backend.set_last_processed_history_id,
         log=_log,
+        is_bootstrapping=lambda: controller is not None and not controller.done,
     )
 
     state = LoopState(
@@ -545,6 +701,17 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         subscriber=_make_subscriber(),
     )
     try:
+        # Phase 5: while the progressive bootstrap is running, each loop step
+        # embeds one bounded batch and THEN services notifications, so a
+        # notification that arrived mid-bootstrap is handled between batches --
+        # not after the whole corpus. Once the gate opens, drain parked mail.
+        while controller is not None and not controller.done:
+            state = run_bootstrap_iteration(state, deps, controller)
+            controller.maybe_drain()
+        # A gate that opened only on the final batch still needs its drain.
+        if controller is not None:
+            controller.maybe_drain()
+
         while True:
             state = run_iteration(state, deps)
     finally:

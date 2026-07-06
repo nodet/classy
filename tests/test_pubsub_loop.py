@@ -11,10 +11,13 @@ import pytest
 
 from gmail_classifier.models import HistoryExpiredError
 from gmail_classifier.pubsub_loop import (
+    PULL_TIMEOUT,
+    PULL_TIMEOUT_RETRY,
     LoopState,
     LoopDeps,
     next_backoff,
     is_network_error,
+    run_bootstrap_iteration,
     run_iteration,
 )
 
@@ -567,6 +570,109 @@ def test_history_expired_persists_rewatched_cursor_before_ack():
 
     assert order == [("check_inbox", None), ("persist", "REWATCH-555"), ("ack", None)]
     assert persisted == ["REWATCH-555"]
+
+
+# --------------------------------------------------------------------------
+# Case 10: progressive-bootstrap interleave (Phase 5).
+# --------------------------------------------------------------------------
+
+
+class FakeDriver:
+    """Scripted progressive-bootstrap driver: records run_batch() calls and
+    flips ``done`` after a set number of batches."""
+
+    def __init__(self, batches_until_done=1):
+        self._remaining = batches_until_done
+        self.batch_calls = 0
+        self.done = False
+
+    def run_batch(self):
+        self.batch_calls += 1
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self.done = True
+        return 1
+
+
+def test_bootstrap_iteration_embeds_batch_then_services_notification():
+    """One bootstrap step embeds a batch AND services any pending notification in
+    the same iteration -- so a notification that arrived mid-bootstrap is handled
+    between batches, not after the whole corpus. This is the plan's headline
+    "notification serviced before bootstrap completes"."""
+    events = [object()]
+    client = FakeClient(history_result=events, history_latest="300")
+    sub = FakeSubscriber(actions=[[Notification("300")]])
+    processed = []
+    deps, _ = make_deps(client, lambda: sub,
+                        process_events=lambda evs: processed.append(list(evs)))
+    driver = FakeDriver(batches_until_done=3)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    state = run_bootstrap_iteration(state, deps, driver)
+
+    assert driver.batch_calls == 1        # embedded exactly one bounded batch
+    assert processed == [events]          # AND serviced the pending notification
+    assert state.history_id == "300"      # pointer advanced past the batch
+    assert not driver.done                # still more corpus to embed
+
+
+def test_bootstrap_iteration_runs_batch_even_on_idle_pull():
+    """With no notification waiting, the step still embeds a batch (forward
+    progress on the corpus) and leaves the cursor where it was."""
+    client = FakeClient()
+    sub = FakeSubscriber(actions=[[]])  # idle, healthy pull
+    deps, _ = make_deps(client, lambda: sub)
+    driver = FakeDriver(batches_until_done=5)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    state = run_bootstrap_iteration(state, deps, driver)
+
+    assert driver.batch_calls == 1
+    assert state.history_id == "100"
+    assert client.get_history_calls == []  # nothing to replay
+
+
+def test_bootstrapping_uses_short_pull_timeout():
+    """While bootstrapping, an idle healthy pull uses the SHORT timeout so the
+    loop returns promptly to embed the next batch instead of blocking the full
+    60s on a quiet subscription."""
+    timeouts = []
+
+    class TimeoutRecordingSub(FakeSubscriber):
+        def pull(self, timeout):
+            timeouts.append(timeout)
+            return super().pull(timeout)
+
+    client = FakeClient()
+    sub = TimeoutRecordingSub(actions=[[]])
+    deps, _ = make_deps(client, lambda: sub, is_bootstrapping=lambda: True)
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+    assert timeouts == [PULL_TIMEOUT_RETRY]
+
+
+def test_steady_state_uses_long_pull_timeout():
+    """Once bootstrapping is done (the default), a healthy idle pull uses the
+    full 60s timeout -- the steady-state behavior is unchanged."""
+    timeouts = []
+
+    class TimeoutRecordingSub(FakeSubscriber):
+        def pull(self, timeout):
+            timeouts.append(timeout)
+            return super().pull(timeout)
+
+    client = FakeClient()
+    sub = TimeoutRecordingSub(actions=[[]])
+    deps, _ = make_deps(client, lambda: sub)  # is_bootstrapping defaults False
+
+    state = LoopState(history_id="100", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    run_iteration(state, deps)
+    assert timeouts == [PULL_TIMEOUT]
 
 
 def test_history_expired_no_ack_when_rewatch_fails():

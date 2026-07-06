@@ -77,6 +77,11 @@ class LoopDeps:
     persist_cursor: Callable[[str], None] = lambda history_id: None
     sleep: Callable[[float], None] = time.sleep
     now_ms: Callable[[], int] = lambda: int(time.time() * 1000)
+    # True while a progressive bootstrap is still running: the pull uses the
+    # short timeout so the loop returns promptly to embed the next batch instead
+    # of blocking up to PULL_TIMEOUT waiting on a quiet subscription. Default
+    # False preserves the steady-state 60s idle pull.
+    is_bootstrapping: Callable[[], bool] = lambda: False
 
 
 def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
@@ -114,7 +119,15 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         # acks -- we ack only after the notifications' history is processed
         # (and, on a durable-cursor backend, persisted), so a crash mid-batch
         # leaves them for redelivery.
-        pull_timeout = PULL_TIMEOUT_RETRY if backoff else PULL_TIMEOUT
+        # While bootstrapping, use the short timeout even when healthy so an
+        # idle pull returns quickly and the caller can embed the next bootstrap
+        # batch rather than blocking the full 60s on a quiet subscription.
+        if backoff:
+            pull_timeout = PULL_TIMEOUT_RETRY
+        elif deps.is_bootstrapping():
+            pull_timeout = PULL_TIMEOUT_RETRY
+        else:
+            pull_timeout = PULL_TIMEOUT
         notifications, ack_ids = subscriber.pull(timeout=pull_timeout)
 
         # A successful pull -- even one that returns no messages -- proves the
@@ -191,3 +204,20 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
         backoff = next_backoff(backoff)
         deps.log(f"Retrying in {backoff}s...")
         return LoopState(history_id, expiration, backoff, subscriber)
+
+
+def run_bootstrap_iteration(state: LoopState, deps: LoopDeps, driver) -> LoopState:
+    """One loop step while a progressive bootstrap is still running.
+
+    Embeds one bounded bootstrap batch (growing the live index), then services
+    any pending notification via :func:`run_iteration`. Because these interleave
+    single-threaded, a notification that arrived during the slow bootstrap is
+    serviced *between* batches -- not after the whole corpus -- and never
+    starved. The batch runs first so the index is as broad as possible (and the
+    maturity gate as likely open) before the notifications it may need to
+    classify are processed.
+
+    Returns the next :class:`LoopState`. The caller keeps calling this until
+    ``driver.done``, then switches to the steady :func:`run_iteration` loop."""
+    driver.run_batch()
+    return run_iteration(state, deps)
