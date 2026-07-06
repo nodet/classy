@@ -143,8 +143,8 @@ def test_print_report_does_not_write(tmp_path, capsys):
     db = tmp_path / "state.db"
     _seed_store(db).close()
 
-    # Make the file (and its directory) read-only so any write attempt -- opening
-    # writable, creating a -journal, or committing CREATE TABLE -- would raise.
+    # Make the DB file read-only so a writable open (or a CREATE TABLE commit)
+    # would raise "attempt to write a readonly database".
     before_mtime = db.stat().st_mtime_ns
     os.chmod(db, 0o444)
     try:

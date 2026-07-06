@@ -29,6 +29,7 @@ import hashlib
 import sqlite3
 import time
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
@@ -244,7 +245,8 @@ class StateStore:
             # state.db the live service is using, nor materialize/mutate an
             # incomplete file. `mode=ro` also fails loudly if the file is absent,
             # so callers guard existence first (see state_status.print_report).
-            self._conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True)
         else:
             self._conn = sqlite3.connect(db_path)
         # Injected clock keeps last_processed_at deterministic in tests.
