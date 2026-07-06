@@ -369,6 +369,30 @@ class StateStore:
     def get_bootstrap_status(self) -> Optional[str]:
         return self.get_meta("bootstrap_status")
 
+    def pin_bootstrap_boundary(self, boundary_history_id: str) -> None:
+        """Pin the read-only boundary, durable cursor, start timestamp, and
+        in-progress status in a **single transaction**.
+
+        Bootstrap calls ``watch()`` once, at start-of-service, to fix the
+        historyId boundary; everything at-or-before it is pre-existing (read
+        only), only mail after it is classifiable. These four writes must land
+        atomically: if the boundary or cursor persisted but ``bootstrap_status``
+        did not, a crash in that window would make the next boot think no
+        boundary was pinned and call ``watch()`` again -- moving the boundary
+        forward and silently skipping mail that arrived in between."""
+        now = str(self._now_ms())
+        with self._conn:  # one transaction across all four keys
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                [
+                    ("bootstrap_boundary_history_id", boundary_history_id),
+                    ("last_processed_history_id", boundary_history_id),
+                    ("last_processed_at", now),
+                    ("bootstrap_started_at", now),
+                    ("bootstrap_status", "in_progress"),
+                ],
+            )
+
     # --- durable history cursor -----------------------------------------
 
     def get_last_processed_history_id(self) -> Optional[str]:

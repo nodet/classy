@@ -155,18 +155,24 @@ def bootstrap_index(
     """
     # watch() FIRST, before reading a single message, so the pinned historyId
     # boundary reflects start-of-service. Anything at-or-before it is existing =
-    # read-only; only mail after it is classifiable. On a resume (boundary
-    # already pinned) do NOT re-watch -- that would move the boundary past mail
-    # that arrived during the first attempt and silently skip it.
+    # read-only; only mail after it is classifiable.
+    #
+    # A pinned boundary is the ONLY reason to skip watch(): once a boundary
+    # exists we must never re-watch, because that would move it past mail that
+    # arrived during the first attempt and silently skip it. Do NOT gate on
+    # bootstrap_status here -- pin_bootstrap_boundary writes the boundary,
+    # cursor, and status in one transaction, but if we keyed off status a crash
+    # (or any future partial write) that left a boundary without a status would
+    # re-watch and lose the boundary. If a boundary exists but status is missing,
+    # just (re)mark in-progress and continue from the existing boundary.
     boundary = store.get_meta("bootstrap_boundary_history_id")
-    if store.get_bootstrap_status() is None or boundary is None:
+    if boundary is None:
         boundary, _expiration = client.watch(topic)
-        store.set_meta("bootstrap_boundary_history_id", boundary)
-        # Pins last_processed_history_id AND stamps last_processed_at together.
-        store.set_last_processed_history_id(boundary)
-        store.set_meta("bootstrap_started_at", str(store.now_ms()))
+        # Pins boundary + cursor + started_at + status="in_progress" atomically.
+        store.pin_bootstrap_boundary(boundary)
         log(f"Bootstrap: watch pinned boundary historyId={boundary}")
-    store.set_meta("bootstrap_status", "in_progress")
+    else:
+        store.set_meta("bootstrap_status", "in_progress")
 
     # User labels minus the CONFIGURED excluded names -- excluded at the source,
     # so no excluded-label row ever reaches the labels table.

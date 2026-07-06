@@ -247,6 +247,36 @@ def test_bootstrap_resume_does_not_re_watch(tmp_path):
     store.close()
 
 
+def test_bootstrap_does_not_rewatch_when_boundary_set_but_status_missing(tmp_path):
+    """Narrow crash window: a boundary is pinned but bootstrap_status is absent.
+    watch() must NOT run again (that would move the boundary past mail that
+    arrived after the first pin); the existing boundary is reused."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1"])}, inbox=[], watch_id="900")
+    store = _store(tmp_path)
+    # Simulate the crash state: boundary present, status never written.
+    store.set_meta("bootstrap_boundary_history_id", "111")
+    store.set_last_processed_history_id("111")
+    assert store.get_bootstrap_status() is None
+
+    bootstrap.bootstrap_index(client, _FakeEmbedder(), store, excluded=set(),
+                              max_per_label=200, topic="topic")
+
+    assert client.watch_calls == 0  # boundary already pinned -> no re-watch
+    assert store.get_meta("bootstrap_boundary_history_id") == "111"  # unchanged
+    store.close()
+
+
+def test_pin_bootstrap_boundary_is_atomic(tmp_path):
+    """pin_bootstrap_boundary writes boundary, cursor, and status together."""
+    store = _store(tmp_path)
+    store.pin_bootstrap_boundary("321")
+    assert store.get_meta("bootstrap_boundary_history_id") == "321"
+    assert store.get_last_processed_history_id() == "321"
+    assert store.get_last_processed_at() is not None
+    assert store.get_bootstrap_status() == "in_progress"
+    store.close()
+
+
 def test_bootstrap_one_body_at_a_time(tmp_path):
     client = _FakeClient(
         labels={"L_A": ("A", ["a1", "a2", "a3"])}, inbox=["i1", "i2"],
