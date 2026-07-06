@@ -511,7 +511,7 @@ def heartbeat_cursor(
 ) -> Optional[str]:
     """Refresh the durable cursor's timestamp on a quiet-but-live mailbox so it
     never *reaches* ``WARM_RECOVERY_WINDOW`` and forces a resync it did not need
-    (Phase 6). Returns the new history id iff it advanced the cursor, else
+    (Phase 6). he persisted cursor value when it refreshed the heartbeat, else
     ``None``.
 
     Only acts once the cursor's age reaches ``HEARTBEAT_INTERVAL``: does a no-op
