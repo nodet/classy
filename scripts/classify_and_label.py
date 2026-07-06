@@ -174,7 +174,8 @@ def _build_backend(args, excluded, client, embedder):
         _bootstrap.bootstrap_index(
             client, embedder, backend.store,
             excluded=excluded, max_per_label=args.max_per_label,
-            topic=PUBSUB_TOPIC, log=lambda m: print(f"  {m}", flush=True),
+            topic=PUBSUB_TOPIC, gmail_account_id=gmail_account_id,
+            log=lambda m: print(f"  {m}", flush=True),
         )
         return backend
 

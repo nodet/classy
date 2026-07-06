@@ -136,6 +136,7 @@ def _skip_bucket(client, labeled_ids: Set[str], max_per_label: int):
 def bootstrap_index(
     client, embedder, store: StateStore, *,
     excluded: Set[str], max_per_label: int, topic: str,
+    gmail_account_id: Optional[str] = None,
     log: Callable[..., None] = _noop,
 ) -> None:
     """Cold bootstrap an empty (or ``in_progress``) ``state.db`` from Gmail.
@@ -146,6 +147,11 @@ def bootstrap_index(
     Never labels or archives existing mail. On completion the store is a WARM
     store: schema/fingerprint/account/exclusion meta are all written so the next
     boot loads the join directly.
+
+    ``gmail_account_id`` binds the store to this mailbox. It is written before
+    ``bootstrap_status=complete`` so that on the next boot ``decide_startup`` --
+    which requires a non-empty stored account equal to the live one -- reads the
+    freshly built store as WARM rather than INCOMPATIBLE.
     """
     # watch() FIRST, before reading a single message, so the pinned historyId
     # boundary reflects start-of-service. Anything at-or-before it is existing =
@@ -184,8 +190,13 @@ def bootstrap_index(
             if n % 100 == 0:
                 log(f"Bootstrap: {n} messages embedded")
 
-    # Stamp the store as a complete, WARM-eligible store.
+    # Stamp the store as a complete, WARM-eligible store. gmail_account_id must
+    # be written before bootstrap_status=complete: decide_startup requires a
+    # non-empty stored account equal to the live one, so a store marked complete
+    # without it would read back as INCOMPATIBLE on the very next boot.
     store.set_meta("state_schema_version", STATE_SCHEMA_VERSION)
+    if gmail_account_id is not None:
+        store.set_meta("gmail_account_id", gmail_account_id)
     store.set_meta("ml_fingerprint",
                    compute_ml_fingerprint(embedder.model_name, embedder.dimension))
     store.set_meta("excluded_labels_hash", compute_excluded_hash(excluded))

@@ -103,6 +103,21 @@ def test_bootstrap_builds_index_from_labels_and_skip(tmp_path):
     store.close()
 
 
+def test_bootstrap_persists_account_id_before_complete(tmp_path):
+    """gmail_account_id must be written by the time the store is marked complete,
+    or decide_startup rejects the freshly built store as INCOMPATIBLE."""
+    client = _FakeClient(labels={"L_A": ("A", ["a1"])}, inbox=[])
+    store = _store(tmp_path)
+    bootstrap.bootstrap_index(
+        client, _FakeEmbedder(), store,
+        excluded=set(), max_per_label=200, topic="topic",
+        gmail_account_id="me@x.com",
+    )
+    assert store.get_bootstrap_status() == "complete"
+    assert store.get_meta("gmail_account_id") == "me@x.com"
+    store.close()
+
+
 def test_bootstrap_watch_pins_boundary_before_any_get(tmp_path):
     """watch() must run before the first get_message, so the pinned historyId
     boundary reflects start-of-service, not end-of-bootstrap."""

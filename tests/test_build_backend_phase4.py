@@ -19,9 +19,11 @@ import pytest
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.state_store import (
     STATE_SCHEMA_VERSION,
+    StartupDecision,
     StateStore,
     compute_excluded_hash,
     compute_ml_fingerprint,
+    decide_startup,
 )
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -104,6 +106,31 @@ def test_bootstrap_decision_fetches_and_warms(tmp_path):
     assert by_id == {"a1": "A", "a2": "A", "i1": SKIP_LABEL}
     assert backend.store.get_bootstrap_status() == "complete"
     backend.close()
+
+
+def test_bootstrap_then_reopen_is_warm(tmp_path):
+    """A freshly bootstrapped store must read back as WARM on the next boot, not
+    INCOMPATIBLE. decide_startup requires a non-empty stored account id equal to
+    the live one, so bootstrap must persist gmail_account_id before completing."""
+    client = _FakeClient(email="me@x.com", labels={"L_A": ("A", ["a1"])}, inbox=["i1"])
+    emb = _FakeEmbedder()
+    args = _args(tmp_path)
+
+    backend = cal._build_backend(args, set(), client, emb)
+    assert backend.store.get_meta("gmail_account_id") == "me@x.com"
+    backend.close()
+
+    # Reopen the file and re-run the decision the way _build_backend would.
+    reopened = StateStore(args.state_db)
+    decision = decide_startup(
+        reopened,
+        schema_version=STATE_SCHEMA_VERSION,
+        ml_fingerprint=_ml(emb),
+        excluded_hash=compute_excluded_hash(set()),
+        gmail_account_id="me@x.com",
+    )
+    reopened.close()
+    assert decision is StartupDecision.WARM
 
 
 # --------------------------------------------------------------------------
