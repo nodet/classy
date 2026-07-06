@@ -105,10 +105,14 @@ def _build_backend(args, excluded, client, embedder):
     the backend choice; callers downstream see just a StorageBackend.
 
     Legacy is today's three-DB adapter. State opens the single state.db and
-    dispatches on its persisted meta: only the **warm** path (a populated,
-    fingerprint-matching store) is wired in this phase -- the Gmail-backed
-    bootstrap/rebuild/reconcile paths fail closed with a clear message rather
-    than silently loading stale state (they land in Phase 4).
+    dispatches on its persisted meta:
+
+    - WARM -> load the join directly.
+    - BOOTSTRAP -> cold-fetch from Gmail into the (empty) store, then warm.
+    - REBUILD -> ML fingerprint changed; re-embed into state.rebuild.db and
+      atomically swap it in (carrying the cursor forward).
+    - RECONCILE -> excluded-label set changed; cheap membership fix in place.
+    - INCOMPATIBLE -> schema/account mismatch; a hard stop (fail closed).
 
     ``client``/``embedder`` are the already-authenticated Gmail client and the
     embedder, so the state path can validate the store against the *actual*
@@ -145,15 +149,92 @@ def _build_backend(args, excluded, client, embedder):
         excluded_hash=compute_excluded_hash(excluded),
         gmail_account_id=gmail_account_id,
     )
-    if decision is not StartupDecision.WARM:
+
+    if decision is StartupDecision.WARM:
+        return backend
+
+    if decision is StartupDecision.INCOMPATIBLE:
+        # Schema or account mismatch: the file is unusable as-is and there is no
+        # safe automatic recovery (a wrong-account DB must not be silently
+        # rebuilt over). Fail closed; the operator resets explicitly.
         backend.close()
         print(
-            f"State backend needs the '{decision.value}' path, which is not "
-            "wired yet (Phase 4). Only a populated, fingerprint-matching "
-            "state.db (warm start) is supported in this phase."
+            "State backend is INCOMPATIBLE with this mailbox/config (schema or "
+            "account mismatch). Refusing to load or overwrite it; run "
+            "'make reset-state' to bootstrap fresh."
         )
         sys.exit(1)
-    return backend
+
+    from gmail_classifier import bootstrap as _bootstrap
+
+    if decision is StartupDecision.BOOTSTRAP:
+        # Empty/interrupted store: cold-fetch from Gmail. watch() is pinned
+        # first inside bootstrap_index so pre-existing mail stays read-only.
+        print("State backend: bootstrapping from Gmail (first boot)...")
+        _bootstrap.bootstrap_index(
+            client, embedder, backend.store,
+            excluded=excluded, max_per_label=args.max_per_label,
+            topic=PUBSUB_TOPIC, log=lambda m: print(f"  {m}", flush=True),
+        )
+        return backend
+
+    if decision is StartupDecision.RECONCILE:
+        # Excluded-label config changed: cheap membership fix, no re-embed of
+        # retained ids.
+        print("State backend: reconciling excluded-label change...")
+        _bootstrap.reconcile_exclusions(
+            client, embedder, backend.store,
+            excluded=excluded, max_per_label=args.max_per_label,
+            log=lambda m: print(f"  {m}", flush=True),
+        )
+        return backend
+
+    if decision is StartupDecision.REBUILD:
+        # ML fingerprint changed: vectors are stale, label map + cursor are not.
+        # Build state.rebuild.db, then atomically swap it in.
+        print("State backend: ML changed, rebuilding embeddings from Gmail...")
+        return _rebuild_and_swap(args, excluded, client, embedder, backend)
+
+    # Defensive: decide_startup returns only the enum members handled above.
+    backend.close()
+    raise ValueError(f"unhandled startup decision: {decision!r}")
+
+
+def _rebuild_db_path(state_db: str) -> str:
+    """``data/state.db`` -> ``data/state.rebuild.db`` (same dir/filesystem so the
+    swap is an atomic rename, not a cross-device copy)."""
+    if state_db.endswith(".db"):
+        return state_db[:-3] + ".rebuild.db"
+    return state_db + ".rebuild"
+
+
+def _rebuild_and_swap(args, excluded, client, embedder, backend):
+    """Re-embed into state.rebuild.db, close both, atomically swap, reopen.
+
+    The old state.db is never removed before the validated replacement is in
+    place; a crash mid-rebuild leaves the old store untouched (the rebuild store
+    lacks the completed fingerprint, so it would not validate as WARM anyway).
+    """
+    from gmail_classifier import bootstrap as _bootstrap
+    from gmail_classifier.state_store import StateBackend
+
+    rebuild_path = _rebuild_db_path(args.state_db)
+    # Start the rebuild from a clean file so a stale prior attempt can't leak in.
+    for path in (rebuild_path, rebuild_path + "-wal", rebuild_path + "-shm",
+                 rebuild_path + "-journal"):
+        if os.path.exists(path):
+            os.remove(path)
+
+    rebuild_backend = StateBackend(rebuild_path, excluded)
+    _bootstrap.rebuild_index(
+        client, embedder, backend.store, rebuild_backend.store,
+        log=lambda m: print(f"  {m}", flush=True),
+    )
+    # Close BOTH connections before renaming so no -wal/-shm is orphaned.
+    backend.close()
+    rebuild_backend.close()
+    _bootstrap.atomic_swap_state_db(args.state_db, rebuild_path)
+    return StateBackend(args.state_db, excluded)
 
 
 def main():
@@ -204,6 +285,11 @@ def main():
         "--storage", choices=["legacy", "state"],
         default=os.environ.get("CLASSY_STORAGE", "legacy"),
         help="Storage backend (default: legacy, or $CLASSY_STORAGE)",
+    )
+    parser.add_argument(
+        "--max-per-label", type=int, default=200,
+        help="State backend: max messages to bootstrap per label and for the "
+             "skip pool (default: 200). Bounds first-boot fetch size.",
     )
     args = parser.parse_args()
     _validate_storage_mode(args)
@@ -383,9 +469,10 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     # no per-message historyId, so it cannot enforce the read-only boundary, and
     # known_ids is incomplete when the skip pool is only sampled -- so a sweep
     # could label/archive pre-boundary backlog. State catches up via history
-    # replay from its durable cursor instead; read-only resync (for expired /
-    # out-of-window cursors) lands in Phase 4, so until then state fails closed
-    # rather than falling back to a labeling inbox poll.
+    # replay from its durable cursor instead; the read-only resync (for expired /
+    # out-of-window cursors, gated on WARM_RECOVERY_WINDOW) is a later increment,
+    # so until then state fails closed rather than falling back to a labeling
+    # inbox poll.
     if is_legacy:
         # Do an initial inbox check to catch anything missed.
         print("Initial inbox check...")
@@ -414,8 +501,8 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         if not is_legacy:
             raise NotImplementedError(
                 "state backend history-expiry recovery (read-only resync + "
-                "re-pin) is not implemented yet (Phase 4); refusing to fall "
-                "back to a labeling inbox poll that could archive backlog."
+                "re-pin) is not implemented yet; refusing to fall back to a "
+                "labeling inbox poll that could archive backlog."
             )
         _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
                      self_labeled)

@@ -186,10 +186,16 @@ class StateStore:
     """
 
     def __init__(self, db_path: str, now_ms: Optional[Callable[[], int]] = None):
+        self.db_path = db_path
         self._conn = sqlite3.connect(db_path)
         # Injected clock keeps last_processed_at deterministic in tests.
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._create_tables()
+
+    def now_ms(self) -> int:
+        """The store's clock (injected in tests). Bootstrap stamps its own meta
+        timestamps from this so they stay consistent with the cursor's."""
+        return self._now_ms()
 
     def _create_tables(self) -> None:
         self._conn.executescript(
@@ -262,6 +268,39 @@ class StateStore:
         Inbox/history processing skips these so already-seen mail isn't
         re-classified."""
         return {r[0] for r in self._conn.execute("SELECT message_id FROM labels")}
+
+    def iter_labels(self) -> Iterator[Tuple[str, str, Optional[str], Optional[str]]]:
+        """Yield ``(message_id, label_id, label_name, source)`` for every label
+        row. Used by the ML rebuild to re-embed each id under its *existing*
+        label -- a fingerprint mismatch invalidates vectors, not membership."""
+        return iter(self._conn.execute(
+            "SELECT message_id, label_id, label_name, source FROM labels"
+        ).fetchall())
+
+    def label_names(self) -> Set[str]:
+        """Distinct real (non-skip) label-name snapshots present in the store.
+        Drives the exclusion reconcile: which configured labels are already
+        represented vs. newly included."""
+        return {
+            r[0] for r in self._conn.execute(
+                "SELECT DISTINCT label_name FROM labels WHERE label_id != ? "
+                "AND label_name IS NOT NULL", (SKIP_LABEL,)
+            )
+        }
+
+    def remove_labels_by_name(self, names: Set[str]) -> int:
+        """Delete every label row whose ``label_name`` is in ``names`` (a now-
+        excluded set). Embeddings are left cached; the join simply stops
+        including them. Returns the number of rows removed."""
+        if not names:
+            return 0
+        placeholders = ",".join("?" for _ in names)
+        cur = self._conn.execute(
+            f"DELETE FROM labels WHERE label_name IN ({placeholders})",
+            tuple(names),
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     def skip_vote_ids(self) -> Set[str]:
         """Only ids whose ``label_id`` is ``__skip__`` -- the negative examples
