@@ -48,8 +48,35 @@ Semantic auto-labeling for Gmail using KNN on email embeddings.
    make service-logs      # watch output
    ```
 
-For detailed launchd configuration, see [mac_uv_launchd_service_plan.md](mac_uv_launchd_service_plan.md).
 For GCP/Gmail API setup, see [docs/gmail-setup.md](docs/gmail-setup.md).
+
+### macOS service notes
+
+`make service-install` generates three files under `~/bin` and
+`~/Library/LaunchAgents`:
+
+- **Runner** (`~/bin/gmail-classifier-runner`) — sets up the environment,
+  combines stdout+stderr into one log, and `exec`s `uv run`.
+- **Plist** (`~/Library/LaunchAgents/com.xnodet.gmail-classifier.plist`) —
+  `KeepAlive=true` so launchd restarts it on crash; `RunAtLoad` starts it at
+  login.
+- **Control script** (`~/bin/gmail-classifierctl`) — wraps `launchctl`
+  bootstrap/bootout/kickstart into `start`/`stop`/`restart`/`reload`/`status`/
+  `logs`/`rotate-log`/`enable`/`disable`.
+
+Use `bootout` (via `make service-stop`) to stop — a plain `kill` under
+`KeepAlive=true` just respawns the process. `make service-restart` uses
+`kickstart -k` for an atomic restart.
+
+**Troubleshooting** if the service starts in Terminal but not from launchd:
+
+- Validate the plist: `plutil -lint ~/Library/LaunchAgents/com.xnodet.gmail-classifier.plist`
+- Check the log: `make service-logs` (or `tail -F ~/Library/Logs/com.xnodet.gmail-classifier.log`)
+- Check launchd state: `launchctl print gui/$(id -u)/com.xnodet.gmail-classifier`
+- Common causes: wrong `uv` path (use `command -v uv`), missing credentials,
+  environment variables that exist in your shell but not under launchd (make
+  them explicit in the runner or plist), or macOS privacy controls blocking
+  access to files.
 
 ## How it works
 
