@@ -74,7 +74,8 @@ def _validate_storage_mode(args):
     replay from its durable cursor and never label/archive pre-boundary backlog.
     ``--mode`` defaults to poll while ``--storage``/``$CLASSY_STORAGE`` can be
     state, so guard here rather than trusting the pubsub-only sweep gate. Fail
-    closed until the read-only resync path lands (Phase 4).
+    closed until the read-only resync path lands (a later increment, not in
+    Phase 4).
 
     Also validate the storage value itself: argparse only enforces ``choices``
     for values typed on the command line, not for the default -- and the default
@@ -463,13 +464,14 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     # sweep, that mail would never be seen at all. A warm-looking state.db with no
     # last_processed_history_id is therefore a bug (bootstrap should have pinned
     # one); fail closed rather than start from an arbitrary boundary. The
-    # read-only resync that recovers a missing/expired cursor lands in Phase 4.
+    # read-only resync that recovers a missing/expired cursor is a later
+    # increment (not in Phase 4).
     if not is_legacy and not resume_id:
         raise SystemExit(
             "state backend has no durable history cursor to resume from; "
             "starting at the fresh watch boundary would silently skip all "
-            "prior history. Bootstrap must pin last_processed_history_id "
-            "(Phase 4); refusing to start."
+            "prior history. Bootstrap must pin last_processed_history_id; "
+            "refusing to start."
         )
 
     history_id = resume_id or watch_history_id
