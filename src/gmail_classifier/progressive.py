@@ -171,7 +171,7 @@ class ProgressiveBootstrap:
             # ids on resume) jumps _pos to a non-round value like 175.
             self._last_logged = self._pos - (self._pos % PROGRESS_LOG_INTERVAL)
             self.log(f"Bootstrap: {self._last_logged}/{total} "
-                     f"({self._built} embedded)")
+                     f"({self._built} embedded since restart)")
 
     def _finalize(self) -> None:
         """Stamp the store complete exactly once, when the work-list is drained.
