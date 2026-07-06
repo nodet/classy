@@ -818,3 +818,35 @@ def test_non_idle_pull_does_not_call_heartbeat():
                       subscriber=sub)
     run_iteration(state, deps)
     assert seen == []
+
+
+def test_idle_heartbeat_advance_carries_into_loop_history_id():
+    """When the heartbeat advances the durable cursor on an idle pull, the loop
+    adopts the same id in-memory: LoopState.history_id moves to it, and the next
+    non-idle iteration calls get_history from the advanced id (not the stale one
+    the heartbeat superseded). Guards against a durable/in-memory cursor split."""
+    client = FakeClient(history_result=[object()], history_latest="700")
+    # Idle pull first (drives the heartbeat), then a real notification.
+    sub = FakeSubscriber(actions=[[], [Notification("650")]])
+    deps, _ = make_deps(client, lambda: sub,
+                        heartbeat=lambda now_ms: "600")
+
+    state = LoopState(history_id="500", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    state = run_iteration(state, deps)          # idle pull -> heartbeat advances
+    assert state.history_id == "600"            # in-memory cursor kept in lock-step
+
+    state = run_iteration(state, deps)          # next real notification
+    assert client.get_history_calls == ["600"]  # replays from the advanced id
+
+
+def test_idle_heartbeat_no_advance_keeps_history_id():
+    """A heartbeat that does not advance (returns None) leaves history_id as-is."""
+    client = FakeClient()
+    sub = FakeSubscriber(actions=[[]])
+    deps, _ = make_deps(client, lambda: sub, heartbeat=lambda now_ms: None)
+
+    state = LoopState(history_id="500", expiration=10**18, backoff=0,
+                      subscriber=sub)
+    state = run_iteration(state, deps)
+    assert state.history_id == "500"

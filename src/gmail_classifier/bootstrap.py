@@ -435,14 +435,23 @@ def read_only_resync(
     The two "don't take bulk actions" triggers -- too much wall-clock elapsed and
     a cursor aged out of Gmail's history window -- share this one path. It:
 
-    1. **Reconciles labels from Gmail as training truth.** Compute the current
-       Gmail snapshot (included labels + a fresh skip sample, the same listing
-       bootstrap uses), then reconcile the store to it: drop rows no longer in
-       the snapshot (a label removed in Gmail, or a message that fell out of the
-       sample), rewrite rows whose label changed, and reuse cached embeddings --
-       re-fetching + embedding only ids never embedded before. It **never** calls
+    1. **Canonicalizes the store to Gmail's current capped snapshot.** Compute
+       the current snapshot (included labels + a fresh skip sample, each capped
+       at ``max_per_label`` newest-first, the same listing bootstrap uses), then
+       make the store equal to it: rewrite rows whose label changed, reuse cached
+       embeddings (re-fetching + embedding only ids never embedded before), and
+       **remove every stored row absent from the snapshot**. It **never** calls
        ``apply_label``/archive: it ingests Gmail's *current* label state, it does
        not classify.
+
+       "Absent from the snapshot" means canonicalized-away, NOT "Gmail says
+       unlabeled". A row is dropped both when Gmail truly no longer labels it and
+       when it merely fell outside the ``max_per_label`` newest-first window for
+       its label. This is deliberate bounded-snapshot behavior -- resync re-pins
+       the training map to a bounded per-label coreset rather than growing it
+       unboundedly across recoveries -- but it means an older Gmail-labeled
+       message can leave the training map on resync even though Gmail still labels
+       it. Absence from a capped listing is not evidence of absence from Gmail.
     2. **Re-pins a fresh boundary.** ``watch()`` returns a new historyId;
        :meth:`StateStore.repin_boundary` persists boundary + cursor + timestamp
        in one transaction, leaving ``bootstrap_status`` complete (so the next
@@ -463,12 +472,16 @@ def read_only_resync(
         for mid, label_id, label_name, source in worklist
     }
 
-    # Drop stale rows first (their embeddings stay cached for possible reuse).
-    stale = store.known_ids() - set(desired)
-    for mid in stale:
+    # Canonicalize to the capped snapshot: drop every stored row not in it. This
+    # covers rows Gmail truly dropped AND rows that fell outside the per-label
+    # newest-first cap -- resync bounds the training map to a coreset rather than
+    # growing it across recoveries (see the docstring). Embeddings stay cached for
+    # possible reuse.
+    dropped = store.known_ids() - set(desired)
+    for mid in dropped:
         store.remove_label(mid)
-    if stale:
-        log(f"Resync: removed {len(stale)} stale label row(s)")
+    if dropped:
+        log(f"Resync: removed {len(dropped)} row(s) outside the snapshot")
 
     # Upsert the current snapshot: rewrite changed labels, reuse cached vectors,
     # fetch+embed only never-seen ids. overwrite_label defaults True so a
@@ -495,16 +508,24 @@ def read_only_resync(
 def heartbeat_cursor(
     client, store: StateStore, now_ms: int,
     log: Callable[..., None] = _noop,
-) -> bool:
+) -> Optional[str]:
     """Refresh the durable cursor's timestamp on a quiet-but-live mailbox so it
     never *reaches* ``WARM_RECOVERY_WINDOW`` and forces a resync it did not need
-    (Phase 6). Returns ``True`` iff it advanced the cursor.
+    (Phase 6). Returns the new history id iff it advanced the cursor, else
+    ``None``.
 
     Only acts once the cursor's age reaches ``HEARTBEAT_INTERVAL``: does a no-op
     ``get_history`` from the current cursor and, **only if it is still valid and
     returns no pending updates**, persists the returned history id + a fresh
     ``last_processed_at`` (one transaction, via
     :meth:`StateStore.set_last_processed_history_id`).
+
+    Returning the advanced id lets the caller keep its *in-memory* loop cursor in
+    lock-step with the durable one: without it the durable cursor could move to
+    the confirmed-empty ``latest`` while the running loop kept replaying from the
+    old id, and the next real notification would call ``get_history`` on a cursor
+    the heartbeat had already superseded -- risking a needless expiry/resync even
+    though the durable cursor is fresh.
 
     Liveness is not progress: a Pub/Sub pull timing out must not refresh the
     timestamp -- only a confirmed-empty history read does. If ``get_history``
@@ -515,15 +536,16 @@ def heartbeat_cursor(
     cursor = store.get_last_processed_history_id()
     last_at = store.get_last_processed_at()
     if cursor is None or last_at is None:
-        return False
+        return None
     if now_ms - last_at < HEARTBEAT_INTERVAL:
-        return False
+        return None
     try:
         events, latest = client.get_history(cursor)
     except HistoryExpiredError:
-        return False
+        return None
     if events:
-        return False
-    store.set_last_processed_history_id(latest or cursor)
+        return None
+    advanced = latest or cursor
+    store.set_last_processed_history_id(advanced)
     log("Heartbeat: refreshed idle cursor timestamp")
-    return True
+    return advanced

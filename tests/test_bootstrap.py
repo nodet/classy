@@ -542,6 +542,31 @@ def test_resync_removes_label_deleted_in_gmail(tmp_path):
     store.close()
 
 
+def test_resync_canonicalizes_to_capped_snapshot(tmp_path):
+    """A stored id that STILL carries its Gmail label but falls outside the
+    per-label newest-first cap is dropped from the training map. This is the
+    deliberate bounded-snapshot behavior: resync re-pins to a per-label coreset
+    (size max_per_label) rather than growing the map across recoveries. Absence
+    from the capped listing is NOT evidence of absence from Gmail -- so this
+    documents/pins the trade-off explicitly."""
+    # Gmail labels both a1 (newest) and a0 (older) under L_A, but the cap is 1, so
+    # list_message_ids returns only the newest -> a1.
+    client = _FakeClient(labels={"L_A": ("A", ["a1", "a0"])}, inbox=[])
+    store = _complete_store(tmp_path)
+    # The store already knew the older one from a prior, larger sample.
+    store.upsert_label("a0", "L_A", "A", source="user")
+    store.upsert_embedding("a0", np.full(8, 1.0, dtype=np.float32))
+
+    bootstrap.read_only_resync(client, _FakeEmbedder(), store, topic="topic",
+                               excluded=set(), max_per_label=1)
+    by_id = {mid: label for mid, _v, label in store.iter_index()}
+    # a0 is canonicalized away even though Gmail still labels it; only the newest
+    # (a1) is kept.
+    assert by_id == {"a1": "A"}
+    assert "a0" not in store.known_ids()
+    store.close()
+
+
 def test_resync_rewrites_changed_label(tmp_path):
     """A stored id whose Gmail label changed from A to B is rewritten to B."""
     client = _FakeClient(labels={"L_B": ("B", ["m1"])}, inbox=[])
@@ -644,7 +669,7 @@ def test_heartbeat_refreshes_idle_cursor_when_due(tmp_path):
 
     clock[0] = bootstrap.HEARTBEAT_INTERVAL   # now due
     advanced = bootstrap.heartbeat_cursor(client, store, now_ms=clock[0])
-    assert advanced is True
+    assert advanced == "600"                  # returns the advanced id
     assert client.get_history_calls == ["500"]
     assert store.get_last_processed_history_id() == "600"
     assert store.get_last_processed_at() == bootstrap.HEARTBEAT_INTERVAL
@@ -657,7 +682,7 @@ def test_heartbeat_noop_before_interval(tmp_path):
     client = _HistoryClient(events=[], latest="600")
     advanced = bootstrap.heartbeat_cursor(client, store,
                                           now_ms=bootstrap.HEARTBEAT_INTERVAL - 1)
-    assert advanced is False
+    assert advanced is None
     assert client.get_history_calls == []
     assert store.get_last_processed_history_id() == "500"  # unchanged
     store.close()
@@ -670,7 +695,7 @@ def test_heartbeat_does_not_advance_when_events_pending(tmp_path):
     client = _HistoryClient(events=[object()], latest="600")
     advanced = bootstrap.heartbeat_cursor(client, store,
                                           now_ms=bootstrap.HEARTBEAT_INTERVAL)
-    assert advanced is False
+    assert advanced is None
     assert store.get_last_processed_history_id() == "500"  # unchanged
     store.close()
 
@@ -682,7 +707,7 @@ def test_heartbeat_swallows_expired_history_for_the_resync_path(tmp_path):
     client = _HistoryClient(exc=HistoryExpiredError("too old"))
     advanced = bootstrap.heartbeat_cursor(client, store,
                                           now_ms=bootstrap.HEARTBEAT_INTERVAL)
-    assert advanced is False
+    assert advanced is None
     assert store.get_last_processed_history_id() == "500"  # unchanged
     store.close()
 
@@ -691,6 +716,6 @@ def test_heartbeat_noop_without_cursor(tmp_path):
     store = _store(tmp_path)  # no cursor at all
     client = _HistoryClient(events=[], latest="600")
     assert bootstrap.heartbeat_cursor(client, store,
-                                      now_ms=WARM_RECOVERY_WINDOW) is False
+                                      now_ms=WARM_RECOVERY_WINDOW) is None
     assert client.get_history_calls == []
     store.close()

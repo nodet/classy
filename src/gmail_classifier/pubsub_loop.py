@@ -81,9 +81,11 @@ class LoopDeps:
     # Quiet-mailbox heartbeat (Phase 6, state only): called with the current
     # wall-clock ms on an idle pull. It refreshes the durable cursor's timestamp
     # once the cursor's age nears WARM_RECOVERY_WINDOW so a live-but-idle service
-    # never forces a needless read-only resync. Default no-op keeps legacy and
-    # existing tests unchanged.
-    heartbeat: Callable[[int], None] = lambda now_ms: None
+    # never forces a needless read-only resync. Returns the advanced history id
+    # when a confirmed-empty read moved the durable cursor (so the loop can keep
+    # its in-memory cursor in lock-step), else None. Default no-op returns None,
+    # keeping legacy and existing tests unchanged.
+    heartbeat: Callable[[int], Optional[str]] = lambda now_ms: None
     # Persist the advanced history cursor BEFORE acking. On state this is a
     # durable write (so a crash-before-ack replays from it); on legacy it is
     # process-local, so restarts keep fresh-watch. Default no-op preserves the
@@ -168,8 +170,13 @@ def run_iteration(state: LoopState, deps: LoopDeps) -> LoopState:
             # a live-but-idle service never forces a needless read-only resync.
             # An idle pull is genuine liveness -- but the heartbeat only advances
             # the cursor after a confirmed-empty history read, not merely because
-            # the pull returned nothing (liveness != progress).
-            deps.heartbeat(deps.now_ms())
+            # the pull returned nothing (liveness != progress). When it does
+            # advance the durable cursor, adopt the same id in-memory so the next
+            # real notification replays from the fresh cursor, not the superseded
+            # one (which would risk a needless expiry/resync).
+            advanced = deps.heartbeat(deps.now_ms())
+            if advanced is not None:
+                history_id = advanced
             return LoopState(history_id, expiration, backoff, subscriber)
 
         # Fallback pointer if the history response carries no id of its own.
