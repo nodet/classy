@@ -1,27 +1,17 @@
 """State storage backend: the single-file ``state.db`` layout (derived-only).
 
-This is the second ``StorageBackend`` implementation (see ``storage_backend.py``).
-Where the legacy backend keeps three DBs and persists message bodies, the state
-backend keeps **one** SQLite file that stores only *derived* runtime state --
-message ids, label ids/names, and embedding vectors. No bodies, subjects, or
-senders are ever written here. The runtime ``TrainingIndex`` is the join
+One SQLite file that stores only *derived* runtime state -- message ids, label
+ids/names, and embedding vectors. No bodies, subjects, or senders are ever
+written here. The runtime ``TrainingIndex`` is the join
 ``embeddings ⋈ labels on message_id``.
 
 It opens **only** ``state.db`` / ``state.rebuild.db`` (and their SQLite
-sidecars). It never touches ``training.db`` / ``inbox_sample.db`` /
-``embeddings.db`` -- there is deliberately no migration path between the
-backends (coexistence invariant #1).
+sidecars).
 
-Phase 3 wires the **warm path** only: a populated ``state.db`` (seeded for
-tests, or bootstrapped by a later phase) loads its index from the join and
-resumes from its durable history cursor. Cold bootstrap and Gmail-backed
-rebuild/reconcile land in Phase 4; the progressive/maturity logic in Phase 5.
-
-Unlike the legacy adapter, the history cursor here is **durable** (persisted in
-``meta``), so a restart replays Gmail history from where it left off rather than
-re-``watch()``ing fresh. Every durable cursor write also stamps
-``last_processed_at`` in the *same* transaction, so a later phase can measure
-the downtime gap accurately.
+The history cursor is **durable** (persisted in ``meta``), so a restart replays
+Gmail history from where it left off rather than re-``watch()``ing fresh. Every
+durable cursor write also stamps ``last_processed_at`` in the *same*
+transaction, so the downtime gap can be measured accurately.
 """
 from __future__ import annotations
 
@@ -40,11 +30,31 @@ from gmail_classifier.classifier import (
     MIN_EXAMPLES_PER_LABEL,
     SKIP_LABEL,
 )
+from dataclasses import dataclass
+
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.models import Message
-from gmail_classifier.storage_backend import LoadedIndex
-from gmail_classifier.training import AssemblyStats
 from gmail_classifier.training_index import TrainingIndex
+
+
+@dataclass
+class AssemblyStats:
+    """Counts from assembling the startup training index."""
+    n_train: int
+    n_skip: int
+    n_dropped: int
+
+
+@dataclass
+class LoadedIndex:
+    """What a backend returns from load_index.
+
+    ``skip_ids`` is the set of message ids the live loop must not re-classify.
+    ``stats`` carries the counts the caller logs at startup.
+    """
+    index: TrainingIndex
+    skip_ids: Set[str]
+    stats: AssemblyStats
 
 # Bumped whenever the state.db schema changes shape. Checked independently of
 # the ML fingerprint (a schema bump means the file layout itself is stale).

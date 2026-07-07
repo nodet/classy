@@ -3,27 +3,9 @@ set -euo pipefail
 
 # Deploy gmail-classifier to GCP e2-micro VM.
 #
-# Usage: gcp-deploy.sh [legacy|state]
-#
-# The backend argument (default: legacy) selects which StorageBackend the
-# service starts with and, crucially, WHAT this deploy ships:
-#   legacy - today's deploy: code + the three DBs (training/inbox_sample/
-#            embeddings), started with --storage legacy.
-#   state  - code + credentials ONLY (no data/*.db); the VM bootstraps from
-#            Gmail on first boot, started with --storage state.
-#
-# Deploy SELECTS a backend, it never DESTROYS the other's data (coexistence
-# invariant #3): the tarball is built with --exclude='data' and untarred *over*
-# INSTALL_DIR, and `tar x` never deletes files absent from the archive -- so
-# state.db survives a legacy deploy and the three legacy DBs survive a state
-# deploy. Each backend's data sync list is explicit below (legacy uploads only
-# its three DBs; state uploads none), so neither can overwrite the other's files.
-
-BACKEND="${1:-legacy}"
-if [[ "$BACKEND" != "legacy" && "$BACKEND" != "state" ]]; then
-    echo "Error: backend must be 'legacy' or 'state' (got '$BACKEND')."
-    exit 1
-fi
+# Ships code + credentials only (no data/*.db). The VM bootstraps state.db
+# from Gmail on first boot; an existing state.db is preserved across redeploys
+# (fast restart, no re-bootstrap).
 
 GCP_PROJECT="classy-498012"
 GCP_ZONE="us-central1-a"
@@ -34,53 +16,16 @@ INSTALL_DIR="/opt/gmail-classifier"
 PROJECT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 cd "$PROJECT_DIR"
 
-echo "Deploying with the '$BACKEND' storage backend."
-
-# --- Guards (credentials are required by both backends) ---
+# --- Guards (credentials are required) ---
 
 if [[ ! -f "credentials/token.json" ]]; then
-    echo "Error: credentials/token.json missing. Run 'make fetch-training' to trigger OAuth."
+    echo "Error: credentials/token.json missing. Run 'make reauth' to trigger OAuth."
     exit 1
 fi
 
 if [[ ! -f "credentials/client_secret.json" ]]; then
     echo "Error: credentials/client_secret.json missing."
     exit 1
-fi
-
-# --- Backend-specific data guards ---
-#
-# Legacy ships prebuilt DBs, so it must verify they exist and the embedding
-# cache is warm. State ships no data (it bootstraps from Gmail), so it requires
-# nothing beyond the credentials guarded above -- the whole point is a
-# code+credentials-only deploy.
-mtime() {
-    if [[ "$(uname)" == "Darwin" ]]; then stat -f%m "$1"; else stat -c%Y "$1"; fi
-}
-if [[ "$BACKEND" == "legacy" ]]; then
-    if [[ ! -s "data/training.db" ]]; then
-        echo "Error: data/training.db missing or empty. Run 'make fetch-training' first."
-        exit 1
-    fi
-
-    if [[ ! -s "data/inbox_sample.db" ]]; then
-        echo "Error: data/inbox_sample.db missing or empty. Run 'make fetch-inbox' first."
-        exit 1
-    fi
-
-    # Guard against shipping a stale embedding cache. If embeddings.db is missing
-    # or older than training.db, the VM re-embeds every uncached message at
-    # startup -- minutes of 100% CPU on the e2-micro and a peak-RSS spike that has
-    # OOM-crashed the service before. Rebuild locally with 'make embed' first.
-    if [[ ! -s "data/embeddings.db" ]]; then
-        echo "Error: data/embeddings.db missing. Run 'make embed' before deploying."
-        exit 1
-    fi
-    if [[ "$(mtime data/training.db)" -gt "$(mtime data/embeddings.db)" ]]; then
-        echo "Error: data/embeddings.db is older than data/training.db (stale cache)."
-        echo "       Run 'make embed' to rebuild it, then re-deploy."
-        exit 1
-    fi
 fi
 
 # Helper: run command on the VM
@@ -125,10 +70,7 @@ fi
 
 echo "Syncing code..."
 
-# Stamp the running code version. The VM gets no .git (excluded below), so
-# capture it here where the repo exists: a tag if exactly on one, otherwise the
-# short commit id, with a -dirty suffix if tracked files were modified.
-# gcp-status reads this file back from the VM.
+# Stamp the running code version.
 git describe --tags --always --dirty 2>/dev/null > .deployed_version || echo "unknown" > .deployed_version
 
 TARBALL="/tmp/gmail-classifier-code.tar.gz"
@@ -152,79 +94,6 @@ vm_run "sudo mkdir -p $INSTALL_DIR && \
     sudo mkdir -p $INSTALL_DIR/data $INSTALL_DIR/credentials $INSTALL_DIR/.cache && \
     sudo chown -R $SERVICE_USER:$SERVICE_USER $INSTALL_DIR && \
     rm -f /tmp/gmail-classifier-code.tar.gz"
-
-# --- Sync data ---
-
-echo "Syncing data..."
-sync_file() {
-    local local_path="$1"
-    local remote_path="$2"
-    local filename
-    filename=$(basename "$local_path")
-
-    local local_size
-    # macOS stat vs Linux stat
-    if [[ "$(uname)" == "Darwin" ]]; then
-        local_size=$(stat -f%z "$local_path")
-    else
-        local_size=$(stat -c%s "$local_path")
-    fi
-
-    local remote_size
-    remote_size=$(vm_run "stat -c%s $remote_path 2>/dev/null || echo 0")
-
-    if [[ "$local_size" == "$remote_size" ]]; then
-        echo "  $filename: unchanged (${local_size} bytes), skipping."
-    else
-        echo "  $filename: uploading (${local_size} bytes)..."
-        vm_scp "$local_path" "/tmp/$filename"
-        vm_run "sudo mv /tmp/$filename $remote_path && sudo chown $SERVICE_USER:$SERVICE_USER $remote_path"
-    fi
-}
-
-sync_if_newer() {
-    local local_path="$1"
-    local remote_path="$2"
-    local filename
-    filename=$(basename "$local_path")
-
-    local local_mtime
-    if [[ "$(uname)" == "Darwin" ]]; then
-        local_mtime=$(stat -f%m "$local_path")
-    else
-        local_mtime=$(stat -c%Y "$local_path")
-    fi
-
-    local remote_mtime
-    remote_mtime=$(vm_run "stat -c%Y $remote_path 2>/dev/null || echo 0")
-
-    if [[ "$local_mtime" -gt "$remote_mtime" ]]; then
-        echo "  $filename: local is newer, uploading..."
-        vm_scp "$local_path" "/tmp/$filename"
-        vm_run "sudo mv /tmp/$filename $remote_path && sudo chown $SERVICE_USER:$SERVICE_USER $remote_path"
-    else
-        echo "  $filename: VM copy is newer or same, skipping."
-    fi
-}
-
-# The sync list is EXPLICIT per backend (never `data/*.db`), so a legacy deploy
-# can only touch its own three DBs and a state deploy uploads no DB at all --
-# neither can overwrite the other backend's files (coexistence invariant #3).
-if [[ "$BACKEND" == "legacy" ]]; then
-    sync_file "data/training.db" "$INSTALL_DIR/data/training.db"
-    if [[ -s "data/embeddings.db" ]]; then
-        sync_file "data/embeddings.db" "$INSTALL_DIR/data/embeddings.db"
-    fi
-
-    # inbox_sample.db is mutated at runtime (skip pool grows as messages are
-    # seen). Only upload if local copy is newer than the VM's.
-    sync_if_newer "data/inbox_sample.db" "$INSTALL_DIR/data/inbox_sample.db"
-else
-    # State backend: ship no data. The VM bootstraps state.db from Gmail on
-    # first boot; any existing state.db on the VM is left untouched so a redeploy
-    # preserves it (fast restart, no re-bootstrap).
-    echo "  (state backend: no DB upload; VM bootstraps from Gmail)"
-fi
 
 # --- Sync credentials ---
 
@@ -252,18 +121,8 @@ if [[ "$FIRST_DEPLOY" == "true" ]]; then
 fi
 
 # --- Install systemd unit ---
-#
-# The backend is written into the unit's ExecStart (--storage) AND its
-# environment (CLASSY_STORAGE), so it is persisted across restarts: a plain
-# `gcp-restart` keeps whatever backend was last deployed. Rewritten on every
-# deploy, so switching backends is just a redeploy of the other one.
-#
-# Both backends run --mode pubsub. The state backend REQUIRES pubsub (poll mode
-# sweeps and labels the current inbox, which would archive pre-boundary backlog
-# -- rejected by _validate_storage_mode), and legacy has always used pubsub in
-# the systemd service.
 
-echo "Installing systemd service (backend: $BACKEND)..."
+echo "Installing systemd service..."
 vm_run "sudo tee /etc/systemd/system/gmail-classifier.service > /dev/null << UNIT
 [Unit]
 Description=Gmail Semantic Auto-Labeling Classifier
@@ -279,8 +138,7 @@ Group=gmail-classifier
 WorkingDirectory=/opt/gmail-classifier
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/opt/gmail-classifier
-Environment=CLASSY_STORAGE=$BACKEND
-ExecStart=/opt/gmail-classifier/.local/bin/uv run --locked -- python -u scripts/classify_and_label.py --mode pubsub --storage $BACKEND
+ExecStart=/opt/gmail-classifier/.local/bin/uv run --locked -- python -u scripts/classify_and_label.py
 Restart=on-failure
 RestartSec=10
 KillSignal=SIGTERM
@@ -300,5 +158,5 @@ UNIT"
 vm_run "sudo systemctl daemon-reload && sudo systemctl enable gmail-classifier"
 
 echo ""
-echo "Deploy complete (backend: $BACKEND)."
+echo "Deploy complete."
 echo "Start/restart the service with: make gcp-start"

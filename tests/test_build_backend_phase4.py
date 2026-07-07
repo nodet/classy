@@ -102,9 +102,7 @@ class _FakeClient:
 
 def _args(tmp_path, **over):
     base = dict(
-        storage="state",
         state_db=str(tmp_path / "state.db"),
-        training_db="unused", skip_db="unused",
         max_per_label=200,
     )
     base.update(over)

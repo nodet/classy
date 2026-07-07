@@ -7,11 +7,11 @@ from gmail_classifier.models import Message
 
 
 class FakeBackend:
-    """In-memory ``StorageBackend`` for handler tests.
+    """In-memory backend for handler tests.
 
-    Records label/skip upserts in dicts keyed by message id, mirroring the
-    legacy adapter's semantics (labeled-wins/last-write-wins on a given id).
-    Tests assert on ``labeled`` / ``skipped`` instead of on concrete stores.
+    Records label/skip upserts in dicts keyed by message id (last-write-wins on
+    a given id). Tests assert on ``labeled`` / ``skipped`` instead of on
+    concrete stores.
     """
 
     def __init__(self):

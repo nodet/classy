@@ -12,38 +12,30 @@ Semantic auto-labeling for Gmail using KNN on email embeddings.
    make setup
    ```
 
-2. **Set up GCP credentials**
+2. **Set up Gmail credentials**
 
    - Create OAuth2 credentials (see [docs/gmail-setup.md](docs/gmail-setup.md))
    - Place `client_secret.json` in `credentials/`
    - Create Pub/Sub topic + subscription (see [docs/gmail-setup.md](docs/gmail-setup.md))
 
-3. **Fetch training data** (the first run also triggers the OAuth flow)
+3. **Run the classifier** (first run triggers OAuth and bootstraps from Gmail)
 
    ```bash
-   make fetch-training    # downloads labeled emails (opens browser on first run)
-   make fetch-inbox       # downloads inbox as skip examples
+   make watch             # Ctrl+C to stop
    ```
 
-   By default this excludes the labels listed in `config.toml` — edit that
-   first if there are labels you don't want auto-applied (see
-   [Configuration](#configuration)).
+   The first boot fetches your labeled emails from Gmail and builds an
+   embedding index locally (`data/state.db`). This takes 10–20 minutes; the
+   service is live from the first second (new mail arriving during bootstrap
+   is parked and classified once the index matures).
 
-4. **Verify it works interactively**
+   Edit `config.toml` first if there are labels you don't want auto-applied
+   (see [Configuration](#configuration)).
 
-   ```bash
-   make watch-pubsub      # Ctrl+C to stop
-   ```
-
-5. **Install as macOS service**
+4. **Install as macOS service** (optional)
 
    ```bash
    make service-install   # generates runner, plist, control script
-   ```
-
-6. **Start the service**
-
-   ```bash
    make service-start
    make service-logs      # watch output
    ```
@@ -168,11 +160,11 @@ excluded = ["XLC", "XLE", "XLCap"]
 ```
 
 Every command reads exclusions from this file — change the list here to change
-what gets fetched, trained on, and auto-applied everywhere, including the macOS
-and GCP services, on **both** storage backends. `config.toml` ships with the
-code, so on the state backend editing exclusions is a normal code redeploy: the
-next boot reconciles membership (drops now-excluded labels, bootstraps
-newly-included ones) **without** a full re-embed of unchanged messages.
+what gets auto-applied everywhere, including the macOS and GCP services.
+`config.toml` ships with the code, so editing exclusions is a normal code
+redeploy: the next boot reconciles membership (drops now-excluded labels,
+bootstraps newly-included ones) **without** a full re-embed of unchanged
+messages.
 
 ## GCP deployment (always-on)
 
@@ -221,58 +213,22 @@ Deploy to a free-tier e2-micro VM for always-on operation without keeping a lapt
    gcloud config list
    ```
 
-### Two storage backends
-
-The service can run with either of two storage backends, chosen at deploy time.
-They share the same classifier and learn-on-correction behavior; they differ
-only in *what is persisted on the VM* and *what a deploy has to ship*.
-
-| | `legacy` (default) | `state` |
-|---|---|---|
-| On-disk data | three DBs: `training.db`, `inbox_sample.db`, `embeddings.db` (stores message bodies) | one `state.db` (derived only — ids, labels, vectors; **no bodies**) |
-| Deploy ships | code + the three DBs + credentials | **code + credentials only** |
-| First boot | loads the uploaded DBs | **bootstraps from Gmail** (slow first boot, then fast) |
-| Deploy target | `make gcp-deploy-legacy` (or `make gcp-deploy`) | `make gcp-deploy-state` |
-
-The two backends never share files, so switching is a redeploy that **leaves the
-other's data intact** (see [Switching backends](#switching-backends)). If you
-just want today's behavior, use `gcp-deploy` / `gcp-deploy-legacy` — everything
-below the horizontal rule in this section is legacy unless it says otherwise.
-
-### Deploy (legacy backend)
-
-```bash
-make embed             # 1. Build the embedding cache locally (avoids OOM on the VM)
-make gcp-create        # 2. Create the VM
-make gcp-deploy-legacy # 3. Deploy code, data, credentials, install deps
-make gcp-start         # 4. Start the service
-make gcp-status        # 5. Check status
-make gcp-logs          # 6. Tail logs (Ctrl+C to stop)
-make gcp-ssh           # 7. SSH into VM (for debugging)
-make gcp-destroy       # 8. Destroy VM (when no longer needed)
-```
-
-`make gcp-deploy` remains an alias for `make gcp-deploy-legacy`. Deploy stops the
-service before syncing and does **not** restart it; run `make gcp-start`
-afterwards (already step 4 above). To restart an already-deployed service without
-redeploying, use `make gcp-restart`.
-
-### Deploy (state backend)
+### Deploy
 
 ```bash
 make gcp-create        # 1. Create the VM (if not already created)
-make gcp-deploy-state   # 2. Deploy code + credentials only (no DB upload)
+make gcp-deploy        # 2. Deploy code + credentials (no DB upload)
 make gcp-start         # 3. Start the service — it bootstraps from Gmail
 make gcp-logs          # 4. Watch the first-boot bootstrap progress
-make gcp-state-status  # 5. Inspect the derived store (backend, counts, cursor)
+make gcp-state-status  # 5. Inspect the store (counts, cursor, fingerprint)
 ```
 
-The state backend needs **no `make embed` and no DB upload** — the VM fetches
+Deploy ships **code + credentials only** — no data upload. The VM fetches
 labeled mail from Gmail and builds its derived `state.db` on first boot. That
-first boot is slow (roughly 10–20 min while it embeds the corpus, bounded by
-`--max-per-label`), but the service is *live and safe from the first second*: it
-never labels or archives the pre-existing backlog, only mail that arrives after
-it starts. Restarts afterward are fast (it reads `state.db`, no re-fetch).
+first boot is slow (roughly 10–20 min while it embeds the corpus), but the
+service is *live and safe from the first second*: it never labels or archives
+the pre-existing backlog, only mail that arrives after it starts. Restarts
+afterward are fast (it reads `state.db`, no re-fetch).
 
 Because bodies are never persisted, **changing the embedding model or the text
 representation forces a re-fetch**: the next boot notices the fingerprint changed
@@ -281,42 +237,21 @@ forward, no live mail skipped). A pure `config.toml` exclusion change is cheaper
 it reconciles membership without re-embedding.
 
 To wipe and re-bootstrap from scratch: `make gcp-reset-state` (stops the service
-and removes `state.db` + its SQLite sidecars — the legacy DBs are untouched). It
-leaves the service **stopped**, like `make gcp-stop`; run `make gcp-start` when
-you want it to bootstrap fresh from Gmail. Locally, `make reset-state` does the
-same to `data/state.db`.
+and removes `state.db` + its SQLite sidecars). It leaves the service **stopped**;
+run `make gcp-start` when you want it to bootstrap fresh from Gmail. Locally,
+`make reset-state` does the same to `data/state.db`.
 
 `state.db` is private derived data: it holds no bodies/subjects/senders but does
 contain message ids, label ids/names, and embeddings. It is never uploaded from
 the VM by default.
 
-### Switching backends
-
-Switching backend is just a redeploy of the other one — it **selects, never
-destroys**. `make gcp-deploy-state` after running legacy finds the three legacy
-DBs exactly as they were left (the state backend never opens them) and `state.db`
-persists on disk, ignored; `make gcp-deploy-legacy` afterward starts against the
-preserved legacy DBs, and the untouched `state.db` is picked up again on the next
-`gcp-deploy-state`. Only one backend runs at a time — deploy stops the current
-service and rewrites the backend selector (persisted in the systemd unit) before
-starting one process.
-
 ### Updating
 
-After code changes, redeploy with the same backend target you last used
-(`make gcp-deploy-legacy` or `make gcp-deploy-state`) then `make gcp-start`.
+After code changes, redeploy with `make gcp-deploy` then `make gcp-start`.
 Deploy stops the service (to avoid corrupting SQLite files mid-sync), syncs code,
 and installs dependencies, but leaves the service stopped — start it again with
-`make gcp-start`. A redeploy never deletes the other backend's data, and a
-state-backend redeploy preserves `state.db` (fast restart, no re-bootstrap).
-
-On the legacy backend, after retraining on the Mac (`make fetch-training` /
-`make fetch-inbox`), rebuild the embedding cache with `make embed` before
-deploying, otherwise the VM has to embed the newly-fetched messages at startup
-and can run out of memory. `make gcp-deploy-legacy` detects changed databases by
-size/mtime and uploads them. On the state backend, `make fetch-training` /
-`make fetch-inbox` are optional (local-only) — the VM gets its data from Gmail
-directly.
+`make gcp-start`. A redeploy preserves `state.db` (fast restart, no
+re-bootstrap).
 
 ### Debugging
 

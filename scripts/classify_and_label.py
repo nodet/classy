@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """Classify unlabeled inbox messages and apply labels via Gmail API.
 
-Uses training data + inbox snapshot as skip examples to classify
-new messages that aren't in the skip pool.
-
-Modes:
-  poll (default): check inbox every N seconds
-  pubsub: wait for Gmail push notifications via Pub/Sub
+Listens for Gmail push notifications via Pub/Sub, classifies new messages
+using KNN on embeddings, and applies labels. The state backend (state.db)
+bootstraps from Gmail on first boot and maintains a durable history cursor.
 """
 import argparse
 import os
 import signal
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +23,6 @@ from gmail_classifier.history_processor import process_history_events
 from gmail_classifier.label_change_handler import process_label_changes
 from gmail_classifier.label_registry import LabelRegistry
 from gmail_classifier.memory import trim_memory
-from gmail_classifier.storage_legacy import LegacyBackend
 
 PUBSUB_TOPIC = "projects/classy-498012/topics/gmail-notifications"
 PUBSUB_SUBSCRIPTION = "projects/classy-498012/subscriptions/gmail-notifications-sub"
@@ -64,45 +59,6 @@ def deployed_version():
         return "unknown"
 
 
-def _validate_storage_mode(args):
-    """Reject storage/mode combinations that would violate the state backend's
-    read-only boundary.
-
-    Poll mode *is* the labeling inbox path: ``_run_poll_mode`` calls
-    ``_check_inbox`` every interval, which lists the current INBOX and hands it
-    to ``process_inbox`` -- classify + apply labels with ``archive=True`` +
-    record skips. That is correct for legacy (it treats the current inbox as
-    work) but unsafe for the state backend, which must only advance via history
-    replay from its durable cursor and never label/archive pre-boundary backlog.
-    ``--mode`` defaults to poll while ``--storage``/``$CLASSY_STORAGE`` can be
-    state, so guard here rather than trusting the pubsub-only sweep gate. This is
-    permanent: the state backend advances only via history replay (and, on an
-    aged cursor, the read-only resync), never a labeling poll -- so poll mode has
-    no safe meaning for it.
-
-    Also validate the storage value itself: argparse only enforces ``choices``
-    for values typed on the command line, not for the default -- and the default
-    comes straight from ``$CLASSY_STORAGE``. So a typo like ``CLASSY_STORAGE=stat``
-    would slip through, and ``_build_backend`` would treat any non-"legacy" value
-    as the state backend. Reject unknown values here, before that dispatch.
-    """
-    if args.storage not in ("legacy", "state"):
-        print(
-            f"--storage must be 'legacy' or 'state' (got {args.storage!r}). "
-            "Check the --storage argument or the $CLASSY_STORAGE environment "
-            "variable for a typo."
-        )
-        sys.exit(1)
-
-    if args.storage == "state" and args.mode != "pubsub":
-        print(
-            f"--storage state requires --mode pubsub (got --mode {args.mode}). "
-            "Poll mode sweeps and labels the current inbox, which would archive "
-            "pre-boundary backlog under the state backend; it advances only via "
-            "history replay. Re-run with --mode pubsub."
-        )
-        sys.exit(1)
-
 
 @dataclass
 class BootstrapPlan:
@@ -121,36 +77,20 @@ class BootstrapPlan:
 
 
 def _build_backend(args, excluded, client, embedder):
-    """Construct the selected StorageBackend and, for a cold state boot, a
-    deferred :class:`BootstrapPlan`. Returns ``(backend, plan)`` where ``plan``
-    is ``None`` unless a progressive bootstrap must run. The only place that
-    branches on the backend choice; callers downstream see just a StorageBackend.
+    """Construct the state backend and, for a cold boot, a deferred
+    :class:`BootstrapPlan`. Returns ``(backend, plan)`` where ``plan``
+    is ``None`` unless a progressive bootstrap must run.
 
-    Legacy is today's three-DB adapter. State opens the single state.db and
-    dispatches on its persisted meta:
+    Dispatches on the persisted meta in state.db:
 
     - WARM -> load the join directly.
     - BOOTSTRAP -> pin the boundary now, defer the fetch to a progressive
-      driver that runs interleaved with the live loop (Phase 5).
+      driver that runs interleaved with the live loop.
     - REBUILD -> ML fingerprint changed; re-embed into state.rebuild.db and
       atomically swap it in (carrying the cursor forward).
     - RECONCILE -> excluded-label set changed; cheap membership fix in place.
     - INCOMPATIBLE -> schema/account mismatch; a hard stop (fail closed).
-
-    ``client``/``embedder`` are the already-authenticated Gmail client and the
-    embedder, so the state path can validate the store against the *actual*
-    mailbox account id and current ML fingerprint.
     """
-    if args.storage == "legacy":
-        return LegacyBackend(args.training_db, args.skip_db, excluded), None
-
-    # Explicit: anything that isn't a known backend is a bug or an unvalidated
-    # value slipping past _validate_storage_mode -- never silently fall through
-    # to the state backend (which archives differently and must not run by
-    # accident on a mistyped $CLASSY_STORAGE).
-    if args.storage != "state":
-        raise ValueError(f"unknown storage backend: {args.storage!r}")
-
     from gmail_classifier.storage_state import (
         STATE_SCHEMA_VERSION,
         StartupDecision,
@@ -287,16 +227,8 @@ def main():
         description="Classify inbox messages and apply labels"
     )
     parser.add_argument(
-        "--training-db", default="data/training.db",
-        help="Path to training message store (default: data/training.db)",
-    )
-    parser.add_argument(
-        "--skip-db", default="data/inbox_sample.db",
-        help="Path to inbox/skip message store (default: data/inbox_sample.db)",
-    )
-    parser.add_argument(
         "--state-db", default="data/state.db",
-        help="Path to the state backend's single DB (default: data/state.db)",
+        help="Path to state.db (default: data/state.db)",
     )
     parser.add_argument(
         "--credentials", default="credentials",
@@ -315,30 +247,17 @@ def main():
         help="Max inbox messages to process per run (default: 50)",
     )
     parser.add_argument(
-        "--interval", type=int, default=300,
-        help="Seconds between checks in poll mode (default: 300)",
-    )
-    parser.add_argument(
         "--once", action="store_true",
         help="Run once and exit (no loop)",
     )
     parser.add_argument(
-        "--mode", choices=["poll", "pubsub"], default="poll",
-        help="Notification mode: poll (default) or pubsub",
-    )
-    parser.add_argument(
-        "--storage", choices=["legacy", "state"],
-        default=os.environ.get("CLASSY_STORAGE", "legacy"),
-        help="Storage backend (default: legacy, or $CLASSY_STORAGE)",
-    )
-    parser.add_argument(
         "--max-per-label", type=int, default=200,
-        help="State backend: max messages to bootstrap per label and for the "
+        help="Max messages to bootstrap per label and for the "
              "skip pool (default: 200). Bounds first-boot fetch size.",
     )
     parser.add_argument(
         "--report", action="store_true",
-        help="State backend: print a status report of the local state.db "
+        help="Print a status report of the local state.db "
              "(schema, fingerprint, bootstrap status, index/label/skip/pending "
              "counts, history cursor) and exit. Reads only state.db -- no Gmail "
              "call, no model load -- so it is safe to run alongside the service.",
@@ -351,9 +270,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # --report is a read-only status dump; it never authenticates or loads the
-    # model, so handle it before the storage/mode validation (which is about the
-    # *running* service) and before any Gmail connection.
     if args.report:
         from gmail_classifier.state_status import print_report
         print_report(args.state_db, excluded_config=list(excluded_labels()))
@@ -361,8 +277,6 @@ def main():
 
     if args.test_alert:
         raise RuntimeError("Test alert: crash notification is working")
-
-    _validate_storage_mode(args)
 
     print(f"gmail-classifier version: {deployed_version()}", flush=True)
 
@@ -419,27 +333,10 @@ def main():
     registry = LabelRegistry(client, excluded=excluded)
 
     try:
-        if args.mode == "pubsub":
-            _run_pubsub_mode(args, client, _credentials, embedder, index,
-                             registry, skip_ids, backend, plan=plan)
-        else:
-            _run_poll_mode(args, client, embedder, index,
-                           registry, skip_ids, backend)
+        _run_pubsub_mode(args, client, _credentials, embedder, index,
+                         registry, skip_ids, backend, plan=plan)
     finally:
         backend.close()
-
-
-def _run_poll_mode(args, client, embedder, index,
-                   registry, skip_ids, backend):
-    """Poll inbox every N seconds."""
-    print(f"\nReady (poll mode, every {args.interval}s). Ctrl+C to stop.\n")
-
-    while True:
-        _check_inbox(args, client, embedder, index, registry, skip_ids, backend)
-
-        if args.once:
-            break
-        time.sleep(args.interval)
 
 
 def _classify_new_ids(new_ids, args, client, embedder, index, registry,
@@ -641,19 +538,8 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     watch_history_id, expiration = client.watch(PUBSUB_TOPIC)
     print(f"  Watch active, historyId={watch_history_id}")
 
-    # Resume from the backend's durable cursor if it has one (state backend, warm
-    # restart) so history since the last processed id is replayed rather than
-    # skipped by adopting the fresh watch boundary. Legacy has no durable cursor
-    # (returns None), so it starts from the fresh watch id exactly as before.
-    is_legacy = args.storage == "legacy"
     resume_id = backend.get_last_processed_history_id()
 
-    # The state read-only resync recovery (Phase 6): the shared recovery for both
-    # a long-outage warm restart (classify_gap -> RESYNC just below) and a mid-run
-    # history expiry (wired as the loop's `resync` dep). It reconciles labels from
-    # Gmail as truth, re-pins a fresh boundary, rebuilds the live index/skip_ids
-    # in place, and returns the fresh (history_id, expiration). It NEVER labels or
-    # archives the accumulated backlog. None on legacy (no durable cursor).
     def _resync():
         from gmail_classifier import bootstrap as _bootstrap
         return _bootstrap.read_only_resync(
@@ -662,53 +548,19 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
             index=index, skip_ids=skip_ids,
             log=lambda m: print(f"  {m}", flush=True))
 
-    if is_legacy:
-        # Legacy adopts the fresh watch id as its starting cursor, as today.
-        history_id = watch_history_id
+    from gmail_classifier.storage_state import GapDecision, classify_gap
+    if classify_gap(backend.store, backend.store.now_ms()) is GapDecision.REPLAY:
+        history_id = resume_id
+        print(f"  Resuming from persisted historyId={resume_id}")
     else:
-        # State: decide from the durable cursor + last_processed_at how to
-        # recover. A missing/expired/over-window/invalid-timestamp cursor no
-        # longer fails closed (Phase 6) -- it takes the read-only resync instead.
-        from gmail_classifier.storage_state import GapDecision, classify_gap
-        if classify_gap(backend.store, backend.store.now_ms()) is GapDecision.REPLAY:
-            # Genuine short outage: replay-and-classify from the persisted cursor.
-            history_id = resume_id
-            print(f"  Resuming from persisted historyId={resume_id}")
-        else:
-            # Long outage, or missing/invalid cursor/timestamp: read-only resync
-            # + re-pin. Never labels/archives the backlog; only mail after the
-            # fresh boundary is classifiable.
-            print("State backend: history gap too large; running read-only resync...")
-            history_id, expiration = _resync()
+        print("State backend: history gap too large; running read-only resync...")
+        history_id, expiration = _resync()
 
     # Track messages labeled by the classifier itself (to ignore echoed events)
     self_labeled = set()
 
-    # The labeling inbox sweep is LEGACY-ONLY. It lists the current INBOX and
-    # classifies whatever is unlabeled -- catch-up-after-downtime behavior that
-    # is correct for legacy (which always fresh-watches and treats the current
-    # inbox as work). It is unsafe for the state backend: inbox listing carries
-    # no per-message historyId, so it cannot enforce the read-only boundary, and
-    # known_ids is incomplete when the skip pool is only sampled -- so a sweep
-    # could label/archive pre-boundary backlog. State catches up via history
-    # replay from its durable cursor instead; when the cursor is expired or the
-    # gap exceeds WARM_RECOVERY_WINDOW it takes the read-only resync + re-pin
-    # (reconcile labels, never label/archive the backlog), never an inbox sweep.
-    if is_legacy:
-        # Do an initial inbox check to catch anything missed.
-        print("Initial inbox check...")
-        _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
-                     self_labeled)
-
     # Drain any pending_new rows stranded by a crash that happened after
-    # bootstrap wrote bootstrap_status="complete" but before all parked mail was
-    # drained. On the next boot that store reads WARM (plan is None), so no
-    # bootstrap controller is built and the controller's maybe_drain never runs
-    # -- the rows would sit forever. A warm store is by definition mature, so
-    # classify + clear them here at startup. A cold boot (plan set) instead lets
-    # the controller drain once its gate opens; legacy's get_pending() is a
-    # no-op, so this is empty there. Runs before the once-return so a --once
-    # restart still recovers stranded rows.
+    # bootstrap completed but before all parked mail was drained.
     if plan is None:
         _make_drain(args, client, embedder, index, registry, skip_ids,
                     self_labeled, backend)()
@@ -727,17 +579,8 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         prefix = "\n" if lead_newline else ""
         print(f"{prefix}{now()} {message}")
 
-    def _check_inbox_fallback():
-        # The loop calls this on HistoryExpiredError only on legacy (state
-        # supplies the `resync` dep instead, so its expiry branch never reaches
-        # here). On legacy it's the inbox poll -- catch-up-after-downtime, as
-        # today. On state a labeling inbox sweep would archive pre-boundary
-        # backlog, which is exactly what the read-only resync avoids.
-        _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
-                     self_labeled)
-
-    # Progressive bootstrap controller (cold state boot only). None on warm/
-    # legacy, where _process_events classifies new mail immediately.
+    # Progressive bootstrap controller (cold boot only). None on warm start,
+    # where _process_events classifies new mail immediately.
     controller = _build_controller(
         plan, args, client, embedder, index, registry, skip_ids, self_labeled,
         backend, _log)
@@ -750,13 +593,8 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                         skip_ids, self_labeled, backend,
                         controller=controller, history_id=state.history_id)
 
-    # State-only recovery hooks (None/no-op on legacy). The resync is the history-
-    # expiry recovery (reconcile + re-pin, never label the backlog); the heartbeat
-    # keeps a live-but-idle cursor from aging into the recovery window. Both are
-    # gated off while the progressive bootstrap runs: the boundary is fresh and
-    # the store not yet complete, so neither applies.
     def _heartbeat(now_ms):
-        if is_legacy or (controller is not None and not controller.done):
+        if controller is not None and not controller.done:
             return
         from gmail_classifier import bootstrap as _bootstrap
         _bootstrap.heartbeat_cursor(client, backend.store, now_ms, log=_log)
@@ -765,12 +603,12 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         make_subscriber=_make_subscriber,
         watch=lambda: client.watch(PUBSUB_TOPIC),
         get_history=client.get_history,
-        check_inbox=_check_inbox_fallback,
+        check_inbox=lambda: None,
         process_events=_process,
         persist_cursor=backend.set_last_processed_history_id,
         log=_log,
         is_bootstrapping=lambda: controller is not None and not controller.done,
-        resync=None if is_legacy else _resync,
+        resync=_resync,
         heartbeat=_heartbeat,
     )
 
@@ -804,45 +642,6 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         except Exception:
             pass
 
-
-def _check_inbox(args, client, embedder, index, registry, skip_ids, backend,
-                 self_labeled=None):
-    """Check inbox and classify new messages (poll mode)."""
-    from gmail_classifier.inbox_check import process_inbox
-
-    # Peek at whether there's anything new before doing any work, so the idle
-    # case stays cheap.
-    inbox_ids = client.list_message_ids(label_id="INBOX", max_results=args.max_messages)
-    if not any(mid not in skip_ids for mid in inbox_ids):
-        return
-
-    results = process_inbox(
-        client=client,
-        embedder=embedder,
-        index=index,
-        registry=registry,
-        skip_ids=skip_ids,
-        backend=backend,
-        k=args.k,
-        max_messages=args.max_messages,
-        dry_run=args.dry_run,
-        self_labeled=self_labeled,
-        inbox_ids=inbox_ids,
-    )
-
-    w = registry.max_label_width
-    for r in results:
-        sender = r["sender"]
-        if r.get("warning"):
-            print(f"{now()} WARNING: label '{r['label']}' not found in Gmail, skipping")
-        elif r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
-            print(truncate(f"{now()} {r['label']:{w}s}  {r['confidence']:6.1%}  {sender} — {r['subject']}"))
-        else:
-            print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {r['subject']}"))
-
-    # Heavy parse+embed work just ran; return the heap to the OS (see
-    # _process_events).
-    trim_memory()
 
 
 def _sigterm_handler(signum, frame):

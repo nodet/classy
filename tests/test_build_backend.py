@@ -55,10 +55,7 @@ def _seed_warm(path, *, account, excluded=frozenset()):
 
 
 def _args(state_db):
-    return SimpleNamespace(
-        storage="state", state_db=state_db,
-        training_db="unused", skip_db="unused",
-    )
+    return SimpleNamespace(state_db=state_db)
 
 
 def test_state_warm_start_accepts_matching_account(tmp_path):
@@ -86,16 +83,3 @@ def test_state_rejects_mismatched_account(tmp_path):
     assert client.profile_calls == 1
 
 
-def test_legacy_path_ignores_client(tmp_path):
-    """Legacy selection never queries the Gmail profile."""
-    args = SimpleNamespace(
-        storage="legacy",
-        training_db=str(tmp_path / "training.db"),
-        skip_db=str(tmp_path / "inbox_sample.db"),
-        state_db=str(tmp_path / "state.db"),
-    )
-    client = _FakeClient("me@gmail.com")
-    backend, plan = cal._build_backend(args, set(), client, _FakeEmbedder())
-    assert client.profile_calls == 0
-    assert plan is None
-    backend.close()

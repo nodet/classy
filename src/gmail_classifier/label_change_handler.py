@@ -12,7 +12,7 @@ from gmail_classifier.preprocessing import preprocess_email_body, build_text_rep
 from gmail_classifier.training_index import TrainingIndex
 
 if TYPE_CHECKING:
-    from gmail_classifier.storage_backend import StorageBackend
+    from gmail_classifier.storage_state import StateStore as StorageBackend
 
 
 def process_label_changes(

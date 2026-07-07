@@ -1,7 +1,12 @@
+from __future__ import annotations
+
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from bs4 import BeautifulSoup
+
+if TYPE_CHECKING:
+    from gmail_classifier.models import Message
 
 # Cap the HTML handed to BeautifulSoup. Real readable text in an email is small;
 # anything past this is overwhelmingly inline base64 images, tracking pixels, and
@@ -147,3 +152,15 @@ def build_text_representation(
         parts.append(f"[list: {list_id}]")
 
     return " | ".join(parts)
+
+
+def _message_text(msg: "Message") -> str:
+    """Full text representation of a message, ready for embedding."""
+    body = preprocess_email_body(msg.body_html)
+    return build_text_representation(
+        from_name=msg.from_name,
+        from_address=msg.from_address,
+        subject=msg.subject,
+        body=body,
+        list_id=msg.list_id,
+    )

@@ -1,18 +1,14 @@
-"""Tests that the labeling inbox sweep in pubsub mode is legacy-only.
+"""Tests for the state backend's startup recovery paths in pubsub mode.
 
-The startup "initial inbox check" (and the HistoryExpiredError inbox-poll
-fallback) list the current INBOX and classify whatever is unlabeled. That is
-correct catch-up behavior for legacy, but unsafe for the state backend: inbox
-listing carries no per-message historyId, so it cannot enforce the read-only
-boundary, and a sweep could label/archive pre-boundary backlog. State catches
-up via history replay from its durable cursor instead.
+The startup path decides (via classify_gap) whether to replay from the durable
+cursor (REPLAY) or run a read-only resync (RESYNC). These tests drive
+_run_pubsub_mode with --once so the loop returns immediately after startup.
 """
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 
 from gmail_classifier.storage_state import (
     STATE_SCHEMA_VERSION,
@@ -37,89 +33,11 @@ class _FakeEmbedder:
         return np.full(8, 1.0, dtype=np.float32)
 
 
-class _SweepClient:
-    """Records the startup inbox listing so a test can assert it did/didn't run."""
-    def __init__(self):
-        self.list_calls = 0
-
-    def watch(self, topic):
-        return ("500", 10**18)
-
-    def list_message_ids(self, label_id, max_results=0):
-        self.list_calls += 1
-        return []  # empty -> _check_inbox returns right after listing
-
-
-class _CursorBackend:
-    """A durable cursor stand-in exposing the slice of StateStore that the state
-    startup path reaches through ``backend.store``: the cursor, its timestamp,
-    and an injected clock.
-
-    ``now_ms``/``last_at`` control ``classify_gap``: with the defaults the gap is
-    0 (REPLAY, resume from the cursor). A test that wants the read-only resync
-    path drops the cursor (``cursor=None``) or pushes ``last_at`` outside the
-    recovery window."""
-    def __init__(self, cursor=None, last_at=0, now_ms=0):
-        self._cursor = cursor
-        self._last_at = last_at
-        self._now_ms = now_ms
-
-    # The state path reaches the store's cursor/clock via ``backend.store``.
-    @property
-    def store(self):
-        return self
-
-    def now_ms(self):
-        return self._now_ms
-
-    def get_last_processed_history_id(self):
-        return self._cursor
-    def set_last_processed_history_id(self, hid):
-        self._cursor = hid
-        self._last_at = self._now_ms
-    def get_last_processed_at(self):
-        return self._last_at
-    def get_pending(self):
-        return []  # no stranded pending_new rows in these sweep tests
-
-
-def _pubsub_args(storage):
-    return SimpleNamespace(
-        storage=storage, mode="pubsub", once=True,
-        max_messages=50, k=5, dry_run=False, max_per_label=200,
-    )
-
-
-def test_startup_inbox_sweep_runs_on_legacy():
-    client = _SweepClient()
-    cal._run_pubsub_mode(
-        _pubsub_args("legacy"), client, credentials=None,
-        embedder=_FakeEmbedder(), index=object(), registry=object(),
-        skip_ids=set(), backend=_CursorBackend(),
-    )
-    assert client.list_calls == 1  # legacy sweeps the inbox at startup
-
-
-def test_startup_inbox_sweep_skipped_on_state():
-    """State must not run the labeling inbox sweep -- it would label/archive
-    pre-boundary backlog that history replay is designed to leave untouched."""
-    client = _SweepClient()
-    cal._run_pubsub_mode(
-        _pubsub_args("state"), client, credentials=None,
-        embedder=_FakeEmbedder(), index=object(), registry=object(),
-        skip_ids=set(), backend=_CursorBackend(cursor="400"),
-    )
-    assert client.list_calls == 0  # no inbox sweep on the state path
-
-
 class _ResyncClient:
-    """A fuller state client: records watch/apply_label and serves a small
-    mailbox so the read-only resync can list + reconcile. ``list_calls`` still
-    tracks the labeling inbox sweep (must stay 0 on state)."""
+    """Records watch/apply_label and serves a small mailbox for read-only resync."""
     def __init__(self, labels=None, inbox=None):
         self._labels = labels or {}
         self._inbox = inbox or []
-        self.list_calls = 0
         self.watch_calls = 0
         self.applied = []
 
@@ -128,9 +46,7 @@ class _ResyncClient:
         return ("900", 10**18)
 
     def list_message_ids(self, label_id, max_results=0):
-        # The labeling inbox sweep peeks INBOX; on state it must never run.
         if label_id == "INBOX":
-            self.list_calls += 1
             return []
         ids = self._labels.get(label_id, ("", []))[1]
         return list(ids[:max_results]) if max_results else list(ids)
@@ -154,6 +70,12 @@ class _ResyncClient:
 
 class _Registry:
     _excluded = set()
+
+
+def _pubsub_args():
+    return SimpleNamespace(
+        once=True, max_messages=50, k=5, dry_run=False, max_per_label=200,
+    )
 
 
 def _seed_warm_state(path, *, cursor, last_at, now_ms):
@@ -182,16 +104,13 @@ def test_state_within_window_resumes_without_resync(tmp_path):
     index = TrainingIndex(np.empty((0, 0), dtype=np.float32), [], [])
 
     cal._run_pubsub_mode(
-        _pubsub_args("state"), client, credentials=None,
+        _pubsub_args(), client, credentials=None,
         embedder=_FakeEmbedder(), index=index, registry=_Registry(),
         skip_ids=set(), backend=backend,
     )
-    # Only the initial watch ran (the resume-from-cursor path re-watches once at
-    # startup); no resync re-pin, and the boundary is unchanged.
     assert client.watch_calls == 1
     assert backend.store.get_meta("bootstrap_boundary_history_id") == "400"
-    assert client.applied == []       # nothing labeled
-    assert client.list_calls == 0     # no inbox sweep
+    assert client.applied == []
     backend.close()
 
 
@@ -201,56 +120,35 @@ def test_state_past_window_runs_read_only_resync(tmp_path):
     path = str(tmp_path / "state.db")
     now = 10 * WARM_RECOVERY_WINDOW
     backend = _seed_warm_state(path, cursor="410", last_at=0, now_ms=now)
-    # A backlog full of inbox mail that a naive replay-and-classify would archive.
     client = _ResyncClient(labels={"L_A": ("A", ["a1"])},
                            inbox=["i1", "i2", "i3"])
     index = TrainingIndex(np.empty((0, 0), dtype=np.float32), [], [])
 
     cal._run_pubsub_mode(
-        _pubsub_args("state"), client, credentials=None,
+        _pubsub_args(), client, credentials=None,
         embedder=_FakeEmbedder(), index=index, registry=_Registry(),
         skip_ids=set(), backend=backend,
     )
-    # Resync re-pinned the boundary to the fresh watch id, and NEVER labeled the
-    # backlog.
     assert backend.store.get_meta("bootstrap_boundary_history_id") == "900"
     assert backend.store.get_last_processed_history_id() == "900"
-    assert client.applied == []       # backlog never labeled/archived
-    assert client.list_calls == 0     # no labeling inbox sweep
-    # Store stays complete (repin must NOT reset to in_progress -> no re-bootstrap).
+    assert client.applied == []
     assert backend.store.get_bootstrap_status() == "complete"
     backend.close()
 
 
 def test_state_absent_cursor_resyncs_not_fails_closed(tmp_path):
-    """A warm-looking state.db with no durable cursor no longer SystemExits
-    (Phase 6 removed that fail-closed stop): it takes the read-only resync and
-    starts cleanly from the fresh boundary. Replaces the old
-    test_state_without_cursor_fails_closed."""
+    """A warm-looking state.db with no durable cursor takes the read-only resync
+    and starts cleanly from the fresh boundary."""
     path = str(tmp_path / "state.db")
     backend = _seed_warm_state(path, cursor=None, last_at=None, now_ms=1000)
     client = _ResyncClient(labels={"L_A": ("A", ["a1"])}, inbox=["i1"])
     index = TrainingIndex(np.empty((0, 0), dtype=np.float32), [], [])
 
-    # Must NOT raise SystemExit.
     cal._run_pubsub_mode(
-        _pubsub_args("state"), client, credentials=None,
+        _pubsub_args(), client, credentials=None,
         embedder=_FakeEmbedder(), index=index, registry=_Registry(),
         skip_ids=set(), backend=backend,
     )
-    assert backend.store.get_last_processed_history_id() == "900"  # re-pinned
-    assert client.applied == []       # never labels the backlog
-    assert client.list_calls == 0     # no inbox sweep
+    assert backend.store.get_last_processed_history_id() == "900"
+    assert client.applied == []
     backend.close()
-
-
-def test_legacy_without_cursor_uses_watch_boundary():
-    """Legacy has no durable cursor and legitimately adopts the fresh watch id;
-    it must not be caught by the state fail-closed guard."""
-    client = _SweepClient()
-    cal._run_pubsub_mode(
-        _pubsub_args("legacy"), client, credentials=None,
-        embedder=_FakeEmbedder(), index=object(), registry=object(),
-        skip_ids=set(), backend=_CursorBackend(cursor=None),
-    )
-    assert client.list_calls == 1  # started normally, swept the inbox

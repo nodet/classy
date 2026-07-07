@@ -504,12 +504,6 @@ def test_repin_boundary_atomic_and_keeps_complete(tmp_path):
     store.close()
 
 
-def test_backend_satisfies_storage_backend_protocol(tmp_path):
-    from gmail_classifier.storage_backend import StorageBackend
-    backend = StateBackend(str(tmp_path / "state.db"), excluded=set())
-    assert isinstance(backend, StorageBackend)
-    backend.close()
-
 
 def test_loop_persist_cursor_is_durable_across_restart(tmp_path):
     """Integration: wiring StateBackend.set_last_processed_history_id as the

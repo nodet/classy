@@ -4,7 +4,7 @@ This guide walks through every step needed to connect this project to your Gmail
 
 ## Overview
 
-Google requires an "app" to access Gmail on your behalf. You create this app (free), authorize it once in your browser, and then the scripts can read your email without further interaction.
+Google requires an "app" to access Gmail on your behalf. You create this app (free), authorize it once in your browser, and then the classifier can read your email without further interaction.
 
 The pieces:
 - **Google Cloud project** — a container for the "app" (costs nothing)
@@ -79,7 +79,7 @@ mv ~/Downloads/client_id_*.json credentials/client_secret.json
 Run:
 
 ```
-make fetch-training
+make watch
 ```
 
 This will:
@@ -87,41 +87,9 @@ This will:
 2. You'll see a warning "This app isn't verified" — click **Continue** (it's your own app).
 3. Grant permission to read your email.
 4. The browser will show "The authentication flow has completed."
-5. Back in the terminal, the script starts fetching messages.
+5. Back in the terminal, the classifier starts bootstrapping from Gmail.
 
 After this, a `credentials/token.json` file is created. Future runs won't need the browser.
-
----
-
-## Step 6: Fetch training data
-
-```
-make fetch-training
-```
-
-This fetches all messages from your user-created Gmail labels and stores them in `data/training.db`.
-
-To fetch only specific labels:
-
-```
-uv run python scripts/fetch_training_data.py --labels Technology Newsletters Travel
-```
-
----
-
-## Step 7: Fetch inbox sample (for dry-run classification)
-
-```
-make fetch-inbox
-```
-
-This fetches the 100 most recent inbox messages and stores them in `data/inbox_sample.db`.
-
-To fetch more:
-
-```
-uv run python scripts/fetch_inbox.py --count 200
-```
 
 ---
 
@@ -132,8 +100,7 @@ credentials/
   client_secret.json   # Your OAuth app identity (do NOT commit)
   token.json           # Your authorization token (do NOT commit)
 data/
-  training.db          # Labeled messages from Gmail
-  inbox_sample.db      # Recent inbox messages for dry-run
+  state.db             # Derived index (ids, labels, embeddings — no bodies)
 ```
 
 Both `credentials/` and `data/` are in `.gitignore`.
@@ -152,4 +119,4 @@ Both `credentials/` and `data/` are in `.gitignore`.
 - Delete `credentials/token.json` and run again — it will re-authorize.
 
 **"Quota exceeded" or 429 errors**
-- The Gmail API has rate limits. Wait a minute and retry. For very large mailboxes, the script may need multiple runs (it skips already-fetched messages).
+- The Gmail API has rate limits. Wait a minute and retry.

@@ -16,16 +16,6 @@ fi
 
 PROJECT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 
-if [[ ! -s "$PROJECT_DIR/data/training.db" ]]; then
-    echo "Error: data/training.db missing or empty. Run 'make fetch-training' first."
-    exit 1
-fi
-
-if [[ ! -s "$PROJECT_DIR/data/inbox_sample.db" ]]; then
-    echo "Error: data/inbox_sample.db missing or empty. Run 'make fetch-inbox' first."
-    exit 1
-fi
-
 LABEL="com.xnodet.gmail-classifier"
 RUNNER="$HOME/bin/gmail-classifier-runner"
 CTL="$HOME/bin/gmail-classifierctl"
@@ -68,7 +58,7 @@ fi
 
 echo "[\$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')] starting \${LABEL}"
 
-exec "\$UV" run --locked -- python -u scripts/classify_and_label.py --mode pubsub
+exec "\$UV" run --locked -- python -u scripts/classify_and_label.py
 EOF
 chmod +x "$RUNNER"
 

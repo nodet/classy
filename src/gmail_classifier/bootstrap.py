@@ -41,7 +41,7 @@ from gmail_classifier.storage_state import (
     compute_excluded_hash,
     compute_ml_fingerprint,
 )
-from gmail_classifier.training import _message_text
+from gmail_classifier.preprocessing import _message_text
 
 # How many skip (inbox) seeds to persist *before* the round-robin proper, so an
 # interrupted first boot already has the skip mass the confidence denominator
