@@ -1,6 +1,6 @@
 .PHONY: help setup test quick clean reauth watch reset-state \
        service-install service-uninstall service-start service-stop service-restart service-status service-logs \
-       gcp-create gcp-slim gcp-deploy gcp-destroy gcp-start gcp-stop gcp-restart gcp-status gcp-state-status gcp-reset-state gcp-test-alert gcp-logs gcp-ssh
+       gcp-create gcp-deploy gcp-destroy gcp-start gcp-stop gcp-restart gcp-status gcp-state-status gcp-reset-state gcp-test-alert gcp-logs gcp-ssh
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -71,9 +71,6 @@ GCP_INSTALL_DIR := /opt/gmail-classifier
 
 gcp-create: ## Create GCP e2-micro VM
 	@scripts/gcp-create.sh
-
-gcp-slim: ## Disable non-essential GCP agents to free RAM/CPU
-	@scripts/gcp-slim.sh
 
 gcp-deploy: ## Deploy code + credentials to the GCP VM (VM bootstraps from Gmail)
 	@scripts/gcp-deploy.sh
