@@ -34,11 +34,16 @@ Hardcoded author-specific identifiers found today:
 
 | Location | What is hardcoded |
 |---|---|
-| `scripts/classify_and_label.py:33-34` | `PUBSUB_TOPIC` / `PUBSUB_SUBSCRIPTION` (full `projects/classy-498012/...` paths) |
-| `Makefile:67` | `GCP_PROJECT := classy-498012` |
-| `scripts/gcp-create.sh:6`, `gcp-deploy.sh:6`, `gcp-destroy.sh:6` | `GCP_PROJECT="classy-498012"` |
-| `README.md` | literal `classy-498012` in setup steps |
-| `tests/test_pubsub.py` | the subscription path (test fixtures) |
+| `scripts/classify_and_label.py:27-28` | `PUBSUB_TOPIC` / `PUBSUB_SUBSCRIPTION` (full `projects/classy-498012/...` paths) |
+| `Makefile:67-69` | `GCP_PROJECT`, `GCP_INSTANCE`, `GCP_ZONE` |
+| `scripts/gcp-create.sh:6-8`, `gcp-deploy.sh:10-12`, `gcp-destroy.sh:6-8` | `GCP_PROJECT`, `GCP_ZONE`, `GCP_INSTANCE` in each |
+| `README.md:190,197,258` | literal `classy-498012` in setup steps and console URL |
+| `tests/test_pubsub.py` (8 occurrences) | subscription path `projects/classy-498012/subscriptions/...` |
+
+Additionally, `docs/gmail-setup.md` tells users to add `gmail.readonly` to the
+OAuth consent screen, but the code (`auth.py`) requests `gmail.modify` +
+`pubsub`. A user following the current docs will get a broken service. This is
+a pre-existing bug that item 4 fixes.
 
 ## Approach
 
@@ -62,19 +67,21 @@ subscription = "gmail-notifications-sub"   # short name; full path derived
 
 - Add `config.py` accessors: `gcp_project()`, `gcp_zone()`, `gcp_instance()`,
   `pubsub_topic_path()`, `pubsub_subscription_path()`, and `require_gcp_config()`.
+  The existing `load_config()` and `excluded_labels()` show the pattern.
 - Keep the empty-string-means-unset convention so local dev/test paths (which
   never touch GCP) don't trip over unset GCP keys. The service's real mode must
   call `require_gcp_config()` and fail with one clear message naming the missing
   key.
-- `scripts/classify_and_label.py` — replace the `PUBSUB_TOPIC` /
+- `scripts/classify_and_label.py:27-28` — replace the `PUBSUB_TOPIC` /
   `PUBSUB_SUBSCRIPTION` module constants with calls to the config accessors.
-- `Makefile` + `scripts/gcp-*.sh` — source `project`/`zone`/`instance` from
-  config instead of the literal. Simplest: a tiny `scripts/gcp-env.sh` that uses
-  only stdlib Python (`tomllib`; no project dependencies beyond Python 3.11) and
-  exports the vars the other scripts already expect.
-- `tests/test_pubsub.py` — drive the expected subscription path from the config
-  accessor (or a fixture-injected value) rather than asserting the author's
-  literal string.
+- `Makefile:67-69` + `scripts/gcp-create.sh`, `gcp-deploy.sh`,
+  `gcp-destroy.sh` — source `project`/`zone`/`instance` from config instead of
+  the literal. Add a `scripts/gcp-env.sh` that uses only stdlib Python
+  (`tomllib`; no project dependencies beyond Python 3.11) and exports
+  `GCP_PROJECT`, `GCP_ZONE`, `GCP_INSTANCE`. Each shell script sources it; the
+  Makefile uses `$(shell ...)`.
+- `tests/test_pubsub.py` (8 occurrences) — extract a test-local constant or
+  fixture for the subscription path rather than repeating the author's literal.
 
 **Provisioning.** Add an idempotent `make gcp-bootstrap` target that, given the
 configured project, performs the steps the author once did by hand:
@@ -140,10 +147,15 @@ The cold bootstrap is a 10-20 min **read-only** warmup during which nothing is
 labeled. For a new user that long silent stretch reads as "broken." Make the
 service explain itself:
 
+Today the startup prints version, excluded labels, auth, embedding stats, and
+watch registration — but never reports what labels were discovered from Gmail
+or that bootstrapping means "read-only for a while." The `LabelRegistry` is
+constructed silently at line ~334.
+
 - On the cold path, log a startup banner: bootstrapping, **read-only until ~N
   examples/label**, will not touch existing mail.
 - Log the **discovered label set and the effective exclusions** once the cold
-  path's `list_user_labels()` runs.
+  path's `list_user_labels()` runs (after `LabelRegistry` construction).
 - If zero trainable labels are discovered, fail clearly instead of starting a
   permanently idle service.
 - If labels exist but too few have enough examples, keep running but log which
@@ -159,10 +171,11 @@ service explain itself:
 - README pass: replace literal `classy-498012` occurrences with the
   configured-value placeholder, fold in `make gcp-bootstrap` and `make doctor`
   steps, and reframe Quick-start so config-and-provision steps precede deploy.
-- `docs/gmail-setup.md` pass: update OAuth consent-screen scope instructions to
-  match `auth.py` (`gmail.modify` + `pubsub`). Tell users to create the OAuth
-  client in the configured GCP project. Add troubleshooting for
-  `insufficient authentication scopes` / `invalid_grant`.
+- `docs/gmail-setup.md` pass: fix the scope mismatch — currently tells users to
+  add `gmail.readonly`, but `auth.py` requests `gmail.modify` + `pubsub`. Update
+  to match the code. Tell users to create the OAuth client in the configured GCP
+  project. Add troubleshooting for `insufficient authentication scopes` /
+  `invalid_grant`.
 - Frame setup docs around the **one supported way to operate the service: the
   always-on GCP deploy.** Running locally is documented only as a **test/debug
   path** in a clearly-labeled subsection.
