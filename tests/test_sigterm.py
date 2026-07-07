@@ -23,21 +23,23 @@ def test_sigterm_handler_raises_system_exit():
 def test_sigterm_causes_clean_exit_in_subprocess():
     """A process using the SIGTERM->SystemExit pattern exits 0 on SIGTERM."""
     code = textwrap.dedent("""\
-        import signal, sys, time
+        import signal, sys, os
 
         def _sigterm_handler(signum, frame):
             raise SystemExit(0)
 
         signal.signal(signal.SIGTERM, _sigterm_handler)
+        # Signal readiness to parent
+        sys.stdout.write("ready\\n")
+        sys.stdout.flush()
         try:
-            time.sleep(60)
+            signal.pause()
         except SystemExit:
             sys.exit(0)
     """)
-    proc = subprocess.Popen([sys.executable, "-c", code])
-    # Give the process a moment to register the handler
-    import time
-    time.sleep(0.1)
+    proc = subprocess.Popen([sys.executable, "-c", code],
+                            stdout=subprocess.PIPE)
+    proc.stdout.readline()  # wait for "ready"
     proc.send_signal(signal.SIGTERM)
     rc = proc.wait(timeout=5)
     assert rc == 0
@@ -59,17 +61,20 @@ def test_double_sigterm_exits_cleanly():
             raise SystemExit(0)
 
         signal.signal(signal.SIGTERM, _sigterm_handler)
+        sys.stdout.write("ready\\n")
+        sys.stdout.flush()
         try:
-            time.sleep(60)
+            signal.pause()
         except SystemExit:
             # Simulate slow teardown, during which a 2nd SIGTERM arrives.
             time.sleep(2)
             sys.exit(0)
     """)
-    proc = subprocess.Popen([sys.executable, "-c", code])
-    import time
-    time.sleep(0.1)
+    proc = subprocess.Popen([sys.executable, "-c", code],
+                            stdout=subprocess.PIPE)
+    proc.stdout.readline()  # wait for "ready"
     proc.send_signal(signal.SIGTERM)
+    import time
     time.sleep(0.2)
     proc.send_signal(signal.SIGTERM)  # arrives during the simulated teardown
     rc = proc.wait(timeout=5)
