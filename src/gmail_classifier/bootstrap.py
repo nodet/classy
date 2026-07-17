@@ -559,5 +559,5 @@ def heartbeat_cursor(
         return None
     advanced = latest or cursor
     store.set_last_processed_history_id(advanced)
-    log("Heartbeat: refreshed idle cursor timestamp")
+    #log("Heartbeat: refreshed idle cursor timestamp")
     return advanced
