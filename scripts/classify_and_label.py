@@ -585,7 +585,21 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         plan, args, client, embedder, index, registry, skip_ids, self_labeled,
         backend, _log)
 
+    import time as _time
+    from gmail_classifier.label_reconciler import reconcile_labels as _reconcile
+    _last_reconcile = [0.0]
+
+    def _maybe_reconcile():
+        if controller is not None and not controller.done:
+            return
+        elapsed = _time.time() - _last_reconcile[0]
+        if elapsed < 60:
+            return
+        _last_reconcile[0] = _time.time()
+        _reconcile(registry, backend.store, index, client, skip_ids, _log)
+
     def _process(events):
+        _maybe_reconcile()
         # The loop advances its own history_id AFTER process_events; pass the
         # current cursor so parked rows record the historyId they were first
         # seen at.
@@ -596,6 +610,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     def _heartbeat(now_ms):
         if controller is not None and not controller.done:
             return
+        _maybe_reconcile()
         from gmail_classifier import bootstrap as _bootstrap
         _bootstrap.heartbeat_cursor(client, backend.store, now_ms, log=_log)
 

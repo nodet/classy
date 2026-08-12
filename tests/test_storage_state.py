@@ -552,3 +552,47 @@ def test_loop_persist_cursor_is_durable_across_restart(tmp_path):
     fresh = StateBackend(path, excluded=set())
     assert fresh.get_last_processed_history_id() == "555"
     fresh.close()
+
+
+# --------------------------------------------------------------------------
+# StateStore: message_ids_by_label, rename_label, get_embedding
+# --------------------------------------------------------------------------
+
+def test_message_ids_by_label(tmp_path):
+    store = StateStore(str(tmp_path / "state.db"))
+    store.upsert_label("m1", "L1", "Tech")
+    store.upsert_label("m2", "L1", "Tech")
+    store.upsert_label("m3", "L2", "Travel")
+
+    assert store.message_ids_by_label("Tech") == {"m1", "m2"}
+    assert store.message_ids_by_label("Travel") == {"m3"}
+    assert store.message_ids_by_label("Nonexistent") == set()
+    store.close()
+
+
+def test_rename_label(tmp_path):
+    store = StateStore(str(tmp_path / "state.db"))
+    store.upsert_label("m1", "L1", "Tech")
+    store.upsert_label("m2", "L1", "Tech")
+    store.upsert_label("m3", "L2", "Travel")
+
+    count = store.rename_label("Tech", "Technologie")
+
+    assert count == 2
+    assert store.message_ids_by_label("Technologie") == {"m1", "m2"}
+    assert store.message_ids_by_label("Tech") == set()
+    assert store.message_ids_by_label("Travel") == {"m3"}
+    store.close()
+
+
+def test_get_embedding(tmp_path):
+    store = StateStore(str(tmp_path / "state.db"))
+    vec = _vec(42)
+    store.upsert_embedding("m1", vec)
+
+    result = store.get_embedding("m1")
+    assert result is not None
+    assert np.array_equal(result, vec)
+
+    assert store.get_embedding("m99") is None
+    store.close()

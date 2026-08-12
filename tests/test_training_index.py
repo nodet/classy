@@ -79,3 +79,29 @@ def test_contains():
     index = TrainingIndex(embeddings, labels, ids)
     assert "m1" in index
     assert "m99" not in index
+
+
+def test_rename_label():
+    embeddings = np.random.randn(5, 384).astype(np.float32)
+    labels = ["Tech", "Travel", "Travel", "__skip__", "Tech"]
+    ids = ["m1", "m2", "m3", "m4", "m5"]
+
+    index = TrainingIndex(embeddings, labels, ids)
+    count = index.rename_label("Travel", "Voyages")
+
+    assert count == 2
+    assert index.labels.count("Voyages") == 2
+    assert "Travel" not in index.labels
+    assert index.labels.count("Tech") == 2
+
+
+def test_rename_label_no_match():
+    embeddings = np.random.randn(3, 384).astype(np.float32)
+    labels = ["Tech", "Travel", "__skip__"]
+    ids = ["m1", "m2", "m3"]
+
+    index = TrainingIndex(embeddings, labels, ids)
+    count = index.rename_label("News", "Nouvelles")
+
+    assert count == 0
+    assert index.labels == ["Tech", "Travel", "__skip__"]

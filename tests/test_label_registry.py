@@ -1,7 +1,7 @@
 """Tests for LabelRegistry: dynamic label map with lazy refresh."""
 from unittest.mock import MagicMock
 
-from gmail_classifier.label_registry import LabelRegistry
+from gmail_classifier.label_registry import LabelDiff, LabelRegistry
 
 
 def _make_client(labels):
@@ -137,3 +137,63 @@ def test_max_label_width_updates_on_refresh():
     registry.refresh()
 
     assert registry.max_label_width == len("Conferences")
+
+
+# --- refresh_with_diff tests ---
+
+
+def test_refresh_with_diff_detects_deletion():
+    client = _make_client([("L1", "Tech"), ("L2", "Travel")])
+    registry = LabelRegistry(client, excluded=set())
+
+    client.list_user_labels.return_value = [("L1", "Tech")]
+    diff = registry.refresh_with_diff()
+
+    assert diff.deleted == {"L2": "Travel"}
+    assert diff.renamed == {}
+    assert not registry.is_known("L2")
+
+
+def test_refresh_with_diff_detects_rename():
+    client = _make_client([("L1", "Tech"), ("L2", "Travel")])
+    registry = LabelRegistry(client, excluded=set())
+
+    client.list_user_labels.return_value = [("L1", "Tech"), ("L2", "Voyages")]
+    diff = registry.refresh_with_diff()
+
+    assert diff.renamed == {"L2": ("Travel", "Voyages")}
+    assert diff.deleted == {}
+    assert registry.get_name("L2") == "Voyages"
+
+
+def test_refresh_with_diff_no_changes():
+    client = _make_client([("L1", "Tech"), ("L2", "Travel")])
+    registry = LabelRegistry(client, excluded=set())
+
+    diff = registry.refresh_with_diff()
+
+    assert diff.empty
+    assert diff.deleted == {}
+    assert diff.renamed == {}
+
+
+def test_refresh_with_diff_excludes_excluded_from_deleted():
+    """Excluded labels that disappear are not reported as deleted."""
+    client = _make_client([("L1", "Tech"), ("L2", "XLC")])
+    registry = LabelRegistry(client, excluded={"XLC"})
+
+    client.list_user_labels.return_value = [("L1", "Tech")]
+    diff = registry.refresh_with_diff()
+
+    assert diff.deleted == {}
+
+
+def test_refresh_with_diff_new_label_not_in_diff():
+    """A newly appearing label is not a deletion or rename."""
+    client = _make_client([("L1", "Tech")])
+    registry = LabelRegistry(client, excluded=set())
+
+    client.list_user_labels.return_value = [("L1", "Tech"), ("L3", "News")]
+    diff = registry.refresh_with_diff()
+
+    assert diff.empty

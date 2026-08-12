@@ -360,6 +360,31 @@ class StateStore:
             )
         }
 
+    def message_ids_by_label(self, name: str) -> Set[str]:
+        """Return all message_ids stored under ``name``."""
+        return {
+            r[0] for r in self._conn.execute(
+                "SELECT message_id FROM labels WHERE label_name = ?", (name,)
+            )
+        }
+
+    def rename_label(self, old_name: str, new_name: str) -> int:
+        """Rename a label in place. Returns the number of rows updated."""
+        cur = self._conn.execute(
+            "UPDATE labels SET label_name = ? WHERE label_name = ?",
+            (new_name, old_name),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def get_embedding(self, message_id: str) -> Optional[np.ndarray]:
+        """Read a single cached embedding vector, or None if absent."""
+        row = self._conn.execute(
+            "SELECT vector FROM embeddings WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+        return _blob_to_vec(row[0]) if row else None
+
     def remove_labels_by_name(self, names: Set[str]) -> int:
         """Delete every label row whose ``label_name`` is in ``names`` (a now-
         excluded set). Embeddings are left cached; the join simply stops

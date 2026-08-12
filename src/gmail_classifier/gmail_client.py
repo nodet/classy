@@ -96,6 +96,13 @@ class GmailClient:
             userId="me", id=message_id, body=body
         ).execute()
 
+    def move_to_inbox(self, message_id: str) -> None:
+        """Add INBOX label to a message (un-archive)."""
+        self._service.users().messages().modify(
+            userId="me", id=message_id,
+            body={"addLabelIds": ["INBOX"]}
+        ).execute()
+
     def get_message_labels(self, message_id: str) -> List[str]:
         """Get the label IDs currently on a message (minimal fetch)."""
         result = self._service.users().messages().get(

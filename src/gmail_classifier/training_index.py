@@ -111,6 +111,15 @@ class TrainingIndex:
             self.labels.append(label)
             self._id_to_idx[message_id] = base + offset
 
+    def rename_label(self, old_name: str, new_name: str) -> int:
+        """Rename all occurrences of old_name to new_name. Returns count."""
+        count = 0
+        for i, label in enumerate(self.labels):
+            if label == old_name:
+                self.labels[i] = new_name
+                count += 1
+        return count
+
     def remove(self, message_id: str):
         """Remove a message from the index. No-op if not present."""
         if message_id not in self._id_to_idx:
