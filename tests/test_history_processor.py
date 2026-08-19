@@ -1,6 +1,8 @@
 """Tests for history-based notification processing."""
 from unittest.mock import MagicMock, patch
 import numpy as np
+from googleapiclient.errors import HttpError
+import httplib2
 
 from gmail_classifier.history_processor import process_history_events
 from gmail_classifier.models import HistoryEvent, Message
@@ -238,3 +240,37 @@ def test_process_excluded_label_not_applied():
 
     # Message was classified but label not applied
     client.apply_label.assert_not_called()
+
+
+def test_process_skips_deleted_message_404():
+    """A 404 from get_message (message deleted) should skip, not crash."""
+    events = [
+        HistoryEvent(type="messagesAdded", message_id="gone", label_ids=["INBOX"]),
+        HistoryEvent(type="messagesAdded", message_id="msg2", label_ids=["INBOX"]),
+    ]
+
+    resp = httplib2.Response({"status": 404})
+    error = HttpError(resp, b"Not Found", uri="")
+
+    client = MagicMock()
+    client.get_message.side_effect = [error, _make_raw_message("msg2")]
+    embedder = _make_embedder()
+    skip_ids: set = set()
+
+    results = process_history_events(
+        events=events,
+        client=client,
+        embedder=embedder,
+        train_embeddings=np.zeros((10, 384)),
+        train_labels=["__skip__"] * 10,
+        label_name_to_id={},
+        user_label_ids=set(),
+        excluded_labels=set(),
+        skip_ids=skip_ids,
+        k=5,
+        dry_run=False,
+    )
+
+    assert "gone" in skip_ids
+    assert len(results) == 1
+    assert results[0]["message_id"] == "msg2"

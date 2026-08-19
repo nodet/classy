@@ -30,6 +30,7 @@ from itertools import zip_longest
 from typing import Callable, List, Optional, Set, Tuple
 
 import numpy as np
+from googleapiclient.errors import HttpError
 
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.gmail_parser import parse_gmail_message
@@ -123,11 +124,16 @@ def _fetch_embed_persist(client, embedder, store: StateStore, mid: str,
     store.upsert_label(mid, label_id, label_name, source=source)
     if store.has_embedding(mid):
         return None
-    raw = client.get_message(mid)
+    try:
+        raw = client.get_message(mid)
+    except HttpError as e:
+        if e.resp.status == 404:
+            store.remove_label(mid)
+            return None
+        raise
     msg = parse_gmail_message(raw)
     vec = embedder.embed(_message_text(msg))
     store.upsert_embedding(mid, vec)
-    # `raw`/`msg` fall out of scope here -- one body held at a time.
     return vec
 
 

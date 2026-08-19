@@ -2,6 +2,7 @@
 from typing import List, Set, Dict, Optional
 
 import numpy as np
+from googleapiclient.errors import HttpError
 
 from gmail_classifier.classifier import classify, Action, SKIP_LABEL
 from gmail_classifier.embeddings import Embedder
@@ -61,7 +62,14 @@ def process_history_events(
 
     results = []
     for mid in new_message_ids:
-        raw = client.get_message(mid)
+        try:
+            raw = client.get_message(mid)
+        except HttpError as e:
+            if e.resp.status == 404:
+                print(f"  [skip] {mid}: deleted before fetch", flush=True)
+                skip_ids.add(mid)
+                continue
+            raise
 
         # Skip if already has a user label
         msg_label_ids = raw.get("labelIds", [])

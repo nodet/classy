@@ -2,6 +2,8 @@
 from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
+from googleapiclient.errors import HttpError
+
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.embeddings import Embedder
 from gmail_classifier.gmail_client import GmailClient
@@ -110,7 +112,13 @@ def process_label_changes(
 
         if added:
             # Fetch the message to store it
-            raw = client.get_message(mid)
+            try:
+                raw = client.get_message(mid)
+            except HttpError as e:
+                if e.resp.status == 404:
+                    print(f"  [skip] {mid}: deleted before fetch", flush=True)
+                    continue
+                raise
             msg = parse_gmail_message(raw)
 
             # Use the first added user label as the training label
@@ -139,7 +147,13 @@ def process_label_changes(
 
         elif removed:
             # Label removed, no label added — check if message still has any user label
-            raw = client.get_message(mid)
+            try:
+                raw = client.get_message(mid)
+            except HttpError as e:
+                if e.resp.status == 404:
+                    print(f"  [skip] {mid}: deleted before fetch", flush=True)
+                    continue
+                raise
             current_label_ids = raw.get("labelIds", [])
             has_user_label = any(lid in user_label_ids for lid in current_label_ids)
 
