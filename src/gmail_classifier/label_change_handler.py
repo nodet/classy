@@ -117,6 +117,7 @@ def process_label_changes(
             except HttpError as e:
                 if e.resp.status == 404:
                     print(f"  [skip] {mid}: deleted before fetch", flush=True)
+                    backend.remove(mid)
                     continue
                 raise
             msg = parse_gmail_message(raw)
