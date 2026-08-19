@@ -33,16 +33,28 @@ class _FakeEmbedder:
         return np.full(self.dimension, 1.0, dtype=np.float32)
 
 
+# Default arrival timestamp (epoch seconds) for inbox ids given as bare
+# strings, chosen far in the future so plain ["i1", "i2"] fixtures keep
+# looking like "arrived after any past cutoff" -- tests that need to exercise
+# the after_ts gap-catchup boundary pass explicit (id, ts) tuples instead.
+_DEFAULT_MSG_TS = 9_999_999_999
+
+
 class _FakeClient:
     """Records watch/list/get calls and serves canned message resources.
 
     ``labels`` maps label_id -> (label_name, [message_ids]); ``inbox`` is the
-    list of INBOX ids. ``get_message`` returns a minimal Gmail resource.
+    list of INBOX ids, or ``(id, sent_ts)`` tuples (epoch seconds) for tests
+    that need to exercise the ``after_ts`` gap-catchup boundary.
+    ``get_message`` returns a minimal Gmail resource.
     """
 
     def __init__(self, labels=None, inbox=None, watch_id="1000"):
         self._labels = labels or {}
-        self._inbox = inbox or []
+        self._inbox = [
+            m if isinstance(m, tuple) else (m, _DEFAULT_MSG_TS)
+            for m in (inbox or [])
+        ]
         self._watch_id = watch_id
         self.watch_calls = 0
         self.get_calls = []
@@ -59,19 +71,22 @@ class _FakeClient:
 
     def list_message_ids(self, label_id, max_results=0):
         if label_id == "INBOX":
-            ids = self._inbox
+            ids = [mid for mid, _ts in self._inbox]
         else:
             ids = self._labels.get(label_id, ("", []))[1]
         return list(ids[:max_results]) if max_results else list(ids)
 
-    def list_unlabeled_inbox_ids(self, max_results=0):
+    def list_unlabeled_inbox_ids(self, max_results=0, after_ts=None):
         # Server-side has:nouserlabels: an INBOX id carrying ANY user label is
         # excluded, regardless of per-label sample caps. This mirrors the real
         # Gmail query so tests exercise the actual guarantee.
         all_labeled = set()
         for _name, ids in self._labels.values():
             all_labeled.update(ids)
-        unlabeled = [mid for mid in self._inbox if mid not in all_labeled]
+        unlabeled = [
+            mid for mid, ts in self._inbox
+            if mid not in all_labeled and (after_ts is None or ts > after_ts)
+        ]
         return list(unlabeled[:max_results]) if max_results else list(unlabeled)
 
     def get_message(self, mid):
@@ -628,6 +643,87 @@ def test_resync_is_idempotent(tmp_path):
     second = {mid: label for mid, _v, label in store.iter_index()}
     assert first == second
     assert store.get_bootstrap_status() == "complete"
+    store.close()
+
+
+# --------------------------------------------------------------------------
+# find_gap_message_ids (Phase 6 gap catchup): classify mail that arrived
+# during a downtime gap, bounded by last_processed_at so a resync never
+# sweeps up backlog older than the gap itself.
+# --------------------------------------------------------------------------
+
+def _empty_index():
+    return TrainingIndex(np.empty((0, 0), dtype=np.float32), [], [])
+
+
+def test_find_gap_message_ids_returns_empty_without_last_at(tmp_path):
+    """No known-good timestamp (Case A / blank slate) -> nothing is a "gap"
+    message; Gmail's current state is the only ground truth."""
+    store = _store(tmp_path)
+    client = _FakeClient(inbox=["i1", "i2"])
+    result = bootstrap.find_gap_message_ids(
+        client, store, _empty_index(), set(), known_before=set(), last_at_ms=None)
+    assert result == []
+    store.close()
+
+
+def test_find_gap_message_ids_subtracts_known_before(tmp_path):
+    """Messages already known before the resync ran (its own snapshot
+    canonicalization aside) are not gap messages."""
+    store = _store(tmp_path)
+    client = _FakeClient(inbox=["i1", "i2"])
+    result = bootstrap.find_gap_message_ids(
+        client, store, _empty_index(), set(), known_before={"i1"}, last_at_ms=1000)
+    assert result == ["i2"]
+    store.close()
+
+
+def test_find_gap_message_ids_excludes_messages_before_last_at(tmp_path):
+    """Only messages that arrived strictly after the known-good timestamp are
+    gap messages -- older unlabeled backlog is left alone."""
+    store = _store(tmp_path)
+    client = _FakeClient(inbox=[("old", 4000), ("new", 6000)])
+    result = bootstrap.find_gap_message_ids(
+        client, store, _empty_index(), set(), known_before=set(),
+        last_at_ms=5_000_000)
+    assert result == ["new"]
+    store.close()
+
+
+def test_find_gap_message_ids_does_not_truncate_large_backlogs(tmp_path):
+    """warn_threshold only logs a heads-up; it must never drop messages --
+    unlike skip_ids, after_ts only moves forward on later resyncs, so a
+    truncated listing would silently and permanently lose the excess."""
+    store = _store(tmp_path)
+    logged = []
+    client = _FakeClient(inbox=["i1", "i2", "i3"])
+    result = bootstrap.find_gap_message_ids(
+        client, store, _empty_index(), set(), known_before=set(),
+        last_at_ms=1000, warn_threshold=2, log=logged.append)
+    assert result == ["i1", "i2", "i3"]  # nothing truncated
+    assert any("large gap backlog" in m for m in logged)
+    store.close()
+
+
+def test_find_gap_message_ids_strips_self_contaminating_skip_row(tmp_path):
+    """A gap message that read_only_resync's own canonicalization already
+    persisted as a __skip__ row (it treats the current unlabeled inbox as
+    ground truth) is stripped from the store/index/skip_ids before catchup
+    gets it -- otherwise it would vote __skip__ on its own classification."""
+    store = _store(tmp_path)
+    store.upsert_label("i1", SKIP_LABEL, SKIP_LABEL, source="auto")
+    store.upsert_embedding("i1", np.full(8, 1.0, dtype=np.float32))
+    index = TrainingIndex(np.full((1, 8), 1.0, dtype=np.float32), [SKIP_LABEL], ["i1"])
+    skip_ids = {"i1"}
+    client = _FakeClient(inbox=["i1"])
+
+    result = bootstrap.find_gap_message_ids(
+        client, store, index, skip_ids, known_before=set(), last_at_ms=1000)
+
+    assert result == ["i1"]
+    assert "i1" not in store.known_ids()
+    assert "i1" not in skip_ids
+    assert index.ids == []
     store.close()
 
 

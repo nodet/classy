@@ -25,6 +25,17 @@ from gmail_classifier.history_processor import collect_new_inbox_ids
 from gmail_classifier.models import HistoryEvent
 
 
+def park_ids(ids: List[str], skip_ids, backend, history_id: str) -> None:
+    """Park each id in ``pending_new`` and mark it seen in ``skip_ids`` so the
+    same session doesn't reconsider it before draining. Shared by
+    :func:`park_immature_mail` (pre-maturity live mail) and gap catchup
+    (read-only resync's downtime backlog) -- both need "record it now, drain
+    it whenever it's safe to classify" with the same crash-safety story."""
+    for mid in ids:
+        backend.park_pending(mid, history_id)
+        skip_ids.add(mid)
+
+
 def park_immature_mail(events, skip_ids, backend, history_id: str) -> List[str]:
     """Park every genuinely-new inbox id in ``events`` for later classification.
 
@@ -34,9 +45,7 @@ def park_immature_mail(events, skip_ids, backend, history_id: str) -> List[str]:
     the caller still processes those, so user corrections keep growing the index
     even before maturity."""
     new_ids = collect_new_inbox_ids(events, skip_ids)
-    for mid in new_ids:
-        backend.park_pending(mid, history_id)
-        skip_ids.add(mid)
+    park_ids(new_ids, skip_ids, backend, history_id)
     return new_ids
 
 

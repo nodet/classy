@@ -540,13 +540,64 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
 
     resume_id = backend.get_last_processed_history_id()
 
+    # Track messages labeled by the classifier itself (to ignore echoed events)
+    self_labeled = set()
+
+    # Declared before _resync (which reads it) can be called, since the
+    # startup call below happens before _build_controller runs -- at that
+    # point this is genuinely None (no controller built yet), which _resync
+    # combines with `plan` to tell "no bootstrap at all" apart from
+    # "bootstrap hasn't started yet." Reassigned once built, further down.
+    controller = None
+
     def _resync():
         from gmail_classifier import bootstrap as _bootstrap
-        return _bootstrap.read_only_resync(
+        from gmail_classifier.pending_new import park_ids
+        log_fn = lambda m: print(f"  {m}", flush=True)
+        # Both must be captured before read_only_resync runs:
+        # - repin_boundary overwrites last_processed_at to "now", so the
+        #   pre-gap timestamp is gone once resync returns.
+        # - resync's own snapshot canonicalization re-lists the current
+        #   unlabeled inbox (up to max_per_label) and persists it as __skip__
+        #   rows, which _reload_index then folds back into skip_ids -- so a
+        #   post-resync skip_ids already "knows" the very gap messages we
+        #   want to catch up on, and the subtraction below would find none.
+        last_at_before = backend.store.get_last_processed_at()
+        skip_ids_before = set(skip_ids)
+        history_id, expiration = _bootstrap.read_only_resync(
             client, embedder, backend.store, PUBSUB_TOPIC,
             excluded=registry._excluded, max_per_label=args.max_per_label,
-            index=index, skip_ids=skip_ids,
-            log=lambda m: print(f"  {m}", flush=True))
+            index=index, skip_ids=skip_ids, log=log_fn)
+
+        if index.embeddings.shape[0] > 0:
+            try:
+                gap_ids = _bootstrap.find_gap_message_ids(
+                    client, backend.store, index, skip_ids, skip_ids_before,
+                    last_at_before, log=log_fn)
+                if gap_ids:
+                    # Park rather than classify inline: parking is durable, so
+                    # a crash/exception mid-drain leaves the survivors for the
+                    # next drain instead of silently losing them (drain_pending
+                    # is idempotent). It also means gap mail naturally waits
+                    # for the maturity gate if a progressive bootstrap is
+                    # still warming -- `controller is None and plan is not
+                    # None` covers the startup call, which runs before
+                    # _build_controller exists yet the plan already says a
+                    # cold bootstrap is about to start.
+                    log_fn(f"Catchup: parking {len(gap_ids)} message(s) from downtime gap")
+                    park_ids(gap_ids, skip_ids, backend, history_id)
+                    immature = (
+                        (controller is not None and not controller.is_mature())
+                        or (controller is None and plan is not None)
+                    )
+                    if immature:
+                        log_fn("Catchup: deferring drain until the index matures")
+                    else:
+                        _make_drain(args, client, embedder, index, registry,
+                                    skip_ids, self_labeled, backend)()
+            except Exception as exc:
+                log_fn(f"Catchup: failed ({exc}); resync boundary still committed")
+        return history_id, expiration
 
     from gmail_classifier.storage_state import GapDecision, classify_gap
     if classify_gap(backend.store, backend.store.now_ms()) is GapDecision.REPLAY:
@@ -555,9 +606,6 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     else:
         print("State backend: history gap too large; running read-only resync...")
         history_id, expiration = _resync()
-
-    # Track messages labeled by the classifier itself (to ignore echoed events)
-    self_labeled = set()
 
     # Drain any pending_new rows stranded by a crash that happened after
     # bootstrap completed but before all parked mail was drained.

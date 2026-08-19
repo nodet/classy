@@ -41,7 +41,8 @@ class GmailClient:
         """
         return self._list_ids({"labelIds": [label_id]}, max_results)
 
-    def list_unlabeled_inbox_ids(self, max_results: int = 0) -> List[str]:
+    def list_unlabeled_inbox_ids(self, max_results: int = 0,
+                                 after_ts: Optional[int] = None) -> List[str]:
         """List INBOX message IDs that carry **no user label** (newest first).
 
         Uses Gmail's ``has:nouserlabels`` search operator so the filtering
@@ -51,8 +52,16 @@ class GmailClient:
         capped sample for its label -- is excluded by the query itself, so it
         can never be persisted as ``__skip__``. Paging continues until
         ``max_results`` true skip examples are collected.
+
+        ``after_ts``, when given, adds Gmail's ``after:<epoch-seconds>``
+        operator so the server-side filter also bounds by arrival time (used
+        by gap catchup to scope to messages that arrived after a known-good
+        timestamp, without relying on History.list replay).
         """
-        return self._list_ids({"q": "in:inbox has:nouserlabels"}, max_results)
+        q = "in:inbox has:nouserlabels"
+        if after_ts is not None:
+            q += f" after:{after_ts}"
+        return self._list_ids({"q": q}, max_results)
 
     def _list_ids(self, list_kwargs: dict, max_results: int) -> List[str]:
         """Shared pager for messages.list: accumulate ids (newest first) up to

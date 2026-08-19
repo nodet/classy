@@ -10,6 +10,7 @@ from gmail_classifier.models import HistoryEvent
 from gmail_classifier.pending_new import (
     drain_pending,
     events_for_ids,
+    park_ids,
     park_immature_mail,
 )
 
@@ -100,6 +101,17 @@ def test_drain_leaves_rows_if_processing_raises():
     except RuntimeError:
         pass
     assert set(backend.pending) == {"n1"}         # not removed
+
+
+def test_park_ids_records_and_marks_seen():
+    """park_ids is the shared primitive behind park_immature_mail; gap catchup
+    uses it directly with a plain id list (no HistoryEvents involved)."""
+    backend = _FakeBackend()
+    skip_ids = set()
+    park_ids(["g1", "g2"], skip_ids, backend, history_id="900")
+    assert set(backend.pending) == {"g1", "g2"}
+    assert backend.pending["g1"] == ("900", "immature")
+    assert skip_ids == {"g1", "g2"}
 
 
 def test_events_for_ids_are_inbox_added():

@@ -523,6 +523,69 @@ def read_only_resync(
     return history_id, expiration
 
 
+# Purely an operator-visible "this is a large backlog" signal, NOT a cap:
+# discovery below is never truncated. after_ts only ever moves forward on
+# later resyncs (read_only_resync re-pins last_processed_at to "now"), so a
+# message excluded from one pass's listing could never be rediscovered by a
+# future one -- silently and permanently, not "caught up later." The caller
+# is expected to park the result (see pending_new.park_ids) rather than
+# classify it inline, so draining an arbitrarily large batch is safe: a
+# crash/failure mid-drain leaves survivors for the next drain, idempotently.
+GAP_CATCHUP_WARN_THRESHOLD = 500
+
+
+def find_gap_message_ids(client, store: StateStore, index, skip_ids: Set[str],
+                         known_before: Set[str], last_at_ms: Optional[int], *,
+                         warn_threshold: int = GAP_CATCHUP_WARN_THRESHOLD,
+                         log: Callable[..., None] = _noop) -> List[str]:
+    """Find inbox messages that arrived during a downtime gap, for
+    :func:`read_only_resync`'s caller to park + classify normally afterward.
+
+    Call this AFTER ``read_only_resync`` (passing its rebuilt ``store``/
+    ``index``/``skip_ids``), but ``known_before``/``last_at_ms`` must be
+    captured BEFORE it ran, not read fresh afterward:
+
+    - ``read_only_resync`` re-pins ``last_processed_at`` to "now" as part of
+      re-pinning the boundary, so the pre-gap timestamp is gone once it
+      returns -- pass the value read before calling it as ``last_at_ms``.
+    - ``read_only_resync``'s own snapshot canonicalization re-lists the
+      current unlabeled inbox (up to ``max_per_label``) and persists it as
+      ``__skip__`` rows, folding them into ``skip_ids`` -- so a **post**-
+      resync ``skip_ids`` already "knows" the very gap messages this function
+      is meant to find. Pass the **pre**-resync snapshot as ``known_before``.
+
+    Two cases:
+
+    - ``last_at_ms is None`` -- no prior known-good state (a true blank
+      slate, same as cold bootstrap). Gmail's current state is the ground
+      truth; nothing is a "gap" message, so this returns ``[]``.
+    - Otherwise -- messages that arrived strictly after ``last_at_ms`` and
+      were not already known before the resync are the gap. Bounding by
+      timestamp (rather than just "unlabeled and not in known_before")
+      matters because ``skip_ids`` never contains inbox backlog older than
+      cold bootstrap's ``max_per_label`` cap; without the time bound, every
+      future resync would also sweep up that old backlog.
+
+    Any returned id's ``__skip__`` row -- just persisted by resync's own
+    canonicalization, since it treats the current unlabeled inbox as ground
+    truth -- is stripped from ``store``, and ``index``/``skip_ids`` reloaded.
+    Without this, a gap message would appear in its own training pool as a
+    vote for ``__skip__``, biasing its classification against being labeled
+    at all."""
+    if last_at_ms is None:
+        return []
+    after_ts = last_at_ms // 1000
+    unlabeled = client.list_unlabeled_inbox_ids(after_ts=after_ts)
+    gap_ids = [mid for mid in unlabeled if mid not in known_before]
+    if len(gap_ids) > warn_threshold:
+        log(f"Catchup: large gap backlog ({len(gap_ids)} messages)")
+    if gap_ids:
+        for mid in gap_ids:
+            store.remove_label(mid)
+        _reload_index(store, index, skip_ids)
+    return gap_ids
+
+
 def heartbeat_cursor(
     client, store: StateStore, now_ms: int,
     log: Callable[..., None] = _noop,
