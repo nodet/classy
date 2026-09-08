@@ -326,3 +326,61 @@ def test_send_message():
     assert "subject: test subject" in decoded_lower
     assert "Hello body" in decoded
     service.users().messages().send.return_value.execute.assert_called_once()
+
+
+# --- rate-limit retry tests ---
+
+_RATE_LIMIT_CONTENT = (
+    b'{"error": {"code": 403, "message": "Quota exceeded for quota metric '
+    b"'Total Query Cost' and limit 'Units per minute per user' of service "
+    b"'gmail.googleapis.com'.\", \"errors\": [{\"message\": \"Quota exceeded...\", "
+    b'"domain": "usageLimits", "reason": "rateLimitExceeded"}]}}'
+)
+
+
+def _rate_limit_error():
+    from googleapiclient.errors import HttpError
+
+    resp = MagicMock()
+    resp.status = 403
+    return HttpError(resp=resp, content=_RATE_LIMIT_CONTENT)
+
+
+def test_get_message_retries_on_rate_limit_then_succeeds():
+    service = MagicMock()
+    service.users().messages().get.return_value.execute.side_effect = [
+        _rate_limit_error(),
+        _rate_limit_error(),
+        {"id": "msg1", "payload": {}},
+    ]
+    client = GmailClient(service)
+    with patch("gmail_classifier.gmail_client.time.sleep") as mock_sleep:
+        result = client.get_message("msg1")
+    assert result == {"id": "msg1", "payload": {}}
+    assert mock_sleep.call_count == 2
+
+
+def test_get_message_raises_after_exhausting_retries():
+    from googleapiclient.errors import HttpError
+
+    service = MagicMock()
+    service.users().messages().get.return_value.execute.side_effect = _rate_limit_error()
+    client = GmailClient(service)
+    with patch("gmail_classifier.gmail_client.time.sleep"):
+        with pytest.raises(HttpError):
+            client.get_message("msg1")
+
+
+def test_get_message_does_not_retry_non_rate_limit_403():
+    from googleapiclient.errors import HttpError
+
+    service = MagicMock()
+    resp = MagicMock()
+    resp.status = 403
+    error = HttpError(resp=resp, content=b'{"error": {"message": "Permission denied"}}')
+    service.users().messages().get.return_value.execute.side_effect = error
+    client = GmailClient(service)
+    with patch("gmail_classifier.gmail_client.time.sleep") as mock_sleep:
+        with pytest.raises(HttpError):
+            client.get_message("msg1")
+    mock_sleep.assert_not_called()

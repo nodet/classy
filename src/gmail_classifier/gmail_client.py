@@ -1,8 +1,42 @@
 import base64
+import time
 from email.mime.text import MIMEText
 from typing import List, Optional, Tuple
 
+from googleapiclient.errors import HttpError
+
 from gmail_classifier.models import HistoryEvent, HistoryExpiredError
+
+_MAX_RETRIES = 8
+_INITIAL_BACKOFF_SECONDS = 2.0
+_MAX_BACKOFF_SECONDS = 60.0
+
+
+def _is_rate_limit_error(e: HttpError) -> bool:
+    """True for Gmail's per-minute quota errors, which clear on their own."""
+    if e.resp.status == 429:
+        return True
+    if e.resp.status != 403:
+        return False
+    text = str(e)
+    return any(r in text for r in
+                ("rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"))
+
+
+def _execute(request):
+    """Run a Gmail API request, retrying with exponential backoff on
+    rate-limit/quota errors. Other errors (404, permission, etc.) propagate
+    immediately -- callers that special-case those (e.g. 404-as-deleted)
+    still see them on the first attempt."""
+    backoff = _INITIAL_BACKOFF_SECONDS
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return request.execute()
+        except HttpError as e:
+            if not _is_rate_limit_error(e) or attempt == _MAX_RETRIES - 1:
+                raise
+            time.sleep(backoff)
+            backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
 
 
 class GmailClient:
@@ -18,12 +52,12 @@ class GmailClient:
         produced it, so a copied/stale DB from another account is rejected
         rather than warm-started with the wrong label ids and history cursor.
         """
-        profile = self._service.users().getProfile(userId="me").execute()
+        profile = _execute(self._service.users().getProfile(userId="me"))
         return profile.get("emailAddress", "")
 
     def list_user_labels(self) -> List[Tuple[str, str]]:
         """List user-created labels. Returns [(id, name), ...]."""
-        response = self._service.users().labels().list(userId="me").execute()
+        response = _execute(self._service.users().labels().list(userId="me"))
         labels = response.get("labels", [])
         return [
             (l["id"], l["name"])
@@ -75,7 +109,7 @@ class GmailClient:
             if max_results:
                 # Request at most what we still need (Gmail caps at 500 per page)
                 kwargs["maxResults"] = min(max_results - len(ids), 500)
-            response = self._service.users().messages().list(**kwargs).execute()
+            response = _execute(self._service.users().messages().list(**kwargs))
             messages = response.get("messages", [])
             ids.extend(m["id"] for m in messages)
             if max_results and len(ids) >= max_results:
@@ -88,9 +122,9 @@ class GmailClient:
 
     def get_message(self, message_id: str) -> dict:
         """Get a single message by ID."""
-        return self._service.users().messages().get(
+        return _execute(self._service.users().messages().get(
             userId="me", id=message_id, format="full"
-        ).execute()
+        ))
 
     def get_messages(self, message_ids: List[str]) -> List[dict]:
         """Get multiple messages by ID."""
@@ -101,22 +135,22 @@ class GmailClient:
         body = {"addLabelIds": [label_id]}
         if archive:
             body["removeLabelIds"] = ["INBOX"]
-        self._service.users().messages().modify(
+        _execute(self._service.users().messages().modify(
             userId="me", id=message_id, body=body
-        ).execute()
+        ))
 
     def move_to_inbox(self, message_id: str) -> None:
         """Add INBOX label to a message (un-archive)."""
-        self._service.users().messages().modify(
+        _execute(self._service.users().messages().modify(
             userId="me", id=message_id,
             body={"addLabelIds": ["INBOX"]}
-        ).execute()
+        ))
 
     def get_message_labels(self, message_id: str) -> List[str]:
         """Get the label IDs currently on a message (minimal fetch)."""
-        result = self._service.users().messages().get(
+        result = _execute(self._service.users().messages().get(
             userId="me", id=message_id, format="minimal"
-        ).execute()
+        ))
         return result.get("labelIds", [])
 
     def get_history(self, start_history_id: str) -> Tuple[List[HistoryEvent], Optional[str]]:
@@ -132,8 +166,6 @@ class GmailClient:
 
         Raises HistoryExpiredError if the history ID is too old.
         """
-        from googleapiclient.errors import HttpError
-
         events = []
         latest_history_id = None
         page_token = None
@@ -142,7 +174,7 @@ class GmailClient:
             if page_token:
                 kwargs["pageToken"] = page_token
             try:
-                response = self._service.users().history().list(**kwargs).execute()
+                response = _execute(self._service.users().history().list(**kwargs))
             except HttpError as e:
                 if e.resp.status == 404:
                     raise HistoryExpiredError(
@@ -187,12 +219,12 @@ class GmailClient:
 
         Returns (history_id, expiration_ms).
         """
-        result = self._service.users().watch(
+        result = _execute(self._service.users().watch(
             userId="me",
             body={
                 "topicName": topic_name,
             },
-        ).execute()
+        ))
         return result["historyId"], int(result["expiration"])
 
     def send_message(self, to: str, subject: str, body: str):
@@ -201,6 +233,6 @@ class GmailClient:
         msg["to"] = to
         msg["subject"] = subject
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        self._service.users().messages().send(
+        _execute(self._service.users().messages().send(
             userId="me", body={"raw": raw}
-        ).execute()
+        ))
