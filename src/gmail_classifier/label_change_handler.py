@@ -64,11 +64,15 @@ def process_label_changes(
                 excluded_labels_set.add(name)
         excluded_labels = excluded_labels_set
 
-    # Collect affected messages and their events. "added"/"removed" are
-    # dicts used as insertion-ordered sets (plain sets have hash-order
-    # iteration, which made picking a single label among several arbitrary
-    # and non-reproducible -- see the len(added) > 1 warning below).
-    affected = {}  # message_id -> {"added": {}, "removed": {}}
+    # Collect each message's net label deltas. Per message, ``deltas[mid]``
+    # is a single dict of label_id -> "added"/"removed", keyed by that id's
+    # LAST touch in the batch: each update pops the id before reinserting it,
+    # so a re-touched id both moves to the end (giving a true chronological
+    # order to break ties on) and overwrites any earlier op for the same id
+    # -- a label added then undone later in the same batch nets out to just
+    # "removed" instead of incorrectly surviving in both "added" and
+    # "removed" independently.
+    deltas: Dict[str, Dict[str, str]] = {}
     for event in events:
         if event.type not in ("labelsAdded", "labelsRemoved"):
             continue
@@ -84,12 +88,18 @@ def process_label_changes(
             continue
 
         mid = event.message_id
-        if mid not in affected:
-            affected[mid] = {"added": {}, "removed": {}}
-
-        bucket = affected[mid]["added" if event.type == "labelsAdded" else "removed"]
+        delta = deltas.setdefault(mid, {})
+        op = "added" if event.type == "labelsAdded" else "removed"
         for lid in relevant_labels:
-            bucket[lid] = None
+            delta.pop(lid, None)
+            delta[lid] = op
+
+    affected = {}  # message_id -> {"added": {}, "removed": {}}
+    for mid, delta in deltas.items():
+        affected[mid] = {
+            "added": {lid: None for lid, op in delta.items() if op == "added"},
+            "removed": {lid: None for lid, op in delta.items() if op == "removed"},
+        }
 
     # Skip the classifier's own echoed labelsAdded event. Durable (survives a
     # crash between applying the label and seeing its echo) -- see

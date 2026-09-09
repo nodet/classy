@@ -139,6 +139,36 @@ def test_two_labels_added_in_one_batch_keeps_the_last_and_warns(caplog):
     assert "2 labels added in one batch" in caplog.text
 
 
+def test_added_then_undone_in_same_batch_nets_out_to_the_surviving_label(caplog):
+    """Label_1 added, Label_2 added, then Label_2 undone -- all in one batch.
+    The net effect is just Label_1; Label_2 must not still count as an added
+    candidate (it would previously have been picked as "most recent"), and
+    since there's no real ambiguity left, no contention warning should fire."""
+    events = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_2"]),
+        HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_2"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_1"])
+
+    backend = FakeBackend()
+
+    with caplog.at_level("WARNING"):
+        process_label_changes(
+            events=events,
+            client=client,
+            backend=backend,
+            label_id_to_name={"Label_1": "Tech", "Label_2": "Travel"},
+            user_label_ids={"Label_1", "Label_2"},
+            excluded_labels=set(),
+        )
+
+    assert backend.labeled["msg1"].labels == ["Tech"]
+    assert "labels added in one batch" not in caplog.text
+
+
 def test_label_removed_while_trashed_does_not_become_a_skip_example():
     """A message trashed while losing its only label is not 'returned to a
     clean inbox' -- it must not be trained on as an ordinary negative
