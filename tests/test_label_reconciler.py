@@ -237,7 +237,7 @@ def test_deleted_label_crash_mid_loop_leaves_original_labels_intact(tmp_path):
 
     # Rolled back: every message still shows its ORIGINAL label, none erased
     # and none left half-converted to skip.
-    assert store.message_ids_by_label("Travel") == {"m1", "m2", "m3"}
+    assert store.message_ids_by_label_id("L2") == {"m1", "m2", "m3"}
     assert store.known_ids() == {"m1", "m2", "m3"}
     store.close()
 

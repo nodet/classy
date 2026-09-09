@@ -682,35 +682,8 @@ def test_loop_persist_cursor_is_durable_across_restart(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# StateStore: message_ids_by_label, rename_label, get_embedding
+# StateStore: message_ids_by_label_id, rename_label_by_id, get_embedding
 # --------------------------------------------------------------------------
-
-def test_message_ids_by_label(tmp_path):
-    store = StateStore(str(tmp_path / "state.db"))
-    store.upsert_label("m1", "L1", "Tech")
-    store.upsert_label("m2", "L1", "Tech")
-    store.upsert_label("m3", "L2", "Travel")
-
-    assert store.message_ids_by_label("Tech") == {"m1", "m2"}
-    assert store.message_ids_by_label("Travel") == {"m3"}
-    assert store.message_ids_by_label("Nonexistent") == set()
-    store.close()
-
-
-def test_rename_label(tmp_path):
-    store = StateStore(str(tmp_path / "state.db"))
-    store.upsert_label("m1", "L1", "Tech")
-    store.upsert_label("m2", "L1", "Tech")
-    store.upsert_label("m3", "L2", "Travel")
-
-    count = store.rename_label("Tech", "Technologie")
-
-    assert count == 2
-    assert store.message_ids_by_label("Technologie") == {"m1", "m2"}
-    assert store.message_ids_by_label("Tech") == set()
-    assert store.message_ids_by_label("Travel") == {"m3"}
-    store.close()
-
 
 def test_message_ids_by_label_id(tmp_path):
     store = StateStore(str(tmp_path / "state.db"))
@@ -755,7 +728,8 @@ def test_rename_label_by_id_rolls_back_with_other_writes_in_the_same_transaction
         pass
 
     assert store.message_ids_by_label_id("L1") == {"m1"}
-    assert store.message_ids_by_label("Technologie") == set()
+    rows = {mid: name for mid, _, name, _ in store.iter_labels()}
+    assert rows == {"m1": "Tech"}  # rename rolled back too, m2 never inserted
     assert store.known_ids() == {"m1"}
     store.close()
 

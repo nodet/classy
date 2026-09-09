@@ -111,15 +111,6 @@ class TrainingIndex:
             self.labels.append(label)
             self._id_to_idx[message_id] = base + offset
 
-    def rename_label(self, old_name: str, new_name: str) -> int:
-        """Rename all occurrences of old_name to new_name. Returns count."""
-        count = 0
-        for i, label in enumerate(self.labels):
-            if label == old_name:
-                self.labels[i] = new_name
-                count += 1
-        return count
-
     def relabel(self, message_id: str, new_label: str) -> bool:
         """Set one entry's label by id, not by matching its current name --
         immune to a different entry coincidentally sharing that name. Returns
