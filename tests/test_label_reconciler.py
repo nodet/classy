@@ -120,7 +120,7 @@ def test_renamed_label_updates_store_and_index():
     assert index.labels.count("Voyages") == 2
 
 
-def test_move_to_inbox_failure_continues():
+def test_move_to_inbox_failure_continues(caplog):
     registry = _make_registry([("L1", "Tech"), ("L2", "Travel")])
     vec = np.random.randn(384).astype(np.float32)
     store = _make_store(
@@ -135,7 +135,15 @@ def test_move_to_inbox_failure_continues():
 
     registry._client.list_user_labels.return_value = [("L1", "Tech")]
 
-    reconcile_labels(registry, store, index, client, skip_ids, log)
+    with caplog.at_level("WARNING"):
+        reconcile_labels(registry, store, index, client, skip_ids, log)
+
+    # The failure is surfaced (not silently swallowed at debug level), and
+    # the message that failed to move is still marked skip -- see next
+    # assertions -- but the summary log line flags it so it's discoverable.
+    assert "move_to_inbox failed" in caplog.text
+    summary = log.call_args.args[0]
+    assert "1 FAILED to move" in summary
 
     # Both messages still cleaned up in store despite one API failure
     store.remove_labels_by_name.assert_not_called()

@@ -47,12 +47,21 @@ def reconcile_labels(
             continue
 
         reinboxed = 0
+        failed = []
         for mid in mids:
             try:
                 client.move_to_inbox(mid)
                 reinboxed += 1
-            except Exception:
-                logger.debug("move_to_inbox failed for %s", mid, exc_info=True)
+            except Exception as exc:
+                # move_to_inbox already retries rate-limit errors with backoff
+                # (GmailClient._execute), so reaching here means a persistent
+                # failure. The message still gets skip-marked below (its old
+                # label is gone from Gmail either way) but is now durably
+                # stuck outside the inbox -- warn, don't bury it at debug,
+                # so it's discoverable the same way the incident that started
+                # this whole review was: by reading the log.
+                logger.warning("move_to_inbox failed for %s: %s", mid, exc)
+                failed.append(mid)
 
         # One commit-or-rollback unit: upsert_label's INSERT OR REPLACE (keyed
         # on message_id, the table's PRIMARY KEY) already replaces each old
@@ -72,5 +81,7 @@ def reconcile_labels(
                     index.add(mid, vec, SKIP_LABEL)
                 skip_ids.add(mid)
 
+        suffix = (f", {len(failed)} FAILED to move (still marked skip, "
+                  f"check logs: {failed})") if failed else ""
         log(f"Label deleted: {old_name} — {reinboxed}/{len(mids)} "
-            f"messages moved to inbox")
+            f"messages moved to inbox{suffix}")
