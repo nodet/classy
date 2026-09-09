@@ -1,5 +1,5 @@
 """Process Gmail history events: classify new messages."""
-from typing import List, Set, Dict, Optional
+from typing import Callable, List, Set, Dict, Optional
 
 import numpy as np
 from googleapiclient.errors import HttpError
@@ -43,11 +43,19 @@ def process_history_events(
     k: int = 5,
     dry_run: bool = False,
     registry: Optional[LabelRegistry] = None,
+    mark_self_labeled: Callable[[str], None] = lambda mid: None,
 ) -> List[dict]:
     """Process history events and classify new inbox messages.
 
     If registry is provided, it is used for label lookups (supports
     dynamically discovered labels).
+
+    ``mark_self_labeled`` is called immediately after a label is actually
+    applied (not deferred until the whole batch finishes) so the "this was
+    the classifier's own action" fact survives a crash later in this same
+    batch -- otherwise the echoed history event for it would get mistaken
+    for a genuine user correction on a later run. Defaults to a no-op for
+    callers that don't need the distinction (e.g. dry-run tooling).
 
     Returns a list of result dicts with keys:
         message_id, action, label, confidence, sender, subject
@@ -113,6 +121,7 @@ def process_history_events(
             if label_id and result.label not in excluded_labels:
                 if not dry_run:
                     client.apply_label(mid, label_id, archive=True)
+                    mark_self_labeled(mid)
                 entry["applied"] = True
             else:
                 entry["applied"] = False

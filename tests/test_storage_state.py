@@ -161,6 +161,35 @@ def test_pending_new_insert_drain_idempotent(tmp_path):
     store.close()
 
 
+def test_self_labeled_mark_check_unmark(tmp_path):
+    """Durable echo-suppression marker: survives being checked without being
+    consumed, is idempotent to mark twice, and is a true one-shot on unmark."""
+    store = StateStore(str(tmp_path / "state.db"))
+    assert store.is_self_labeled("m1") is False
+
+    store.mark_self_labeled("m1")
+    store.mark_self_labeled("m1")  # duplicate -> no-op (INSERT OR IGNORE)
+    assert store.is_self_labeled("m1") is True
+
+    store.unmark_self_labeled("m1")
+    store.unmark_self_labeled("m1")  # already gone -> no-op
+    assert store.is_self_labeled("m1") is False
+    store.close()
+
+
+def test_self_labeled_survives_reopening_the_store(tmp_path):
+    """The whole point: unlike an in-memory set, this marker is still there
+    after the process that wrote it is gone and a fresh one reopens the file."""
+    db_path = str(tmp_path / "state.db")
+    store = StateStore(db_path)
+    store.mark_self_labeled("m1")
+    store.close()
+
+    reopened = StateStore(db_path)
+    assert reopened.is_self_labeled("m1") is True
+    reopened.close()
+
+
 # --------------------------------------------------------------------------
 # Fingerprints
 # --------------------------------------------------------------------------

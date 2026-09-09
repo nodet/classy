@@ -340,7 +340,7 @@ def main():
 
 
 def _classify_new_ids(new_ids, args, client, embedder, index, registry,
-                      skip_ids, self_labeled, backend):
+                      skip_ids, backend):
     """Fetch, classify, and label/skip a list of new inbox message ids.
 
     Reuses ``process_history_events`` by synthesizing ``messagesAdded`` events
@@ -372,6 +372,7 @@ def _classify_new_ids(new_ids, args, client, embedder, index, registry,
         k=args.k,
         dry_run=args.dry_run,
         registry=registry,
+        mark_self_labeled=backend.mark_self_labeled,
     )
     w = registry.max_label_width
     for r in results:
@@ -379,8 +380,6 @@ def _classify_new_ids(new_ids, args, client, embedder, index, registry,
         subject = r["subject"]
         if r["action"] in (Action.LABEL, Action.LABEL_WITH_REVIEW):
             print(truncate(f"{now()} {r['label']:{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
-            if r.get("applied"):
-                self_labeled.add(r["message_id"])
         else:
             print(truncate(f"{now()} {'':{w}s}  {r['confidence']:6.1%}  {sender} — {subject}"))
             if not args.dry_run:
@@ -390,7 +389,7 @@ def _classify_new_ids(new_ids, args, client, embedder, index, registry,
 
 
 def _process_events(events, args, client, embedder, index, registry,
-                    skip_ids, self_labeled, backend, controller=None,
+                    skip_ids, backend, controller=None,
                     history_id=None):
     """Handle a batch of history events: label changes, classification, output.
 
@@ -419,7 +418,6 @@ def _process_events(events, args, client, embedder, index, registry,
         index=index,
         embedder=embedder,
         registry=registry,
-        ignore_ids=self_labeled,
     )
 
     for src, dst, count in movements:
@@ -439,7 +437,7 @@ def _process_events(events, args, client, embedder, index, registry,
         if new_ids:
             results = _classify_new_ids(
                 new_ids, args, client, embedder, index, registry,
-                skip_ids, self_labeled, backend)
+                skip_ids, backend)
 
     # Only reclaim when the batch did real work. Hand back the heap a heavy
     # message (big HTML parse + embed) just grew, so RSS falls back to idle
@@ -485,7 +483,7 @@ class _MaturityController:
 
 
 def _make_drain(args, client, embedder, index, registry, skip_ids,
-                self_labeled, backend):
+                backend):
     """A closure that classifies and clears every parked ``pending_new`` row
     through the normal classifier. Reused by the bootstrap controller (drained
     when the gate opens) and by the warm-startup drain below."""
@@ -494,13 +492,13 @@ def _make_drain(args, client, embedder, index, registry, skip_ids,
     def _drain():
         drain_pending(backend, process_ids=lambda ids: _classify_new_ids(
             ids, args, client, embedder, index, registry,
-            skip_ids, self_labeled, backend))
+            skip_ids, backend))
 
     return _drain
 
 
 def _build_controller(plan, args, client, embedder, index, registry, skip_ids,
-                      self_labeled, backend, log):
+                      backend, log):
     """Construct the progressive-bootstrap maturity controller, or ``None`` when
     there is no cold bootstrap to run (warm/reconcile/rebuild/legacy)."""
     if plan is None:
@@ -515,7 +513,7 @@ def _build_controller(plan, args, client, embedder, index, registry, skip_ids,
         log=lambda m: print(f"  {m}", flush=True),
     )
     drain = _make_drain(args, client, embedder, index, registry, skip_ids,
-                        self_labeled, backend)
+                        backend)
     return _MaturityController(driver, drain, log)
 
 
@@ -539,9 +537,6 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     print(f"  Watch active, historyId={watch_history_id}")
 
     resume_id = backend.get_last_processed_history_id()
-
-    # Track messages labeled by the classifier itself (to ignore echoed events)
-    self_labeled = set()
 
     # Declared before _resync (which reads it) can be called, since the
     # startup call below happens before _build_controller runs -- at that
@@ -594,7 +589,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
                         log_fn("Catchup: deferring drain until the index matures")
                     else:
                         _make_drain(args, client, embedder, index, registry,
-                                    skip_ids, self_labeled, backend)()
+                                    skip_ids, backend)()
             except Exception as exc:
                 log_fn(f"Catchup: failed ({exc}); resync boundary still committed")
         return history_id, expiration
@@ -611,7 +606,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     # bootstrap completed but before all parked mail was drained.
     if plan is None:
         _make_drain(args, client, embedder, index, registry, skip_ids,
-                    self_labeled, backend)()
+                    backend)()
 
     if args.once:
         return
@@ -630,7 +625,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
     # Progressive bootstrap controller (cold boot only). None on warm start,
     # where _process_events classifies new mail immediately.
     controller = _build_controller(
-        plan, args, client, embedder, index, registry, skip_ids, self_labeled,
+        plan, args, client, embedder, index, registry, skip_ids,
         backend, _log)
 
     import time as _time
@@ -652,7 +647,7 @@ def _run_pubsub_mode(args, client, credentials, embedder, index,
         # current cursor so parked rows record the historyId they were first
         # seen at.
         _process_events(events, args, client, embedder, index, registry,
-                        skip_ids, self_labeled, backend,
+                        skip_ids, backend,
                         controller=controller, history_id=state.history_id)
 
     def _heartbeat(now_ms):

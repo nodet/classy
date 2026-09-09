@@ -102,6 +102,10 @@ class _PendingBackend:
     def set_last_processed_history_id(self, hid):
         self._cursor = hid
 
+    # self-labeled echo suppression (durable no-op fake for these tests)
+    def mark_self_labeled(self, message_id):
+        pass
+
 
 def _empty_index():
     # An index with a real skip mass so NO_LABEL is the classification outcome.
@@ -135,7 +139,7 @@ def test_drain_classifies_parked_ids_despite_skip_ids():
     client = _FakeClient()
     drain = cal._make_drain(
         _args(), client, _FakeEmbedder(), _empty_index(), _FakeRegistry(),
-        skip_ids, set(), backend)
+        skip_ids, backend)
     drain()
 
     # Both parked messages were actually fetched + classified (not filtered out),

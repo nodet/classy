@@ -378,8 +378,9 @@ def test_movements_summary_label_to_label():
     assert movements == [("Tech", "Travel", 1)]
 
 
-def test_ignore_ids_skips_self_labeled_messages():
-    """Messages in ignore_ids are skipped (classifier's own echo)."""
+def test_self_labeled_skips_classifiers_own_echo():
+    """Messages marked self-labeled (durably, on the backend) are skipped when
+    their echoed labelsAdded event comes back."""
     events = [
         HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
         HistoryEvent(type="labelsAdded", message_id="msg2", label_ids=["Label_1"]),
@@ -389,7 +390,7 @@ def test_ignore_ids_skips_self_labeled_messages():
     client.get_message.return_value = _make_raw_message("msg2", label_ids=["Label_1"])
 
     backend = FakeBackend()
-    ignore_ids = {"msg1"}  # msg1 was labeled by the classifier
+    backend.mark_self_labeled("msg1")  # msg1 was labeled by the classifier
 
     movements = process_label_changes(
         events=events,
@@ -398,18 +399,17 @@ def test_ignore_ids_skips_self_labeled_messages():
         label_id_to_name={"Label_1": "Tech"},
         user_label_ids={"Label_1"},
         excluded_labels=set(),
-        ignore_ids=ignore_ids,
     )
 
     # Only msg2 should be processed (msg1 ignored)
     assert list(backend.labeled) == ["msg2"]
     assert movements == [("inbox", "Tech", 1)]
 
-    # msg1 should be removed from ignore_ids (so future corrections work)
-    assert "msg1" not in ignore_ids
+    # msg1's marker should be consumed (so future corrections work)
+    assert not backend.is_self_labeled("msg1")
 
 
-def test_ignore_ids_allows_subsequent_user_correction():
+def test_self_labeled_allows_subsequent_user_correction():
     """After being ignored once, the same message ID can be processed (user correction)."""
     # First call: classifier labeled msg1, echo comes back → ignored
     events1 = [
@@ -421,7 +421,7 @@ def test_ignore_ids_allows_subsequent_user_correction():
 
     label_id_to_name = {"Label_1": "Tech", "Label_2": "Travel"}
     user_label_ids = {"Label_1", "Label_2"}
-    ignore_ids = {"msg1"}
+    backend.mark_self_labeled("msg1")
 
     process_label_changes(
         events=events1,
@@ -430,11 +430,10 @@ def test_ignore_ids_allows_subsequent_user_correction():
         label_id_to_name=label_id_to_name,
         user_label_ids=user_label_ids,
         excluded_labels=set(),
-        ignore_ids=ignore_ids,
     )
 
-    # msg1 consumed from ignore_ids
-    assert "msg1" not in ignore_ids
+    # msg1's marker consumed
+    assert not backend.is_self_labeled("msg1")
 
     # Second call: user corrects msg1 from Tech to Travel
     events2 = [
@@ -450,7 +449,6 @@ def test_ignore_ids_allows_subsequent_user_correction():
         label_id_to_name=label_id_to_name,
         user_label_ids=user_label_ids,
         excluded_labels=set(),
-        ignore_ids=ignore_ids,
     )
 
     # Should be processed now (user correction)

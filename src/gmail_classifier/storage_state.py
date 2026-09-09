@@ -310,6 +310,9 @@ class StateStore:
                 first_seen_history_id TEXT,
                 reason TEXT
             );
+            CREATE TABLE IF NOT EXISTS self_labeled (
+                message_id TEXT PRIMARY KEY
+            );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -502,6 +505,36 @@ class StateStore:
     def remove_pending(self, message_id: str) -> None:
         self._conn.execute(
             "DELETE FROM pending_new WHERE message_id = ?", (message_id,)
+        )
+        self._conn.commit()
+
+    # --- self_labeled (durable echo suppression) --------------------------
+
+    def mark_self_labeled(self, message_id: str) -> None:
+        """Record that ``message_id``'s current label came from the
+        classifier itself, not a user -- durably, so a crash between
+        applying the label and remembering that fact doesn't lose it. The
+        echoed ``labelsAdded`` history event for this action would otherwise
+        get mistaken for a genuine user correction (INSERT OR IGNORE:
+        marking twice is a no-op)."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO self_labeled (message_id) VALUES (?)",
+            (message_id,),
+        )
+        self._conn.commit()
+
+    def is_self_labeled(self, message_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM self_labeled WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        return row is not None
+
+    def unmark_self_labeled(self, message_id: str) -> None:
+        """One-shot consumption: clears the marker once its echo has been
+        seen and ignored, so a later, genuine user correction on the same
+        message is not silently ignored too."""
+        self._conn.execute(
+            "DELETE FROM self_labeled WHERE message_id = ?", (message_id,)
         )
         self._conn.commit()
 
@@ -701,6 +734,17 @@ class StateBackend:
 
     def remove_pending(self, message_id: str) -> None:
         self._store.remove_pending(message_id)
+
+    # --- self_labeled (durable echo suppression) --------------------------
+
+    def mark_self_labeled(self, message_id: str) -> None:
+        self._store.mark_self_labeled(message_id)
+
+    def is_self_labeled(self, message_id: str) -> bool:
+        return self._store.is_self_labeled(message_id)
+
+    def unmark_self_labeled(self, message_id: str) -> None:
+        self._store.unmark_self_labeled(message_id)
 
     # --- durable history cursor -----------------------------------------
 

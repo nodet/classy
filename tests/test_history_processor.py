@@ -274,3 +274,73 @@ def test_process_skips_deleted_message_404():
     assert "gone" in skip_ids
     assert len(results) == 1
     assert results[0]["message_id"] == "msg2"
+
+
+def test_process_calls_mark_self_labeled_when_label_applied():
+    """mark_self_labeled is called right after a real apply_label -- not
+    deferred to the end of the batch -- so the fact survives a crash later
+    in the same batch instead of being lost with the rest of an in-memory
+    ``results`` list that never got returned."""
+    events = [
+        HistoryEvent(type="messagesAdded", message_id="msg1", label_ids=["INBOX"]),
+    ]
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1")
+    embedder = MagicMock()
+    embedder.embed.return_value = np.ones(384)
+    # Non-zero, identical-direction vectors -> cosine similarity 1.0, so
+    # confidence hits HIGH_CONFIDENCE_THRESHOLD and actually reaches LABEL
+    # (a zero-vector query, per find_neighbors, always yields NO_LABEL).
+    train_embeddings = np.ones((5, 384))
+    train_labels = ["Tech"] * 5
+
+    marked = []
+    process_history_events(
+        events=events,
+        client=client,
+        embedder=embedder,
+        train_embeddings=train_embeddings,
+        train_labels=train_labels,
+        label_name_to_id={"Tech": "Label_1"},
+        user_label_ids={"Label_1"},
+        excluded_labels=set(),
+        skip_ids=set(),
+        k=5,
+        dry_run=False,
+        mark_self_labeled=marked.append,
+    )
+
+    client.apply_label.assert_called_once_with("msg1", "Label_1", archive=True)
+    assert marked == ["msg1"]
+
+
+def test_process_does_not_mark_self_labeled_on_dry_run():
+    """dry_run never mutates Gmail, so it must not mark anything either."""
+    events = [
+        HistoryEvent(type="messagesAdded", message_id="msg1", label_ids=["INBOX"]),
+    ]
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1")
+    embedder = MagicMock()
+    embedder.embed.return_value = np.ones(384)
+    train_embeddings = np.ones((5, 384))
+    train_labels = ["Tech"] * 5
+
+    marked = []
+    process_history_events(
+        events=events,
+        client=client,
+        embedder=embedder,
+        train_embeddings=train_embeddings,
+        train_labels=train_labels,
+        label_name_to_id={"Tech": "Label_1"},
+        user_label_ids={"Label_1"},
+        excluded_labels=set(),
+        skip_ids=set(),
+        k=5,
+        dry_run=True,
+        mark_self_labeled=marked.append,
+    )
+
+    client.apply_label.assert_not_called()
+    assert marked == []
