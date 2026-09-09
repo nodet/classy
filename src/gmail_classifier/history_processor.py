@@ -43,7 +43,7 @@ def process_history_events(
     k: int = 5,
     dry_run: bool = False,
     registry: Optional[LabelRegistry] = None,
-    mark_self_labeled: Callable[[str], None] = lambda mid: None,
+    mark_self_labeled: Callable[[str, str], None] = lambda mid, label_id: None,
 ) -> List[dict]:
     """Process history events and classify new inbox messages.
 
@@ -121,7 +121,7 @@ def process_history_events(
             if label_id and result.label not in excluded_labels:
                 if not dry_run:
                     client.apply_label(mid, label_id, archive=True)
-                    mark_self_labeled(mid)
+                    mark_self_labeled(mid, label_id)
                 entry["applied"] = True
             else:
                 entry["applied"] = False

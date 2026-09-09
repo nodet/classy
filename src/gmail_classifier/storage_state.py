@@ -311,7 +311,8 @@ class StateStore:
                 reason TEXT
             );
             CREATE TABLE IF NOT EXISTS self_labeled (
-                message_id TEXT PRIMARY KEY
+                message_id TEXT PRIMARY KEY,
+                label_id TEXT
             );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -319,6 +320,15 @@ class StateStore:
             );
             """
         )
+        # Migration: state.db files created before label_id was tracked have
+        # a self_labeled table without this column. ALTER TABLE ADD COLUMN
+        # is a no-op-safe, idempotent way to backfill it (existing rows get
+        # NULL, which get_self_labeled_label_id treats the same as "unknown"
+        # -- their echo is a one-batch-old marker that will simply not be
+        # matched to a specific added label id and left alone).
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(self_labeled)")}
+        if "label_id" not in columns:
+            self._conn.execute("ALTER TABLE self_labeled ADD COLUMN label_id TEXT")
         self._conn.commit()
 
     # --- embeddings ------------------------------------------------------
@@ -534,16 +544,23 @@ class StateStore:
 
     # --- self_labeled (durable echo suppression) --------------------------
 
-    def mark_self_labeled(self, message_id: str) -> None:
-        """Record that ``message_id``'s current label came from the
-        classifier itself, not a user -- durably, so a crash between
+    def mark_self_labeled(self, message_id: str, label_id: str) -> None:
+        """Record that ``message_id``'s current label (``label_id``) came
+        from the classifier itself, not a user -- durably, so a crash between
         applying the label and remembering that fact doesn't lose it. The
         echoed ``labelsAdded`` history event for this action would otherwise
-        get mistaken for a genuine user correction (INSERT OR IGNORE:
-        marking twice is a no-op)."""
+        get mistaken for a genuine user correction.
+
+        Remembering *which* label id was self-applied (not just that the
+        message was touched) lets the caller strip only that label id from a
+        batch's delta instead of discarding the whole event -- a genuinely
+        different label added to the same message in the same batch (before
+        this echo is consumed) must still go through. INSERT OR REPLACE: if
+        the classifier relabels its own not-yet-echoed message again, the
+        newer label id is the one whose echo is actually coming."""
         self._conn.execute(
-            "INSERT OR IGNORE INTO self_labeled (message_id) VALUES (?)",
-            (message_id,),
+            "INSERT OR REPLACE INTO self_labeled (message_id, label_id) VALUES (?, ?)",
+            (message_id, label_id),
         )
         self._conn.commit()
 
@@ -552,6 +569,17 @@ class StateStore:
             "SELECT 1 FROM self_labeled WHERE message_id = ?", (message_id,)
         ).fetchone()
         return row is not None
+
+    def get_self_labeled_label_id(self, message_id: str) -> Optional[str]:
+        """The label id recorded by :meth:`mark_self_labeled`, or ``None`` if
+        the message isn't marked, or the marker predates label-id tracking
+        (migrated row, ``label_id`` left ``NULL``) -- callers should fall
+        back to treating an existing-but-``None`` marker as "unknown label,
+        drop the whole event" rather than as "not self-labeled"."""
+        row = self._conn.execute(
+            "SELECT label_id FROM self_labeled WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        return row[0] if row else None
 
     def unmark_self_labeled(self, message_id: str) -> None:
         """One-shot consumption: clears the marker once its echo has been
@@ -761,11 +789,14 @@ class StateBackend:
 
     # --- self_labeled (durable echo suppression) --------------------------
 
-    def mark_self_labeled(self, message_id: str) -> None:
-        self._store.mark_self_labeled(message_id)
+    def mark_self_labeled(self, message_id: str, label_id: str) -> None:
+        self._store.mark_self_labeled(message_id, label_id)
 
     def is_self_labeled(self, message_id: str) -> bool:
         return self._store.is_self_labeled(message_id)
+
+    def get_self_labeled_label_id(self, message_id: str) -> Optional[str]:
+        return self._store.get_self_labeled_label_id(message_id)
 
     def unmark_self_labeled(self, message_id: str) -> None:
         self._store.unmark_self_labeled(message_id)

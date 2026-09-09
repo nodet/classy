@@ -4,6 +4,8 @@ Drive an on-disk SQLite state.db (tmp_path) with a fake embedder -- no network,
 no FastEmbed. Covers the plan's "Unit -- storage_state.py" and "Unit -- startup
 dispatch" gates for Phase 3 (warm path only).
 """
+import sqlite3
+
 import numpy as np
 import pytest
 
@@ -163,13 +165,18 @@ def test_pending_new_insert_drain_idempotent(tmp_path):
 
 def test_self_labeled_mark_check_unmark(tmp_path):
     """Durable echo-suppression marker: survives being checked without being
-    consumed, is idempotent to mark twice, and is a true one-shot on unmark."""
+    consumed, remembers the specific label id, replaces it on a second mark,
+    and is a true one-shot on unmark."""
     store = StateStore(str(tmp_path / "state.db"))
     assert store.is_self_labeled("m1") is False
+    assert store.get_self_labeled_label_id("m1") is None
 
-    store.mark_self_labeled("m1")
-    store.mark_self_labeled("m1")  # duplicate -> no-op (INSERT OR IGNORE)
+    store.mark_self_labeled("m1", "L1")
     assert store.is_self_labeled("m1") is True
+    assert store.get_self_labeled_label_id("m1") == "L1"
+
+    store.mark_self_labeled("m1", "L2")  # relabeled before the echo arrived
+    assert store.get_self_labeled_label_id("m1") == "L2"
 
     store.unmark_self_labeled("m1")
     store.unmark_self_labeled("m1")  # already gone -> no-op
@@ -182,12 +189,35 @@ def test_self_labeled_survives_reopening_the_store(tmp_path):
     after the process that wrote it is gone and a fresh one reopens the file."""
     db_path = str(tmp_path / "state.db")
     store = StateStore(db_path)
-    store.mark_self_labeled("m1")
+    store.mark_self_labeled("m1", "L1")
     store.close()
 
     reopened = StateStore(db_path)
     assert reopened.is_self_labeled("m1") is True
+    assert reopened.get_self_labeled_label_id("m1") == "L1"
     reopened.close()
+
+
+def test_self_labeled_migrates_pre_label_id_schema(tmp_path):
+    """A state.db created before label_id tracking existed has a self_labeled
+    table with only message_id. Opening it with the current code must add
+    the column without losing the row -- the pending marker survives, just
+    without a specific label id (handled by the caller as a coarser
+    fall-back, see label_change_handler.py)."""
+    db_path = str(tmp_path / "state.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE self_labeled (message_id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO self_labeled (message_id) VALUES ('m1')")
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db_path)
+    assert store.is_self_labeled("m1") is True
+    assert store.get_self_labeled_label_id("m1") is None
+
+    store.mark_self_labeled("m2", "L1")
+    assert store.get_self_labeled_label_id("m2") == "L1"
+    store.close()
 
 
 # --------------------------------------------------------------------------

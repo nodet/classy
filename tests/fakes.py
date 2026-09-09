@@ -21,7 +21,7 @@ class FakeBackend:
         self.upsert_skip_calls = []
         self.removed = []
         self._history_id: Optional[str] = None
-        self._self_labeled: set = set()
+        self._self_labeled: Dict[str, str] = {}  # message_id -> label_id
 
     def upsert_label(self, message: Message, label_id: str,
                      vec: Optional[np.ndarray] = None) -> None:
@@ -49,11 +49,14 @@ class FakeBackend:
     def close(self) -> None:
         pass
 
-    def mark_self_labeled(self, message_id: str) -> None:
-        self._self_labeled.add(message_id)
+    def mark_self_labeled(self, message_id: str, label_id: str) -> None:
+        self._self_labeled[message_id] = label_id
 
     def is_self_labeled(self, message_id: str) -> bool:
         return message_id in self._self_labeled
 
+    def get_self_labeled_label_id(self, message_id: str) -> Optional[str]:
+        return self._self_labeled.get(message_id)
+
     def unmark_self_labeled(self, message_id: str) -> None:
-        self._self_labeled.discard(message_id)
+        self._self_labeled.pop(message_id, None)

@@ -474,7 +474,7 @@ def test_self_labeled_skips_classifiers_own_echo():
     client.get_message.return_value = _make_raw_message("msg2", label_ids=["Label_1"])
 
     backend = FakeBackend()
-    backend.mark_self_labeled("msg1")  # msg1 was labeled by the classifier
+    backend.mark_self_labeled("msg1", "Label_1")  # msg1 was labeled by the classifier
 
     movements = process_label_changes(
         events=events,
@@ -493,6 +493,66 @@ def test_self_labeled_skips_classifiers_own_echo():
     assert not backend.is_self_labeled("msg1")
 
 
+def test_self_labeled_echo_does_not_swallow_a_simultaneous_genuine_label():
+    """Bug H: if the classifier just self-labeled msg1 with Label_1, and in
+    the SAME batch the user genuinely also adds Label_2 to msg1 before the
+    Label_1 echo is consumed, only the echoed Label_1 add must be stripped --
+    Label_2's genuine addition must still be processed, not dropped along
+    with the whole event."""
+    events = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_2"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_1", "Label_2"])
+
+    backend = FakeBackend()
+    backend.mark_self_labeled("msg1", "Label_1")  # classifier applied Label_1, echo pending
+
+    process_label_changes(
+        events=events,
+        client=client,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech", "Label_2": "Travel"},
+        user_label_ids={"Label_1", "Label_2"},
+        excluded_labels=set(),
+    )
+
+    # Label_2's genuine addition survives; the echo is consumed, not the
+    # whole message's event.
+    assert backend.labeled["msg1"].labels == ["Travel"]
+    assert not backend.is_self_labeled("msg1")
+
+
+def test_self_labeled_legacy_marker_with_no_label_id_drops_whole_event():
+    """A self_labeled row migrated from the pre-label-id schema (label_id
+    NULL) has no way to identify which added label is the echo -- fall back
+    to the coarser, original behavior of dropping the whole event."""
+    events = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
+        HistoryEvent(type="labelsAdded", message_id="msg2", label_ids=["Label_1"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg2", label_ids=["Label_1"])
+
+    backend = FakeBackend()
+    backend._self_labeled["msg1"] = None  # simulates a migrated, id-less row
+
+    process_label_changes(
+        events=events,
+        client=client,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech"},
+        user_label_ids={"Label_1"},
+        excluded_labels=set(),
+    )
+
+    assert list(backend.labeled) == ["msg2"]
+    assert not backend.is_self_labeled("msg1")
+
+
 def test_self_labeled_allows_subsequent_user_correction():
     """After being ignored once, the same message ID can be processed (user correction)."""
     # First call: classifier labeled msg1, echo comes back → ignored
@@ -505,7 +565,7 @@ def test_self_labeled_allows_subsequent_user_correction():
 
     label_id_to_name = {"Label_1": "Tech", "Label_2": "Travel"}
     user_label_ids = {"Label_1", "Label_2"}
-    backend.mark_self_labeled("msg1")
+    backend.mark_self_labeled("msg1", "Label_1")
 
     process_label_changes(
         events=events1,

@@ -91,14 +91,26 @@ def process_label_changes(
         for lid in relevant_labels:
             bucket[lid] = None
 
-    # Skip messages labeled by the classifier itself (echoed events). Durable
-    # (survives a crash between applying the label and seeing its echo) --
-    # see StateStore.mark_self_labeled.
+    # Skip the classifier's own echoed labelsAdded event. Durable (survives a
+    # crash between applying the label and seeing its echo) -- see
+    # StateStore.mark_self_labeled. Strips only the specific echoed label id
+    # from this message's delta rather than the whole entry, so a genuinely
+    # different label added to the same message in the same batch (before
+    # this echo is consumed) still goes through.
     for mid in list(affected.keys()):
-        if backend.is_self_labeled(mid):
+        if not backend.is_self_labeled(mid):
+            continue
+        echoed_label_id = backend.get_self_labeled_label_id(mid)
+        # One-shot: allow a later, genuine user correction on this message.
+        backend.unmark_self_labeled(mid)
+        if echoed_label_id is None:
+            # Marker predates label-id tracking (migrated row) -- fall back
+            # to the coarser, message-level suppression it was recorded for.
             del affected[mid]
-            # One-shot: allow a later, genuine user correction on this message.
-            backend.unmark_self_labeled(mid)
+            continue
+        affected[mid]["added"].pop(echoed_label_id, None)
+        if not affected[mid]["added"] and not affected[mid]["removed"]:
+            del affected[mid]
 
     # Track movements: (source, destination) -> count
     movements = defaultdict(int)

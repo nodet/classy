@@ -103,7 +103,7 @@ class _PendingBackend:
         self._cursor = hid
 
     # self-labeled echo suppression (durable no-op fake for these tests)
-    def mark_self_labeled(self, message_id):
+    def mark_self_labeled(self, message_id, label_id):
         pass
 
 

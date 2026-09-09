@@ -307,11 +307,11 @@ def test_process_calls_mark_self_labeled_when_label_applied():
         skip_ids=set(),
         k=5,
         dry_run=False,
-        mark_self_labeled=marked.append,
+        mark_self_labeled=lambda mid, label_id: marked.append((mid, label_id)),
     )
 
     client.apply_label.assert_called_once_with("msg1", "Label_1", archive=True)
-    assert marked == ["msg1"]
+    assert marked == [("msg1", "Label_1")]
 
 
 def test_process_does_not_mark_self_labeled_on_dry_run():
@@ -339,7 +339,7 @@ def test_process_does_not_mark_self_labeled_on_dry_run():
         skip_ids=set(),
         k=5,
         dry_run=True,
-        mark_self_labeled=marked.append,
+        mark_self_labeled=lambda mid, label_id: marked.append((mid, label_id)),
     )
 
     client.apply_label.assert_not_called()
