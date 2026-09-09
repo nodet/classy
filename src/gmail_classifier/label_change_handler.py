@@ -35,7 +35,9 @@ def process_label_changes(
 
     - Label added: fetch message, add to training, remove from skip.
     - Label removed: if message has no other user labels, remove from
-      training and add to skip.
+      training and add to skip -- unless it was trashed/spammed, in which
+      case any stale row is just dropped (not trained on as a negative
+      example).
     - Label moved (remove + add same message): update training, not skip.
 
     Persistence goes through the ``StorageBackend`` seam (``upsert_label`` /

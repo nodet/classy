@@ -109,7 +109,13 @@ def _fetch_embed_persist(client, embedder, store: StateStore, mid: str,
 
     The embedding is written **last**, so a crash between the label and embedding
     writes just re-does this one message's embed next boot rather than leaving a
-    permanent labeled row with no vector. Returning the vector lets the
+    permanent labeled row with no vector -- true for callers that let each call
+    commit on its own (``bootstrap_index``/``rebuild_index``/the progressive
+    driver). ``read_only_resync`` instead calls this inside one enclosing
+    ``store.transaction()`` across its whole worklist, so there a crash anywhere
+    in that loop rolls back every message processed so far this run, not just
+    the current one -- the per-message claim above only holds up to whatever
+    the caller's own commit boundary is. Returning the vector lets the
     progressive driver add it to the live in-memory index without a re-read.
 
     ``overwrite_label=False`` is the progressive driver's guard against clobbering

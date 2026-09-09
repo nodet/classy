@@ -271,7 +271,7 @@ class StateStore:
 
     @contextmanager
     def transaction(self):
-        """Defer every write inside this block to one commit-or-rollback unit.
+        """Defer this block's writes to one commit-or-rollback unit.
 
         Without this, ``upsert_label``/``upsert_embedding``/``remove_label``
         each commit immediately, so a crash partway through a multi-message
@@ -279,7 +279,15 @@ class StateStore:
         was processed so far durably committed even though the caller never
         finished -- a later run then misreads that partial state as already
         handled. Wrapping the whole reconciliation in ``with store.transaction():``
-        makes it all-or-nothing."""
+        makes it all-or-nothing.
+
+        Only covers methods that explicitly check ``self._defer_commit``
+        (``upsert_label``, ``upsert_embedding``, ``remove_label``,
+        ``rename_label_by_id``) or, like ``repin_boundary``, fall back to a
+        local ``with self._conn:`` only when *not* already inside one of
+        these blocks. Any other mutating method commits unconditionally --
+        calling one from inside this block silently breaks the all-or-nothing
+        guarantee (an early, partial commit) rather than raising an error."""
         self._defer_commit = True
         try:
             with self._conn:
