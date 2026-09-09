@@ -108,6 +108,37 @@ def test_label_moved_updates_training_not_skip():
     assert "msg1" not in backend.skipped
 
 
+def test_two_labels_added_in_one_batch_keeps_the_last_and_warns(caplog):
+    """The store only holds one label per message. Two labelsAdded events
+    for DIFFERENT labels on the same message in one batch (e.g. a filter, or
+    the user applying two labels) used to pick an arbitrary, non-reproducible
+    winner via unordered set iteration. It must now deterministically keep
+    the most recently-added one and warn, not drop data silently."""
+    events = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_2"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_1", "Label_2"])
+
+    backend = FakeBackend()
+
+    with caplog.at_level("WARNING"):
+        process_label_changes(
+            events=events,
+            client=client,
+            backend=backend,
+            label_id_to_name={"Label_1": "Tech", "Label_2": "Travel"},
+            user_label_ids={"Label_1", "Label_2"},
+            excluded_labels=set(),
+        )
+
+    # Label_2 (the later event) wins, deterministically.
+    assert backend.labeled["msg1"].labels == ["Travel"]
+    assert "2 labels added in one batch" in caplog.text
+
+
 def test_excluded_label_changes_ignored():
     """Changes to excluded labels should be ignored."""
     events = [

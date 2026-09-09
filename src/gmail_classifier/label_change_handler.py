@@ -1,4 +1,5 @@
 """Handle label change events from Gmail history."""
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
@@ -15,6 +16,8 @@ from gmail_classifier.training_index import TrainingIndex
 
 if TYPE_CHECKING:
     from gmail_classifier.storage_state import StateStore as StorageBackend
+
+logger = logging.getLogger(__name__)
 
 
 def process_label_changes(
@@ -61,30 +64,32 @@ def process_label_changes(
                 excluded_labels_set.add(name)
         excluded_labels = excluded_labels_set
 
-    # Collect affected messages and their events
-    affected = {}  # message_id -> {"added": set(), "removed": set()}
+    # Collect affected messages and their events. "added"/"removed" are
+    # dicts used as insertion-ordered sets (plain sets have hash-order
+    # iteration, which made picking a single label among several arbitrary
+    # and non-reproducible -- see the len(added) > 1 warning below).
+    affected = {}  # message_id -> {"added": {}, "removed": {}}
     for event in events:
         if event.type not in ("labelsAdded", "labelsRemoved"):
             continue
 
         # Only care about user label changes
-        relevant_labels = set()
+        relevant_labels = []
         for lid in event.label_ids:
             label_name = label_id_to_name.get(lid)
             if label_name and label_name not in excluded_labels:
-                relevant_labels.add(lid)
+                relevant_labels.append(lid)
 
         if not relevant_labels:
             continue
 
         mid = event.message_id
         if mid not in affected:
-            affected[mid] = {"added": set(), "removed": set()}
+            affected[mid] = {"added": {}, "removed": {}}
 
-        if event.type == "labelsAdded":
-            affected[mid]["added"].update(relevant_labels)
-        else:
-            affected[mid]["removed"].update(relevant_labels)
+        bucket = affected[mid]["added" if event.type == "labelsAdded" else "removed"]
+        for lid in relevant_labels:
+            bucket[lid] = None
 
     # Skip messages labeled by the classifier itself (echoed events). Durable
     # (survives a crash between applying the label and seeing its echo) --
@@ -122,8 +127,18 @@ def process_label_changes(
                 raise
             msg = parse_gmail_message(raw)
 
-            # Use the first added user label as the training label
-            label_id = next(iter(added))
+            # The store only ever holds one label per message (its PRIMARY
+            # KEY is message_id) -- if more than one distinct label landed
+            # on this message in the same batch (e.g. a filter, or the user
+            # applying two labels), keep the most recently-added one and warn
+            # so the drop isn't silent; `added` preserves event order.
+            if len(added) > 1:
+                logger.warning(
+                    "msg %s: %d labels added in one batch (%s); keeping the last",
+                    mid, len(added),
+                    [label_id_to_name.get(lid, lid) for lid in added],
+                )
+            label_id = next(reversed(added))
             label_name = label_id_to_name[label_id]
             msg.labels = [label_name]
 
