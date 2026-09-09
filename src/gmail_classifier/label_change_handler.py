@@ -106,21 +106,30 @@ def process_label_changes(
     # StateStore.mark_self_labeled. Strips only the specific echoed label id
     # from this message's delta rather than the whole entry, so a genuinely
     # different label added to the same message in the same batch (before
-    # this echo is consumed) still goes through.
+    # this echo is consumed) still goes through. Only consumed once the
+    # echoed id is actually found in this batch's "added" -- an unrelated
+    # event on the same message must NOT burn the one-shot marker before the
+    # real echo arrives, or that later echo would be mistaken for a genuine
+    # user correction once the marker is gone.
     for mid in list(affected.keys()):
         if not backend.is_self_labeled(mid):
             continue
         echoed_label_id = backend.get_self_labeled_label_id(mid)
-        # One-shot: allow a later, genuine user correction on this message.
-        backend.unmark_self_labeled(mid)
         if echoed_label_id is None:
-            # Marker predates label-id tracking (migrated row) -- fall back
-            # to the coarser, message-level suppression it was recorded for.
+            # Marker predates label-id tracking (migrated row) -- there's no
+            # way to tell which added label (if any) is the echo, so fall
+            # back to the coarser, message-level suppression it was recorded
+            # for; a one-time transition cost, not a steady-state one.
+            backend.unmark_self_labeled(mid)
             del affected[mid]
             continue
-        affected[mid]["added"].pop(echoed_label_id, None)
-        if not affected[mid]["added"] and not affected[mid]["removed"]:
-            del affected[mid]
+        if echoed_label_id in affected[mid]["added"]:
+            affected[mid]["added"].pop(echoed_label_id)
+            backend.unmark_self_labeled(mid)
+            if not affected[mid]["added"] and not affected[mid]["removed"]:
+                del affected[mid]
+        # else: the echo hasn't arrived in this batch -- leave the marker in
+        # place so a later batch can still recognize and suppress it.
 
     # Track movements: (source, destination) -> count
     movements = defaultdict(int)

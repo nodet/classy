@@ -523,6 +523,56 @@ def test_self_labeled_skips_classifiers_own_echo():
     assert not backend.is_self_labeled("msg1")
 
 
+def test_self_labeled_marker_survives_an_unrelated_event_before_its_echo_arrives():
+    """The one-shot marker must only be consumed once its OWN echoed label is
+    actually seen -- not just because the message shows up in a batch for
+    some unrelated reason. Otherwise the marker is burned before the real
+    echo arrives, and that later echo gets mistaken for a genuine user
+    correction."""
+    backend = FakeBackend()
+    backend.mark_self_labeled("msg1", "Label_1")  # classifier applied Label_1, echo pending
+
+    # Batch 1: an unrelated event on msg1 (Label_1's echo hasn't shown up
+    # yet). msg1 still carries Label_1 in Gmail at this point.
+    events1 = [
+        HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_3"]),
+    ]
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["Label_1"])
+
+    process_label_changes(
+        events=events1,
+        client=client,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech", "Label_3": "Old"},
+        user_label_ids={"Label_1", "Label_3"},
+        excluded_labels=set(),
+    )
+
+    # The marker must still be pending -- the echo it's waiting for never
+    # showed up in batch 1.
+    assert backend.is_self_labeled("msg1")
+    assert backend.get_self_labeled_label_id("msg1") == "Label_1"
+
+    # Batch 2: the real echo finally arrives.
+    events2 = [
+        HistoryEvent(type="labelsAdded", message_id="msg1", label_ids=["Label_1"]),
+    ]
+
+    movements = process_label_changes(
+        events=events2,
+        client=client,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech", "Label_3": "Old"},
+        user_label_ids={"Label_1", "Label_3"},
+        excluded_labels=set(),
+    )
+
+    # The echo is suppressed -- not written as a fresh, genuine label.
+    assert movements == []
+    assert not backend.is_self_labeled("msg1")
+
+
 def test_self_labeled_echo_does_not_swallow_a_simultaneous_genuine_label():
     """Bug H: if the classifier just self-labeled msg1 with Label_1, and in
     the SAME batch the user genuinely also adds Label_2 to msg1 before the
