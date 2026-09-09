@@ -172,7 +172,9 @@ def test_added_then_undone_in_same_batch_nets_out_to_the_surviving_label(caplog)
 def test_label_removed_while_trashed_does_not_become_a_skip_example():
     """A message trashed while losing its only label is not 'returned to a
     clean inbox' -- it must not be trained on as an ordinary negative
-    example. Any stale row should just be dropped instead."""
+    example. Any stale row should just be dropped instead, including its
+    live in-memory index entry (otherwise it keeps voting under its old
+    label until the process restarts)."""
     events = [
         HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
     ]
@@ -183,6 +185,11 @@ def test_label_removed_while_trashed_does_not_become_a_skip_example():
     backend = FakeBackend()
     backend.labeled["msg1"] = Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
 
+    embeddings = np.random.randn(2, 384).astype(np.float32)
+    index = TrainingIndex(embeddings, ["Tech", "Travel"], ["msg1", "msg2"])
+    embedder = MagicMock()
+    embedder.embed.return_value = np.ones(384, dtype=np.float32)
+
     process_label_changes(
         events=events,
         client=client,
@@ -190,11 +197,15 @@ def test_label_removed_while_trashed_does_not_become_a_skip_example():
         label_id_to_name={"Label_1": "Tech"},
         user_label_ids={"Label_1"},
         excluded_labels=set(),
+        index=index,
+        embedder=embedder,
     )
 
     assert "msg1" not in backend.labeled
     assert "msg1" not in backend.skipped
     assert "msg1" in backend.removed
+    assert "msg1" not in index
+    assert "msg2" in index  # unrelated entry untouched
 
 
 def test_label_removed_while_spammed_does_not_become_a_skip_example():
@@ -208,6 +219,11 @@ def test_label_removed_while_spammed_does_not_become_a_skip_example():
     backend = FakeBackend()
     backend.labeled["msg1"] = Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
 
+    embeddings = np.random.randn(2, 384).astype(np.float32)
+    index = TrainingIndex(embeddings, ["Tech", "Travel"], ["msg1", "msg2"])
+    embedder = MagicMock()
+    embedder.embed.return_value = np.ones(384, dtype=np.float32)
+
     process_label_changes(
         events=events,
         client=client,
@@ -215,11 +231,15 @@ def test_label_removed_while_spammed_does_not_become_a_skip_example():
         label_id_to_name={"Label_1": "Tech"},
         user_label_ids={"Label_1"},
         excluded_labels=set(),
+        index=index,
+        embedder=embedder,
     )
 
     assert "msg1" not in backend.labeled
     assert "msg1" not in backend.skipped
     assert "msg1" in backend.removed
+    assert "msg1" not in index
+    assert "msg2" in index
 
 
 def test_excluded_label_changes_ignored():

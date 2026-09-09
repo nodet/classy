@@ -210,6 +210,13 @@ def process_label_changes(
                 # training on it as an ordinary negative example would
                 # conflate two different things. Drop any stale row instead.
                 backend.remove(mid)
+                # Also purge the live in-memory index -- unlike the sibling
+                # SKIP_LABEL branch below, there's no replacement entry to
+                # add, so this message must not keep voting under its old
+                # (now-stale) label until the process restarts and rebuilds
+                # the index from the store.
+                if index is not None:
+                    index.remove(mid)
                 continue
 
             if not has_user_label:
