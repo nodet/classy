@@ -174,6 +174,13 @@ def process_label_changes(
             current_label_ids = raw.get("labelIds", [])
             has_user_label = any(lid in user_label_ids for lid in current_label_ids)
 
+            if not has_user_label and ("TRASH" in current_label_ids or "SPAM" in current_label_ids):
+                # Trashed/spammed mail isn't "returned to a clean inbox" --
+                # training on it as an ordinary negative example would
+                # conflate two different things. Drop any stale row instead.
+                backend.remove(mid)
+                continue
+
             if not has_user_label:
                 # No user labels left — move to skip
                 msg = parse_gmail_message(raw)

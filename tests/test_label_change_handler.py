@@ -139,6 +139,59 @@ def test_two_labels_added_in_one_batch_keeps_the_last_and_warns(caplog):
     assert "2 labels added in one batch" in caplog.text
 
 
+def test_label_removed_while_trashed_does_not_become_a_skip_example():
+    """A message trashed while losing its only label is not 'returned to a
+    clean inbox' -- it must not be trained on as an ordinary negative
+    example. Any stale row should just be dropped instead."""
+    events = [
+        HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["TRASH"])
+
+    backend = FakeBackend()
+    backend.labeled["msg1"] = Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
+
+    process_label_changes(
+        events=events,
+        client=client,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech"},
+        user_label_ids={"Label_1"},
+        excluded_labels=set(),
+    )
+
+    assert "msg1" not in backend.labeled
+    assert "msg1" not in backend.skipped
+    assert "msg1" in backend.removed
+
+
+def test_label_removed_while_spammed_does_not_become_a_skip_example():
+    events = [
+        HistoryEvent(type="labelsRemoved", message_id="msg1", label_ids=["Label_1"]),
+    ]
+
+    client = MagicMock()
+    client.get_message.return_value = _make_raw_message("msg1", label_ids=["SPAM"])
+
+    backend = FakeBackend()
+    backend.labeled["msg1"] = Message(id="msg1", subject="Test", from_address="a@x.com", labels=["Tech"])
+
+    process_label_changes(
+        events=events,
+        client=client,
+        backend=backend,
+        label_id_to_name={"Label_1": "Tech"},
+        user_label_ids={"Label_1"},
+        excluded_labels=set(),
+    )
+
+    assert "msg1" not in backend.labeled
+    assert "msg1" not in backend.skipped
+    assert "msg1" in backend.removed
+
+
 def test_excluded_label_changes_ignored():
     """Changes to excluded labels should be ignored."""
     events = [
