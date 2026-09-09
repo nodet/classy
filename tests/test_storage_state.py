@@ -590,6 +590,48 @@ def test_transaction_commits_all_writes_on_success(tmp_path):
     store.close()
 
 
+def test_repin_boundary_inside_transaction_rolls_back_with_everything_else(tmp_path):
+    """repin_boundary has its own internal ``with self._conn:`` for its
+    standalone use -- but sqlite3 has no true nested transactions, so calling
+    it from inside an outer transaction() block used to commit everything
+    pending the moment it returned, regardless of what happened afterward.
+    read_only_resync calls repin_boundary as the second-to-last statement in
+    its transaction() block (bootstrap.py); this reproduces that shape and
+    confirms a later failure still rolls back the boundary re-pin too."""
+    store = StateStore(str(tmp_path / "state.db"))
+    store.set_meta("bootstrap_status", "complete")
+    store.repin_boundary("100")  # establish an original boundary/cursor
+
+    with pytest.raises(RuntimeError):
+        with store.transaction():
+            store.upsert_label("msg1", "Label_1", "Tech")
+            store.repin_boundary("900")
+            raise RuntimeError("simulated failure after repin_boundary")
+
+    # Nothing from inside the block survived -- including the boundary/cursor
+    # repin_boundary wrote, which used to escape the rollback entirely.
+    assert store.known_ids() == set()
+    assert store.get_last_processed_history_id() == "100"
+    assert store.get_meta("bootstrap_boundary_history_id") == "100"
+    store.close()
+
+
+def test_repin_boundary_inside_transaction_commits_with_everything_else(tmp_path):
+    """Happy-path counterpart: repin_boundary's writes land together with the
+    rest of the transaction on a normal exit."""
+    store = StateStore(str(tmp_path / "state.db"))
+    store.set_meta("bootstrap_status", "complete")
+
+    with store.transaction():
+        store.upsert_label("msg1", "Label_1", "Tech")
+        store.repin_boundary("900")
+
+    assert store.known_ids() == {"msg1"}
+    assert store.get_last_processed_history_id() == "900"
+    assert store.get_bootstrap_status() == "complete"
+    store.close()
+
+
 def test_loop_persist_cursor_is_durable_across_restart(tmp_path):
     """Integration: wiring StateBackend.set_last_processed_history_id as the
     loop's persist_cursor advances the cursor durably, so a fresh backend over

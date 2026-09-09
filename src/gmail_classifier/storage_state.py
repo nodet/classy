@@ -642,17 +642,29 @@ class StateStore:
         status to ``in_progress`` (as ``pin_bootstrap_boundary`` does), the next
         boot would decide BOOTSTRAP and re-fetch the whole corpus. The resync
         only moves the boundary forward so post-boundary history stays untouched;
-        the store is still complete/WARM."""
+        the store is still complete/WARM.
+
+        Honors an enclosing :meth:`transaction`: sqlite3's ``with conn:`` has
+        no true nesting -- a second, inner ``with self._conn:`` here would
+        commit everything pending on the connection the moment it exits,
+        including whatever the *outer* transaction() block had deferred. If
+        ``_defer_commit`` is set, skip the local wrapper and let these writes
+        ride along in the caller's transaction instead."""
         now = str(self._now_ms())
-        with self._conn:  # one transaction across all three keys
+        pairs = [
+            ("bootstrap_boundary_history_id", boundary_history_id),
+            ("last_processed_history_id", boundary_history_id),
+            ("last_processed_at", now),
+        ]
+        if self._defer_commit:
             self._conn.executemany(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-                [
-                    ("bootstrap_boundary_history_id", boundary_history_id),
-                    ("last_processed_history_id", boundary_history_id),
-                    ("last_processed_at", now),
-                ],
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", pairs
             )
+        else:
+            with self._conn:  # one transaction across all three keys
+                self._conn.executemany(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", pairs
+                )
 
     # --- durable history cursor -----------------------------------------
 
