@@ -120,6 +120,16 @@ class TrainingIndex:
                 count += 1
         return count
 
+    def relabel(self, message_id: str, new_label: str) -> bool:
+        """Set one entry's label by id, not by matching its current name --
+        immune to a different entry coincidentally sharing that name. Returns
+        False (no-op) if the id isn't present."""
+        idx = self._id_to_idx.get(message_id)
+        if idx is None:
+            return False
+        self.labels[idx] = new_label
+        return True
+
     def remove(self, message_id: str):
         """Remove a message from the index. No-op if not present."""
         if message_id not in self._id_to_idx:

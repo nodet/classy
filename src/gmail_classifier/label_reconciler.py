@@ -31,12 +31,17 @@ def reconcile_labels(
         return
 
     for label_id, (old_name, new_name) in diff.renamed.items():
-        count = store.rename_label(old_name, new_name)
-        index.rename_label(old_name, new_name)
+        # Keyed by Gmail label id, not the name string: a same-pass delete of
+        # a *different* label that used to hold ``new_name`` must not get
+        # confused with these messages -- see message_ids_by_label_id.
+        with store.transaction():
+            count = store.rename_label_by_id(label_id, new_name)
+            for mid in store.message_ids_by_label_id(label_id):
+                index.relabel(mid, new_name)
         log(f"Label renamed: {old_name} -> {new_name} ({count} messages)")
 
     for label_id, old_name in diff.deleted.items():
-        mids = store.message_ids_by_label(old_name)
+        mids = store.message_ids_by_label_id(label_id)
         if not mids:
             log(f"Label deleted: {old_name} (no stored messages)")
             continue

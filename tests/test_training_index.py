@@ -105,3 +105,25 @@ def test_rename_label_no_match():
 
     assert count == 0
     assert index.labels == ["Tech", "Travel", "__skip__"]
+
+
+def test_relabel_sets_only_the_named_id_not_matching_names():
+    """relabel is keyed by message id, not by matching the current label
+    string -- immune to a different entry coincidentally sharing that name."""
+    embeddings = np.random.randn(3, 384).astype(np.float32)
+    labels = ["Travel", "Travel", "News"]
+    ids = ["m1", "m2", "m3"]
+
+    index = TrainingIndex(embeddings, labels, ids)
+    changed = index.relabel("m1", "News")
+
+    assert changed is True
+    assert index.labels == ["News", "Travel", "News"]  # only m1 changed
+
+
+def test_relabel_returns_false_for_unknown_id():
+    embeddings = np.random.randn(1, 384).astype(np.float32)
+    index = TrainingIndex(embeddings, ["Tech"], ["m1"])
+
+    assert index.relabel("nonexistent", "Travel") is False
+    assert index.labels == ["Tech"]

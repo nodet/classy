@@ -397,6 +397,18 @@ class StateStore:
             )
         }
 
+    def message_ids_by_label_id(self, label_id: str) -> Set[str]:
+        """Return all message_ids stored under Gmail label id ``label_id``.
+
+        Unlike :meth:`message_ids_by_label`, this can't be confused by a
+        same-pass rename landing on a name a different, deleted label used to
+        hold -- the id is stable, the name isn't."""
+        return {
+            r[0] for r in self._conn.execute(
+                "SELECT message_id FROM labels WHERE label_id = ?", (label_id,)
+            )
+        }
+
     def rename_label(self, old_name: str, new_name: str) -> int:
         """Rename a label in place. Returns the number of rows updated."""
         cur = self._conn.execute(
@@ -404,6 +416,18 @@ class StateStore:
             (new_name, old_name),
         )
         self._conn.commit()
+        return cur.rowcount
+
+    def rename_label_by_id(self, label_id: str, new_name: str) -> int:
+        """Rename by Gmail label id rather than by current name -- see
+        :meth:`message_ids_by_label_id`. Honors ``transaction()`` deferral like
+        ``upsert_label``/``upsert_embedding``, unlike :meth:`rename_label`."""
+        cur = self._conn.execute(
+            "UPDATE labels SET label_name = ? WHERE label_id = ?",
+            (new_name, label_id),
+        )
+        if not self._defer_commit:
+            self._conn.commit()
         return cur.rowcount
 
     def get_embedding(self, message_id: str) -> Optional[np.ndarray]:

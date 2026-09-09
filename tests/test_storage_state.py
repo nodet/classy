@@ -640,6 +640,54 @@ def test_rename_label(tmp_path):
     store.close()
 
 
+def test_message_ids_by_label_id(tmp_path):
+    store = StateStore(str(tmp_path / "state.db"))
+    store.upsert_label("m1", "L1", "Tech")
+    store.upsert_label("m2", "L1", "Tech")
+    store.upsert_label("m3", "L2", "Travel")
+
+    assert store.message_ids_by_label_id("L1") == {"m1", "m2"}
+    assert store.message_ids_by_label_id("L2") == {"m3"}
+    assert store.message_ids_by_label_id("Nonexistent") == set()
+    store.close()
+
+
+def test_rename_label_by_id_is_immune_to_a_name_shared_with_a_different_id(tmp_path):
+    """The whole point of keying by id: renaming L1 onto a name a different
+    label (L2) already holds must not touch L2's rows at all."""
+    store = StateStore(str(tmp_path / "state.db"))
+    store.upsert_label("m1", "L1", "Tech")
+    store.upsert_label("m2", "L2", "Travel")
+
+    count = store.rename_label_by_id("L1", "Travel")
+
+    assert count == 1
+    assert store.message_ids_by_label_id("L1") == {"m1"}
+    assert store.message_ids_by_label_id("L2") == {"m2"}
+    # Both now display "Travel", but remain distinguishable by label_id.
+    rows = {mid: lid for mid, lid, _, _ in store.iter_labels()}
+    assert rows == {"m1": "L1", "m2": "L2"}
+    store.close()
+
+
+def test_rename_label_by_id_rolls_back_with_other_writes_in_the_same_transaction(tmp_path):
+    store = StateStore(str(tmp_path / "state.db"))
+    store.upsert_label("m1", "L1", "Tech")
+
+    try:
+        with store.transaction():
+            store.rename_label_by_id("L1", "Technologie")
+            store.upsert_label("m2", "L2", "Travel")
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+
+    assert store.message_ids_by_label_id("L1") == {"m1"}
+    assert store.message_ids_by_label("Technologie") == set()
+    assert store.known_ids() == {"m1"}
+    store.close()
+
+
 def test_get_embedding(tmp_path):
     store = StateStore(str(tmp_path / "state.db"))
     vec = _vec(42)
