@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from gmail_classifier.classifier import SKIP_LABEL
 from gmail_classifier.label_reconciler import reconcile_labels
 from gmail_classifier.label_registry import LabelDiff, LabelRegistry
+from gmail_classifier.storage_state import StateStore
 from gmail_classifier.training_index import TrainingIndex
 
 
@@ -73,8 +74,9 @@ def test_deleted_label_purges_and_reinboxes():
     moved = {c.args[0] for c in client.move_to_inbox.call_args_list}
     assert moved == {"m3", "m4"}
 
-    # Store: label rows removed, then upserted as skip
-    store.remove_labels_by_name.assert_called_once_with({"Travel"})
+    # Store: each message's row replaced in place by the skip upsert (its
+    # PRIMARY KEY means no separate bulk-delete is needed beforehand).
+    store.remove_labels_by_name.assert_not_called()
     assert store.upsert_label.call_count == 2
     for call in store.upsert_label.call_args_list:
         assert call.args[1] == SKIP_LABEL
@@ -132,7 +134,7 @@ def test_move_to_inbox_failure_continues():
     reconcile_labels(registry, store, index, client, skip_ids, log)
 
     # Both messages still cleaned up in store despite one API failure
-    store.remove_labels_by_name.assert_called_once_with({"Travel"})
+    store.remove_labels_by_name.assert_not_called()
     assert store.upsert_label.call_count == 2
     assert skip_ids == {"m3", "m4"}
 
@@ -182,5 +184,47 @@ def test_mixed_delete_and_rename():
 
     # Deletion happened
     client.move_to_inbox.assert_called_once_with("m5")
-    store.remove_labels_by_name.assert_called_once_with({"News"})
+    store.remove_labels_by_name.assert_not_called()
     assert "m5" in skip_ids
+
+
+def test_deleted_label_crash_mid_loop_leaves_original_labels_intact(tmp_path):
+    """A crash partway through the skip-marking loop must roll back to every
+    message's ORIGINAL label -- never a mix of skip/erased/original. Uses a
+    real StateStore (not the MagicMock fixture above) because a mocked
+    transaction() would silently swallow the injected exception instead of
+    letting it propagate, which is exactly the behavior under test."""
+    store = StateStore(str(tmp_path / "state.db"))
+    vec = np.random.randn(384).astype(np.float32)
+    for mid in ("m1", "m2", "m3"):
+        store.upsert_label(mid, "L2", "Travel", source="user")
+        store.upsert_embedding(mid, vec)
+
+    registry = _make_registry([("L1", "Tech"), ("L2", "Travel")])
+    registry._client.list_user_labels.return_value = [("L1", "Tech")]  # Travel deleted
+    index = _make_index(["Travel", "Travel", "Travel"], ["m1", "m2", "m3"])
+    client = MagicMock()
+    skip_ids = set()
+    log = MagicMock()
+
+    real_upsert = store.upsert_label
+    calls = {"n": 0}
+
+    def flaky_upsert(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated crash mid-loop")
+        return real_upsert(*args, **kwargs)
+
+    with patch.object(store, "upsert_label", side_effect=flaky_upsert):
+        try:
+            reconcile_labels(registry, store, index, client, skip_ids, log)
+            assert False, "expected the simulated crash to propagate"
+        except RuntimeError:
+            pass
+
+    # Rolled back: every message still shows its ORIGINAL label, none erased
+    # and none left half-converted to skip.
+    assert store.message_ids_by_label("Travel") == {"m1", "m2", "m3"}
+    assert store.known_ids() == {"m1", "m2", "m3"}
+    store.close()

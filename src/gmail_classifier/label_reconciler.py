@@ -49,14 +49,23 @@ def reconcile_labels(
             except Exception:
                 logger.debug("move_to_inbox failed for %s", mid, exc_info=True)
 
-        store.remove_labels_by_name({old_name})
-        for mid in mids:
-            store.upsert_label(mid, SKIP_LABEL, SKIP_LABEL, source="auto")
-            index.remove(mid)
-            vec = store.get_embedding(mid)
-            if vec is not None:
-                index.add(mid, vec, SKIP_LABEL)
-            skip_ids.add(mid)
+        # One commit-or-rollback unit: upsert_label's INSERT OR REPLACE (keyed
+        # on message_id, the table's PRIMARY KEY) already replaces each old
+        # label row with the new skip row, so no separate bulk-delete is
+        # needed -- and skipping it removes the erasure window a bulk delete
+        # followed by an unguarded per-message loop would otherwise leave: a
+        # crash partway through used to mean the not-yet-reached messages had
+        # NO row at all (erased, not just stale). Wrapping the loop itself
+        # means a crash now leaves every message at its original label
+        # instead of a mix of skip/erased/original.
+        with store.transaction():
+            for mid in mids:
+                store.upsert_label(mid, SKIP_LABEL, SKIP_LABEL, source="auto")
+                index.remove(mid)
+                vec = store.get_embedding(mid)
+                if vec is not None:
+                    index.add(mid, vec, SKIP_LABEL)
+                skip_ids.add(mid)
 
         log(f"Label deleted: {old_name} — {reinboxed}/{len(mids)} "
             f"messages moved to inbox")
