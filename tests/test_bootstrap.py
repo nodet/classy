@@ -49,7 +49,8 @@ class _FakeClient:
     ``get_message`` returns a minimal Gmail resource.
     """
 
-    def __init__(self, labels=None, inbox=None, watch_id="1000"):
+    def __init__(self, labels=None, inbox=None, watch_id="1000",
+                 raise_after_get=None):
         self._labels = labels or {}
         self._inbox = [
             m if isinstance(m, tuple) else (m, _DEFAULT_MSG_TS)
@@ -60,6 +61,10 @@ class _FakeClient:
         self.get_calls = []
         self.max_concurrent_bodies = 0
         self._live_bodies = 0
+        # If set, the (raise_after_get + 1)-th get_message call raises a
+        # non-404 HttpError instead of returning -- simulates a mid-loop
+        # crash (e.g. a quota error) partway through a reconciliation.
+        self._raise_after_get = raise_after_get
 
     # -- collaborators used by bootstrap --
     def watch(self, topic):
@@ -90,6 +95,13 @@ class _FakeClient:
         return list(unlabeled[:max_results]) if max_results else list(unlabeled)
 
     def get_message(self, mid):
+        if self._raise_after_get is not None and len(self.get_calls) >= self._raise_after_get:
+            from unittest.mock import MagicMock
+
+            from googleapiclient.errors import HttpError
+            resp = MagicMock()
+            resp.status = 403
+            raise HttpError(resp=resp, content=b'{"error": {"message": "boom"}}')
         self.get_calls.append(mid)
         # Track that only one raw body is "live" at a time: bootstrap must embed
         # and discard before fetching the next. We can't see the discard
@@ -643,6 +655,42 @@ def test_resync_is_idempotent(tmp_path):
     second = {mid: label for mid, _v, label in store.iter_index()}
     assert first == second
     assert store.get_bootstrap_status() == "complete"
+    store.close()
+
+
+def test_resync_crash_mid_loop_leaves_store_unchanged(tmp_path):
+    """A crash partway through the reconciliation loop (e.g. a quota error on
+    the Nth message) must not leave any of the messages processed before the
+    crash point durably committed -- otherwise a later, successful resync's
+    gap-catchup reads that orphaned row as "already known" and permanently
+    skips a message that was never actually classified (the incident this
+    test guards against)."""
+    client = _FakeClient(
+        labels={"L_A": ("A", ["a1", "a2", "a3"])}, inbox=[],
+        raise_after_get=1,  # a1 embeds fine, a2 raises
+    )
+    store = _complete_store(tmp_path)
+    known_before = store.known_ids()
+    boundary_before = store.get_meta("bootstrap_boundary_history_id")
+    cursor_before = store.get_last_processed_history_id()
+
+    with pytest.raises(Exception):
+        bootstrap.read_only_resync(client, _FakeEmbedder(), store, topic="topic",
+                                    excluded=set(), max_per_label=200)
+
+    # Nothing from the aborted attempt survives -- not a1 (processed before
+    # the crash), not the boundary/cursor re-pin.
+    assert store.known_ids() == known_before
+    assert store.get_meta("bootstrap_boundary_history_id") == boundary_before
+    assert store.get_last_processed_history_id() == cursor_before
+
+    # A second, clean attempt reconciles correctly from this untouched state.
+    client2 = _FakeClient(labels={"L_A": ("A", ["a1", "a2", "a3"])}, inbox=[],
+                          watch_id="900")
+    bootstrap.read_only_resync(client2, _FakeEmbedder(), store, topic="topic",
+                               excluded=set(), max_per_label=200)
+    by_id = {mid: label for mid, _v, label in store.iter_index()}
+    assert by_id == {"a1": "A", "a2": "A", "a3": "A"}
     store.close()
 
 

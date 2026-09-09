@@ -490,32 +490,39 @@ def read_only_resync(
         for mid, label_id, label_name, source in worklist
     }
 
-    # Canonicalize to the capped snapshot: drop every stored row not in it. This
-    # covers rows Gmail truly dropped AND rows that fell outside the per-label
-    # newest-first cap -- resync bounds the training map to a coreset rather than
-    # growing it across recoveries (see the docstring). Embeddings stay cached for
-    # possible reuse.
-    dropped = store.known_ids() - set(desired)
-    for mid in dropped:
-        store.remove_label(mid)
-    if dropped:
-        log(f"Resync: removed {len(dropped)} row(s) outside the snapshot")
+    # Everything below is one commit-or-rollback unit: a crash partway through
+    # (a 403 mid-loop, SIGTERM, anything) must leave the store exactly as it
+    # was before this call, not a mix of durably-committed rows from before
+    # the crash point and a boundary that never got re-pinned -- that mix is
+    # what let an orphaned __skip__ row poison a later gap-catchup pass into
+    # treating a never-classified message as "already known."
+    with store.transaction():
+        # Canonicalize to the capped snapshot: drop every stored row not in it.
+        # This covers rows Gmail truly dropped AND rows that fell outside the
+        # per-label newest-first cap -- resync bounds the training map to a
+        # coreset rather than growing it across recoveries (see the docstring).
+        # Embeddings stay cached for possible reuse.
+        dropped = store.known_ids() - set(desired)
+        for mid in dropped:
+            store.remove_label(mid)
+        if dropped:
+            log(f"Resync: removed {len(dropped)} row(s) outside the snapshot")
 
-    # Upsert the current snapshot: rewrite changed labels, reuse cached vectors,
-    # fetch+embed only never-seen ids. overwrite_label defaults True so a
-    # changed label is actually rewritten.
-    added = 0
-    for mid, (label_id, label_name, source) in desired.items():
-        if _persist_one(client, embedder, store, mid, label_id, label_name, source):
-            added += 1
-    log(f"Resync: reconciled {len(desired)} snapshot row(s) "
-        f"({added} newly embedded)")
+        # Upsert the current snapshot: rewrite changed labels, reuse cached
+        # vectors, fetch+embed only never-seen ids. overwrite_label defaults
+        # True so a changed label is actually rewritten.
+        added = 0
+        for mid, (label_id, label_name, source) in desired.items():
+            if _persist_one(client, embedder, store, mid, label_id, label_name, source):
+                added += 1
+        log(f"Resync: reconciled {len(desired)} snapshot row(s) "
+            f"({added} newly embedded)")
 
-    # Re-pin a fresh boundary AFTER reconciling, so the current mailbox is all
-    # at-or-before the new boundary and stays read-only.
-    history_id, expiration = client.watch(topic)
-    store.repin_boundary(history_id)
-    log(f"Resync: re-pinned boundary historyId={history_id}")
+        # Re-pin a fresh boundary AFTER reconciling, so the current mailbox is
+        # all at-or-before the new boundary and stays read-only.
+        history_id, expiration = client.watch(topic)
+        store.repin_boundary(history_id)
+        log(f"Resync: re-pinned boundary historyId={history_id}")
 
     if index is not None:
         _reload_index(store, index, skip_ids)

@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import time
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterator, List, Optional, Set, Tuple
@@ -261,8 +262,30 @@ class StateStore:
             self._conn = sqlite3.connect(db_path)
         # Injected clock keeps last_processed_at deterministic in tests.
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
+        # Set within transaction() to make upsert_label/upsert_embedding/
+        # remove_label skip their per-call commit, so a multi-message
+        # reconciliation becomes one commit-or-rollback unit.
+        self._defer_commit = False
         if not read_only:
             self._create_tables()
+
+    @contextmanager
+    def transaction(self):
+        """Defer every write inside this block to one commit-or-rollback unit.
+
+        Without this, ``upsert_label``/``upsert_embedding``/``remove_label``
+        each commit immediately, so a crash partway through a multi-message
+        reconciliation (e.g. resync, label-delete handling) leaves whatever
+        was processed so far durably committed even though the caller never
+        finished -- a later run then misreads that partial state as already
+        handled. Wrapping the whole reconciliation in ``with store.transaction():``
+        makes it all-or-nothing."""
+        self._defer_commit = True
+        try:
+            with self._conn:
+                yield
+        finally:
+            self._defer_commit = False
 
     def now_ms(self) -> int:
         """The store's clock (injected in tests). Bootstrap stamps its own meta
@@ -302,7 +325,8 @@ class StateStore:
             "INSERT OR REPLACE INTO embeddings (message_id, vector) VALUES (?, ?)",
             (message_id, _vec_to_blob(vector)),
         )
-        self._conn.commit()
+        if not self._defer_commit:
+            self._conn.commit()
 
     def has_embedding(self, message_id: str) -> bool:
         row = self._conn.execute(
@@ -329,11 +353,13 @@ class StateStore:
                VALUES (?, ?, ?, ?)""",
             (message_id, label_id, label_name, source),
         )
-        self._conn.commit()
+        if not self._defer_commit:
+            self._conn.commit()
 
     def remove_label(self, message_id: str) -> None:
         self._conn.execute("DELETE FROM labels WHERE message_id = ?", (message_id,))
-        self._conn.commit()
+        if not self._defer_commit:
+            self._conn.commit()
 
     def known_ids(self) -> Set[str]:
         """Every id present in ``labels`` -- real labels **and** ``__skip__``.

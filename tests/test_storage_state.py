@@ -504,6 +504,32 @@ def test_repin_boundary_atomic_and_keeps_complete(tmp_path):
     store.close()
 
 
+def test_transaction_rolls_back_all_writes_on_exception(tmp_path):
+    """A multi-message reconciliation wrapped in transaction() is all-or-
+    nothing: an exception partway through leaves no partial rows behind, so a
+    later run can't misread them as already handled."""
+    store = StateStore(str(tmp_path / "state.db"))
+    with pytest.raises(RuntimeError):
+        with store.transaction():
+            store.upsert_label("msg1", "Label_1", "Tech")
+            store.upsert_embedding("msg1", np.zeros(4))
+            store.upsert_label("msg2", "Label_1", "Tech")
+            raise RuntimeError("simulated crash mid-reconciliation")
+    assert store.known_ids() == set()
+    assert store.embedded_ids() == set()
+    store.close()
+
+
+def test_transaction_commits_all_writes_on_success(tmp_path):
+    """The counterpart happy path: every write inside the block is visible
+    once it exits normally."""
+    store = StateStore(str(tmp_path / "state.db"))
+    with store.transaction():
+        store.upsert_label("msg1", "Label_1", "Tech")
+        store.upsert_label("msg2", "Label_1", "Tech")
+    assert store.known_ids() == {"msg1", "msg2"}
+    store.close()
+
 
 def test_loop_persist_cursor_is_durable_across_restart(tmp_path):
     """Integration: wiring StateBackend.set_last_processed_history_id as the
